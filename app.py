@@ -342,26 +342,44 @@ if st.button("分析実行"):
         use_container_width=True
     )
 
-    # =============================
-    # 📊 上位20社グラフ
-    # =============================
-    top20 = df_results.head(20)
+# =============================
+# 📊 上位20社データ
+# =============================
+top20 = df_results.head(20)
 
-    fig, ax = plt.subplots(figsize=(10, 8))
+# =============================
+# 📊 シャープレシオ（縦棒）
+# =============================
+fig1, ax1 = plt.subplots(figsize=(14,6))
 
-    colors = ["green" if x > 1 else "gray" for x in top20["シャープレシオ"]]
+ax1.bar(
+    top20["企業名"],
+    top20["シャープレシオ"],
+    color="green"
+)
 
-    ax.barh(
-        top20["企業名"],
-        top20["シャープレシオ"],
-        color=colors
-    )
+ax1.set_title("Top 20 Sharpe Ratio Stocks")
+ax1.set_ylabel("Sharpe Ratio")
+ax1.tick_params(axis='x', rotation=45)
 
-    ax.set_title("Top 20 Sharpe Ratio Stocks")
-    ax.set_xlabel("Sharpe Ratio")
-    ax.invert_yaxis()
+st.pyplot(fig1)
 
-    st.pyplot(fig)
+# =============================
+# 📊 年間平均リターン（縦棒）
+# =============================
+fig2, ax2 = plt.subplots(figsize=(14,6))
+
+ax2.bar(
+    top20["企業名"],
+    top20["年間平均リターン(%)"],
+    color="blue"
+)
+
+ax2.set_title("Top 20 Annual Return (%)")
+ax2.set_ylabel("Annual Return (%)")
+ax2.tick_params(axis='x', rotation=45)
+
+st.pyplot(fig2)
 
     # =============================
     # 🤖 Geminiコメント
