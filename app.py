@@ -1,38 +1,21 @@
-
 import streamlit as st
 import google.generativeai as genai
-from pandas_datareader import data as web
+import yfinance as yf
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import japanize_matplotlib
 from datetime import datetime, timedelta
-import textwrap
-import time
 
-# -------------------------------
-# ページ設定
-# -------------------------------
 st.set_page_config(layout="wide")
-st.title("📈 日本株 シャープレシオ分析ダッシュボード")
+st.title("📈 日本株 シャープレシオ分析")
 
-# -------------------------------
-# SecretsからAPIキー取得
-# -------------------------------
-TIINGO_API_KEY = st.secrets["TIINGO_API_KEY"]
 GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
-
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel("gemini-2.5-pro")
 
-# -------------------------------
-# 入力UI
-# -------------------------------
-years = st.number_input("📅 過去何年で分析しますか？", 1, 10, 5)
+years = st.number_input("📅 過去何年で分析？", 1, 10, 5)
 
-# -------------------------------
-# 銘柄マップ（簡易版 ※フル版をここに貼ってOK）
-# -------------------------------
 ticker_name_map = {
     '1332.JP': ('ニッスイ', '水産'),
     '1605.JP': ('ＩＮＰＥＸ', '鉱業'),
@@ -261,34 +244,23 @@ ticker_name_map = {
     '9984.JP': ('ＳＢＧ', '通信'),
 }
 
-# -------------------------------
-# データ取得関数
-# -------------------------------
 @st.cache_data(ttl=3600)
-def get_price(code, start, end):
-    try:
-        df = web.DataReader(code, "stooq", start, end)
-        return df.sort_index()
-    except:
-        return pd.DataFrame()
+def get_price(ticker, start, end):
+    df = yf.download(ticker, start=start, end=end, progress=False)
+    return df
 
-# -------------------------------
-# 分析実行ボタン
-# -------------------------------
-if st.button("🚀 分析実行"):
+if st.button("分析実行"):
 
     end_date = datetime.today()
-    start_date = end_date - timedelta(days=years * 365)
+    start_date = end_date - timedelta(days=years*365)
 
-    benchmark_code = "1321.JP"
-    df_market = get_price(benchmark_code, start_date, end_date)
+    benchmark = yf.download("^N225", start=start_date, end=end_date, progress=False)
 
-    if df_market.empty:
+    if benchmark.empty:
         st.error("市場データ取得失敗")
         st.stop()
 
-    series_market = df_market["Close"]
-    market_returns = series_market.pct_change().dropna()
+    market_returns = benchmark["Close"].pct_change().dropna()
     annual_market_return = market_returns.mean() * 252
 
     results = []
@@ -298,93 +270,56 @@ if st.button("🚀 分析実行"):
         df = get_price(ticker, start_date, end_date)
         progress.progress((i+1)/len(ticker_name_map))
 
-        if df.empty or len(df) < 30:
+        if df.empty:
             continue
 
-        series = df["Close"]
-        returns = series.pct_change().dropna()
+        returns = df["Close"].pct_change().dropna()
+        common = returns.index.intersection(market_returns.index)
 
-        common_index = returns.index.intersection(market_returns.index)
-        if len(common_index) < 30:
+        if len(common) < 30:
             continue
 
-        x = returns.loc[common_index].values
-        y = market_returns.loc[common_index].values
+        x = returns.loc[common].values
+        y = market_returns.loc[common].values
 
-        annual_return = x.mean() * 252
-        annual_volatility = x.std() * np.sqrt(252)
-
-        beta = np.cov(x, y)[0][1] / np.var(y)
-        risk_free_rate = 0.01
-
-        sharpe_ratio = (annual_return - risk_free_rate) / annual_volatility
-        alpha = annual_return - (risk_free_rate + beta * (annual_market_return - risk_free_rate))
+        annual_return = x.mean()*252
+        annual_vol = x.std()*np.sqrt(252)
+        beta = np.cov(x,y)[0][1]/np.var(y)
+        sharpe = (annual_return-0.01)/annual_vol
 
         results.append({
             "企業名": name,
-            "業種": sector,
             "年間リターン": annual_return,
-            "年間リスク": annual_volatility,
-            "シャープレシオ": sharpe_ratio,
-            "ベータ": beta,
-            "アルファ": alpha
+            "年間リスク": annual_vol,
+            "シャープレシオ": sharpe
         })
 
-    df_results = pd.DataFrame(results).dropna()
+    df_results = pd.DataFrame(results)
 
     if df_results.empty:
-        st.error("有効な分析データなし")
+        st.error("データなし")
         st.stop()
 
-    top20 = df_results.sort_values("シャープレシオ", ascending=False)
+    df_results = df_results.sort_values("シャープレシオ", ascending=False)
 
-    # -------------------------------
-    # グラフ描画
-    # -------------------------------
-    labels = top20["企業名"]
-    returns = top20["年間リターン"] * 100
-    risks = top20["年間リスク"] * 100
-    sharpes = top20["シャープレシオ"]
-
-    fig, axs = plt.subplots(3, 1, figsize=(14, 12))
-
-    axs[0].bar(labels, returns)
-    axs[0].set_title("年間リターン (%)")
-    axs[0].tick_params(axis='x', rotation=45)
-
-    axs[1].bar(labels, risks)
-    axs[1].set_title("年間リスク (%)")
-    axs[1].tick_params(axis='x', rotation=45)
-
-    axs[2].bar(labels, sharpes)
-    axs[2].set_title("シャープレシオ")
-    axs[2].tick_params(axis='x', rotation=45)
-
-    plt.tight_layout()
+    fig, ax = plt.subplots(figsize=(10,6))
+    ax.bar(df_results["企業名"], df_results["シャープレシオ"])
+    ax.set_title("シャープレシオ")
+    ax.tick_params(axis='x', rotation=45)
     st.pyplot(fig)
 
-    # -------------------------------
-    # Geminiコメント生成
-    # -------------------------------
-    summary_text = ""
-    for _, row in top20.head(5).iterrows():
-        summary_text += (
-            f"{row['企業名']} リターン{row['年間リターン']:.2%} "
-            f"リスク{row['年間リスク']:.2%} "
-            f"シャープ{row['シャープレシオ']:.2f}\n"
-        )
+    # Geminiコメント
+    summary = df_results.head(3).to_string()
 
     prompt = f"""
-    以下は日本株分析結果です。
-    投資家向けに特徴を300文字以内で要約してください。
+    以下の日本株分析結果を投資家向けに300文字で要約してください。
 
-    {summary_text}
+    {summary}
     """
 
     try:
         response = model.generate_content(prompt)
-        comment = response.text.strip()
-        st.subheader("🤖 AI分析コメント")
-        st.write(comment)
+        st.subheader("🤖 AIコメント")
+        st.write(response.text)
     except:
-        st.warning("Geminiコメント取得失敗")
+        st.warning("Geminiエラー")
