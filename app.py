@@ -6,15 +6,27 @@ import numpy as np
 import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
 
+# -----------------------------
+# ページ設定
+# -----------------------------
 st.set_page_config(layout="wide")
 st.title("📈 日本株 シャープレシオ分析")
 
+# -----------------------------
+# Gemini設定
+# -----------------------------
 GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel("gemini-2.5-pro")
 
-years = st.number_input("📅 過去何年で分析？", 1, 10, 5)
+# -----------------------------
+# 入力
+# -----------------------------
+years = st.number_input("📅 過去何年で分析？", 1, 10, 3)
 
+# -----------------------------
+# 銘柄（例：一部）
+# -----------------------------
 ticker_name_map = {
     '1332.T': ('ニッスイ', '水産'),
     '1605.T': ('ＩＮＰＥＸ', '鉱業'),
@@ -243,15 +255,21 @@ ticker_name_map = {
     '9984.T': ('ＳＢＧ', '通信'),
 }
 
+# -----------------------------
+# データ取得
+# -----------------------------
 @st.cache_data(ttl=3600)
 def get_price(ticker, start, end):
     df = yf.download(ticker, start=start, end=end, progress=False)
     return df
 
+# -----------------------------
+# 実行
+# -----------------------------
 if st.button("分析実行"):
 
     end_date = datetime.today()
-    start_date = end_date - timedelta(days=years*365)
+    start_date = end_date - timedelta(days=years * 365)
 
     benchmark = yf.download("^N225", start=start_date, end=end_date, progress=False)
 
@@ -267,7 +285,7 @@ if st.button("分析実行"):
 
     for i, (ticker, (name, sector)) in enumerate(ticker_name_map.items()):
         df = get_price(ticker, start_date, end_date)
-        progress.progress((i+1)/len(ticker_name_map))
+        progress.progress((i + 1) / len(ticker_name_map))
 
         if df.empty:
             continue
@@ -281,16 +299,18 @@ if st.button("分析実行"):
         x = returns.loc[common].values
         y = market_returns.loc[common].values
 
-        annual_return = x.mean()*252
-        annual_vol = x.std()*np.sqrt(252)
-        beta = np.cov(x,y)[0][1]/np.var(y)
-        sharpe = (annual_return-0.01)/annual_vol
+        annual_return = x.mean() * 252
+        annual_vol = x.std() * np.sqrt(252)
+        beta = np.cov(x, y)[0][1] / np.var(y)
+        sharpe = (annual_return - 0.01) / annual_vol
 
         results.append({
             "企業名": name,
-            "年間リターン": annual_return,
-            "年間リスク": annual_vol,
-            "シャープレシオ": sharpe
+            "業種": sector,
+            "年間平均リターン(%)": annual_return * 100,
+            "年間リスク(%)": annual_vol * 100,
+            "シャープレシオ": sharpe,
+            "ベータ": beta
         })
 
     df_results = pd.DataFrame(results)
@@ -301,17 +321,50 @@ if st.button("分析実行"):
 
     df_results = df_results.sort_values("シャープレシオ", ascending=False)
 
-    fig, ax = plt.subplots(figsize=(10,6))
-    ax.bar(df_results["企業名"], df_results["シャープレシオ"])
-    ax.set_title("シャープレシオ")
-    ax.tick_params(axis='x', rotation=45)
+    # =============================
+    # 📊 表で表示
+    # =============================
+    st.subheader("📋 分析結果一覧")
+
+    st.dataframe(
+        df_results.style.format({
+            "年間平均リターン(%)": "{:.2f}",
+            "年間リスク(%)": "{:.2f}",
+            "シャープレシオ": "{:.2f}",
+            "ベータ": "{:.2f}"
+        }),
+        use_container_width=True
+    )
+
+    # =============================
+    # 📊 上位20社グラフ
+    # =============================
+    top20 = df_results.head(20)
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+
+    colors = ["green" if x > 1 else "gray" for x in top20["シャープレシオ"]]
+
+    ax.barh(
+        top20["企業名"],
+        top20["シャープレシオ"],
+        color=colors
+    )
+
+    ax.set_title("シャープレシオ上位20社")
+    ax.set_xlabel("シャープレシオ")
+    ax.invert_yaxis()
+
     st.pyplot(fig)
 
-    # Geminiコメント
-    summary = df_results.head(3).to_string()
+    # =============================
+    # 🤖 Geminiコメント
+    # =============================
+    summary = top20.head(5).to_string()
 
     prompt = f"""
-    以下の日本株分析結果を投資家向けに300文字で要約してください。
+    以下は日本株のリスク・リターン分析結果です。
+    投資家向けに簡潔に300文字以内で評価してください。
 
     {summary}
     """
@@ -322,3 +375,4 @@ if st.button("分析実行"):
         st.write(response.text)
     except:
         st.warning("Geminiエラー")
+        
