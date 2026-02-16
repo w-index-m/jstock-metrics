@@ -4,4 +4,3 @@ numpy
 matplotlib
 yfinance
 google-generativeai
-japanize-matplotlib
