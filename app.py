@@ -7,6 +7,12 @@ import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
 
 # -----------------------------
+# フォント設定（日本語対応）
+# -----------------------------
+plt.rcParams["font.family"] = "IPAexGothic"
+plt.rcParams["axes.unicode_minus"] = False
+
+# -----------------------------
 # ページ設定
 # -----------------------------
 st.set_page_config(layout="wide")
@@ -25,7 +31,7 @@ model = genai.GenerativeModel("gemini-2.5-pro")
 years = st.number_input("📅 過去何年で分析？", 1, 10, 3)
 
 # -----------------------------
-# 銘柄（例：一部）
+# 銘柄（例）
 # -----------------------------
 ticker_name_map = {
     '1332.T': ('ニッスイ', '水産'),
@@ -264,7 +270,7 @@ def get_price(ticker, start, end):
     return df
 
 # -----------------------------
-# 実行
+# 実行ボタン
 # -----------------------------
 if st.button("分析実行"):
 
@@ -322,7 +328,7 @@ if st.button("分析実行"):
     df_results = df_results.sort_values("シャープレシオ", ascending=False)
 
     # =============================
-    # 📊 表で表示
+    # 📋 表表示
     # =============================
     st.subheader("📋 分析結果一覧")
 
@@ -351,8 +357,8 @@ if st.button("分析実行"):
         color=colors
     )
 
-    ax.set_title("シャープレシオ上位20社")
-    ax.set_xlabel("シャープレシオ")
+    ax.set_title("Top 20 Sharpe Ratio Stocks")
+    ax.set_xlabel("Sharpe Ratio")
     ax.invert_yaxis()
 
     st.pyplot(fig)
@@ -375,4 +381,3 @@ if st.button("分析実行"):
         st.write(response.text)
     except:
         st.warning("Geminiエラー")
-        
