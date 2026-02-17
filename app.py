@@ -10,7 +10,19 @@ from dateutil.relativedelta import relativedelta
 # -----------------------------
 # フォント設定（日本語対応）
 # -----------------------------
-plt.rcParams["font.family"] = "IPAexGothic"
+import matplotlib.font_manager as fm
+
+def _set_japanese_font():
+    """利用可能な日本語フォントを自動検出して設定する"""
+    candidates = ["Noto Sans CJK JP", "IPAexGothic", "IPAPGothic", "Hiragino Sans", "Yu Gothic"]
+    available = {f.name for f in fm.fontManager.ttflist}
+    for font in candidates:
+        if font in available:
+            plt.rcParams["font.family"] = font
+            return font
+    return None  # フォールバック（文字化けは残るが、クラッシュは防ぐ）
+
+_set_japanese_font()
 plt.rcParams["axes.unicode_minus"] = False
 
 # -----------------------------
