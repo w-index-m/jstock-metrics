@@ -4,13 +4,19 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from datetime import datetime, timedelta
+from datetime import datetime
+from dateutil.relativedelta import relativedelta
 
 # -----------------------------
 # フォント設定（日本語対応）
 # -----------------------------
 plt.rcParams["font.family"] = "IPAexGothic"
 plt.rcParams["axes.unicode_minus"] = False
+
+# -----------------------------
+# 定数
+# -----------------------------
+GEMINI_MODEL = "gemini-2.5-pro"
 
 # -----------------------------
 # ページ設定
@@ -23,15 +29,19 @@ st.title("📈 日本株 シャープレシオ分析")
 # -----------------------------
 GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-2.5-pro")
+model = genai.GenerativeModel(GEMINI_MODEL)
 
 # -----------------------------
-# 入力
+# サイドバー：入力パラメータ
 # -----------------------------
-years = st.number_input("📅 過去何年で分析？", 1, 10, 3)
+with st.sidebar:
+    st.header("⚙️ 分析パラメータ")
+    years = st.number_input("📅 過去何年で分析？", 1, 10, 3)
+    risk_free_rate = st.number_input("📉 無リスク金利（%）", 0.0, 10.0, 1.0, step=0.1) / 100
+    top_n = st.number_input("📊 上位何社を表示？", 5, 50, 20, step=5)
 
 # -----------------------------
-# 銘柄（例）
+# 銘柄
 # -----------------------------
 ticker_name_map = {
     '1332.T': ('ニッスイ', '水産'),
@@ -262,11 +272,21 @@ ticker_name_map = {
 }
 
 # -----------------------------
-# データ取得
+# データ取得（キャッシュあり）
 # -----------------------------
 @st.cache_data(ttl=3600)
 def get_price(ticker, start, end):
     df = yf.download(ticker, start=start, end=end, progress=False)
+    # yfinance v0.2以降のMultiIndex対策
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.droplevel(1)
+    return df
+
+@st.cache_data(ttl=3600)
+def get_benchmark(start, end):
+    df = yf.download("^N225", start=start, end=end, progress=False)
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.droplevel(1)
     return df
 
 # -----------------------------
@@ -275,9 +295,11 @@ def get_price(ticker, start, end):
 if st.button("分析実行"):
 
     end_date = datetime.today()
-    start_date = end_date - timedelta(days=years * 365)
+    # 修正: relativedeltaで正確な年数計算（閏年対応）
+    start_date = end_date - relativedelta(years=int(years))
 
-    benchmark = yf.download("^N225", start=start_date, end=end_date, progress=False)
+    with st.spinner("市場データを取得中..."):
+        benchmark = get_benchmark(start_date, end_date)
 
     if benchmark.empty:
         st.error("市場データ取得失敗")
@@ -288,8 +310,10 @@ if st.button("分析実行"):
 
     results = []
     progress = st.progress(0)
+    status_text = st.empty()
 
     for i, (ticker, (name, sector)) in enumerate(ticker_name_map.items()):
+        status_text.text(f"取得中: {name} ({ticker})")
         df = get_price(ticker, start_date, end_date)
         progress.progress((i + 1) / len(ticker_name_map))
 
@@ -302,13 +326,14 @@ if st.button("分析実行"):
         if len(common) < 30:
             continue
 
-        x = returns.loc[common].values
-        y = market_returns.loc[common].values
+        x = returns.loc[common].values.flatten()
+        y = market_returns.loc[common].values.flatten()
 
         annual_return = x.mean() * 252
         annual_vol = x.std() * np.sqrt(252)
         beta = np.cov(x, y)[0][1] / np.var(y)
-        sharpe = (annual_return - 0.01) / annual_vol
+        # 修正: サイドバーで設定した無リスク金利を使用
+        sharpe = (annual_return - risk_free_rate) / annual_vol
 
         results.append({
             "企業名": name,
@@ -318,6 +343,10 @@ if st.button("分析実行"):
             "シャープレシオ": sharpe,
             "ベータ": beta
         })
+
+    # プログレスバーとステータステキストを消去
+    progress.empty()
+    status_text.empty()
 
     df_results = pd.DataFrame(results)
 
@@ -342,49 +371,40 @@ if st.button("分析実行"):
         use_container_width=True
     )
 
-# =============================
-# 📊 上位20社データ
-# =============================
-top20 = df_results.head(20)
-
-# =============================
-# 📊 シャープレシオ（縦棒）
-# =============================
-fig1, ax1 = plt.subplots(figsize=(14,6))
-
-ax1.bar(
-    top20["企業名"],
-    top20["シャープレシオ"],
-    color="green"
-)
-
-ax1.set_title("Top 20 Sharpe Ratio Stocks")
-ax1.set_ylabel("Sharpe Ratio")
-ax1.tick_params(axis='x', rotation=45)
-
-st.pyplot(fig1)
-
-# =============================
-# 📊 年間平均リターン（縦棒）
-# =============================
-fig2, ax2 = plt.subplots(figsize=(14,6))
-
-ax2.bar(
-    top20["企業名"],
-    top20["年間平均リターン(%)"],
-    color="blue"
-)
-
-ax2.set_title("Top 20 Annual Return (%)")
-ax2.set_ylabel("Annual Return (%)")
-ax2.tick_params(axis='x', rotation=45)
-
-st.pyplot(fig2)
+    # =============================
+    # 📊 上位N社データ（修正: ifブロック内に移動）
+    # =============================
+    top_n = int(top_n)
+    top_stocks = df_results.head(top_n)
 
     # =============================
-    # 🤖 Geminiコメント
+    # 📊 シャープレシオ（縦棒）
     # =============================
-    summary = top20.head(5).to_string()
+    fig1, ax1 = plt.subplots(figsize=(14, 6))
+    ax1.bar(top_stocks["企業名"], top_stocks["シャープレシオ"], color="green")
+    ax1.set_title(f"シャープレシオ 上位{top_n}社")
+    ax1.set_ylabel("シャープレシオ")
+    ax1.tick_params(axis='x', rotation=45)
+    plt.tight_layout()
+    st.pyplot(fig1)
+    plt.close(fig1)
+
+    # =============================
+    # 📊 年間平均リターン（縦棒）
+    # =============================
+    fig2, ax2 = plt.subplots(figsize=(14, 6))
+    ax2.bar(top_stocks["企業名"], top_stocks["年間平均リターン(%)"], color="steelblue")
+    ax2.set_title(f"年間平均リターン(%) 上位{top_n}社")
+    ax2.set_ylabel("年間平均リターン(%)")
+    ax2.tick_params(axis='x', rotation=45)
+    plt.tight_layout()
+    st.pyplot(fig2)
+    plt.close(fig2)
+
+    # =============================
+    # 🤖 Geminiコメント（修正: ifブロック内に移動）
+    # =============================
+    summary = top_stocks.head(5).to_string()
 
     prompt = f"""
     以下は日本株のリスク・リターン分析結果です。
@@ -393,9 +413,10 @@ st.pyplot(fig2)
     {summary}
     """
 
+    # 修正: 例外を明示的にキャッチしてエラー内容を表示
     try:
         response = model.generate_content(prompt)
         st.subheader("🤖 AIコメント")
         st.write(response.text)
-    except:
-        st.warning("Geminiエラー")
+    except Exception as e:
+        st.warning(f"Gemini APIエラー: {e}")
