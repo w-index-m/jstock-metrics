@@ -40,7 +40,7 @@ plt.rcParams["axes.unicode_minus"] = False
 # 定数
 # -----------------------------
 GEMINI_MODEL = "gemini-2.5-pro"
-GROQ_MODEL   = "llama-3.3-70b-versatile"  # フォールバック用
+GROQ_MODEL   = "llama3-70b-8192"   # フォールバック用
 
 # -----------------------------
 # ページ設定
