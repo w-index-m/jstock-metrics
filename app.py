@@ -13,29 +13,23 @@ from dateutil.relativedelta import relativedelta
 import matplotlib.font_manager as fm
 import os
 
-# フォントファイルを直接パス指定（フォントキャッシュに依存しない）
+# リポジトリ内フォントを最優先、次にシステムフォントを探す
 _FONT_PATHS = [
-    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "font/NotoSansCJK-Regular.ttc",        # ★ リポジトリ内（Streamlit Cloud用）
+    "font/NotoSansJP-ExtraBold.ttf",        # ★ リポジトリ内（同上）
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",  # Linuxシステム
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Medium.ttc",
     "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf",
     "/usr/share/fonts/opentype/ipafont-gothic/ipag.ttf",
 ]
 
 def _set_japanese_font():
-    # まずファイルパス直接指定を試みる（最も確実）
     for path in _FONT_PATHS:
         if os.path.exists(path):
             fm.fontManager.addfont(path)
             prop = fm.FontProperties(fname=path)
             plt.rcParams["font.family"] = prop.get_name()
             return prop.get_name()
-    # フォールバック: フォント名で探す
-    candidates = ["Noto Sans CJK JP", "IPAexGothic", "IPAPGothic", "Hiragino Sans", "Yu Gothic"]
-    available = {f.name for f in fm.fontManager.ttflist}
-    for font in candidates:
-        if font in available:
-            plt.rcParams["font.family"] = font
-            return font
     return None
 
 _set_japanese_font()
