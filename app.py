@@ -6,6 +6,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
+from groq import Groq
 
 # -----------------------------
 # フォント設定（日本語対応・確実版）
@@ -39,6 +40,7 @@ plt.rcParams["axes.unicode_minus"] = False
 # 定数
 # -----------------------------
 GEMINI_MODEL = "gemini-2.5-pro"
+GROQ_MODEL   = "llama3-70b-8192"   # フォールバック用
 
 # -----------------------------
 # ページ設定
@@ -47,11 +49,37 @@ st.set_page_config(layout="wide")
 st.title("📈 日本株 シャープレシオ分析")
 
 # -----------------------------
-# Gemini設定
+# AI設定（Gemini優先 / Groqフォールバック）
 # -----------------------------
 GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
+GROQ_API_KEY   = st.secrets.get("GROQ_API_KEY", "")
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel(GEMINI_MODEL)
+gemini_model = genai.GenerativeModel(GEMINI_MODEL)
+groq_client  = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+
+def generate_ai_comment(prompt: str) -> tuple[str, str]:
+    """Geminiで生成。429/quota系エラー時はGroqへ自動フォールバック。
+    Returns: (コメント本文, 使用したAI名)
+    """
+    # --- Gemini を試みる ---
+    try:
+        response = gemini_model.generate_content(prompt)
+        return response.text, "Gemini"
+    except Exception as e:
+        err_str = str(e)
+        is_quota_error = "429" in err_str or "quota" in err_str.lower() or "RESOURCE_EXHAUSTED" in err_str
+        if not is_quota_error:
+            raise  # クォータ以外のエラーはそのまま上げる
+
+    # --- Groqへフォールバック ---
+    if groq_client is None:
+        raise RuntimeError("Geminiのクォータ超過。GROQ_API_KEY が設定されていないためフォールバック不可。")
+    chat = groq_client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=400,
+    )
+    return chat.choices[0].message.content, "Groq"
 
 # -----------------------------
 # サイドバー：入力パラメータ
@@ -435,10 +463,9 @@ if st.button("分析実行"):
     {summary}
     """
 
-    # 修正: 例外を明示的にキャッチしてエラー内容を表示
     try:
-        response = model.generate_content(prompt)
-        st.subheader("🤖 AIコメント")
-        st.write(response.text)
+        comment, ai_name = generate_ai_comment(prompt)
+        st.subheader(f"🤖 AIコメント（{ai_name}）")
+        st.write(comment)
     except Exception as e:
-        st.warning(f"Gemini APIエラー: {e}")
+        st.warning(f"AI APIエラー: {e}")
