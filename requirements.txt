@@ -1,6 +1,8 @@
 streamlit
+google-generativeai
+yfinance
 pandas
 numpy
 matplotlib
-yfinance
-google-generativeai
+python-dateutil
+groq
