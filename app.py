@@ -60,24 +60,60 @@ genai.configure(api_key=GEMINI_API_KEY)
 gemini_model = genai.GenerativeModel(GEMINI_MODEL)
 groq_client  = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
+OPENROUTER_API_KEY = st.secrets.get("OPENROUTER_API_KEY", "")
+
 def generate_ai_comment(prompt: str) -> tuple[str, str]:
-    """Gemini → Groq フォールバック"""
+    """Gemini -> Groq -> OpenRouter の順でフォールバック"""
+    # 1) Gemini
     try:
         response = gemini_model.generate_content(prompt)
         return response.text, "Gemini"
     except Exception as e:
-        err_str = str(e)
-        is_quota = "429" in err_str or "quota" in err_str.lower() or "RESOURCE_EXHAUSTED" in err_str
-        if not is_quota:
-            raise
-    if groq_client is None:
-        raise RuntimeError("Geminiクォータ超過 & GROQ_API_KEY 未設定")
-    chat = groq_client.chat.completions.create(
-        model=GROQ_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=400,
+        gemini_err = str(e)
+
+    # 2) Groq
+    if groq_client:
+        try:
+            chat = groq_client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=600,
+            )
+            return chat.choices[0].message.content, "Groq"
+        except Exception as e:
+            groq_err = str(e)
+    else:
+        groq_err = "GROQ_API_KEY 未設定"
+
+    # 3) OpenRouter
+    if OPENROUTER_API_KEY:
+        try:
+            r = requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "https://jstock-dashboard.streamlit.app",
+                    "X-Title": "JStock Dashboard",
+                },
+                json={
+                    "model": "meta-llama/llama-3.1-8b-instruct:free",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 600,
+                },
+                timeout=30,
+            )
+            r.raise_for_status()
+            text = r.json()["choices"][0]["message"]["content"]
+            return text, "OpenRouter"
+        except Exception as e:
+            or_err = str(e)
+    else:
+        or_err = "OPENROUTER_API_KEY 未設定"
+
+    raise RuntimeError(
+        f"全AIバックエンド失敗 / Gemini: {gemini_err} / Groq: {groq_err} / OpenRouter: {or_err}"
     )
-    return chat.choices[0].message.content, "Groq"
 
 # ================================================================
 # 📰 ニュース取得モジュール
@@ -421,43 +457,83 @@ def fetch_tdnet_news(ticker_code: str, max_items: int = 20, months: int = 3) -> 
 @st.cache_data(ttl=7200)
 def ai_summarize_tdnet_pdf(pdf_url: str, title: str) -> str:
     """
-    株探の開示PDFページから本文テキストを取得し、AIで要約する。
-    PDFは直接パースせず、株探の開示詳細ページのテキストを利用。
+    適時開示の内容をAIで詳細要約。
+    株探の開示HTMLページ取得 -> PDFテキスト抽出 -> タイトルのみ の順でフォールバック。
     """
+    page_text = ""
+    source_desc = ""
+
+    # 1) 株探の開示HTMLページ（/disclosures/pdf/ -> /disclosures/ に変換）
     try:
-        r = requests.get(pdf_url, headers={
-            **_NEWS_HEADERS,
-            "Referer": "https://kabutan.jp/",
-        }, timeout=20)
-        if r.status_code != 200:
-            return f"ページ取得失敗（HTTP {r.status_code}）"
+        html_url = pdf_url.replace("/disclosures/pdf/", "/disclosures/")
+        if html_url != pdf_url:
+            r = requests.get(html_url, headers={**_NEWS_HEADERS, "Referer": "https://kabutan.jp/"}, timeout=15)
+            if r.status_code == 200 and "text/html" in r.headers.get("Content-Type", ""):
+                raw = re.sub(r'<script[^>]*>.*?</script>', ' ', r.text, flags=re.DOTALL)
+                raw = re.sub(r'<style[^>]*>.*?</style>', ' ', raw, flags=re.DOTALL)
+                raw = re.sub(r'<[^>]+>', ' ', raw)
+                raw = re.sub(r'\s+', ' ', raw).strip()
+                page_text = raw[:6000]
+                source_desc = "株探開示ページ"
+    except Exception:
+        pass
 
-        # HTMLの場合はテキスト抽出、PDFの場合はバイナリ
-        content_type = r.headers.get("Content-Type", "")
-        if "pdf" in content_type.lower():
-            # PDFは直接パースできないのでタイトルのみでAI分析
-            page_text = f"適時開示タイトル: {title}"
-        else:
-            # HTML形式ならテキスト抽出
-            text = re.sub(r'<[^>]+>', ' ', r.text)
-            text = re.sub(r'\s+', ' ', text).strip()
-            page_text = text[:3000]
+    # 2) PDF直接取得（バイナリからテキスト部分を抽出）
+    if not page_text:
+        try:
+            r = requests.get(pdf_url, headers={**_NEWS_HEADERS, "Referer": "https://kabutan.jp/"}, timeout=20)
+            if r.status_code == 200:
+                ct = r.headers.get("Content-Type", "")
+                if "text/html" in ct:
+                    raw = re.sub(r'<[^>]+>', ' ', r.text)
+                    page_text = re.sub(r'\s+', ' ', raw).strip()[:6000]
+                    source_desc = "開示HTML"
+                elif "pdf" in ct.lower():
+                    pdf_str = r.content.decode("latin-1", errors="ignore")
+                    chunks = re.findall(r'BT\s*(.*?)\s*ET', pdf_str, re.DOTALL)
+                    parts = []
+                    for chunk in chunks:
+                        parts.extend(re.findall(r'\(([^)]{1,200})\)', chunk))
+                    page_text = " ".join(parts)[:6000]
+                    source_desc = "PDFテキスト抽出"
+        except Exception:
+            pass
 
-        prompt = f"""
-以下は日本株の適時開示情報です。投資家向けに日本語200文字以内で要点をまとめてください。
+    if not page_text or len(page_text.strip()) < 50:
+        page_text = "（本文取得不可。タイトルから推定）"
+        source_desc = "タイトルのみ"
 
-タイトル: {title}
-内容: {page_text}
+    prompt = f"""あなたは日本株の機関投資家向けアナリストです。
+以下の適時開示情報を分析し、投資判断に役立つ詳細な要約を日本語で作成してください。
 
-要約のポイント:
-- 何が変わったか（業績修正・配当・資本政策など）
-- 数値があれば具体的に記載
-- 株価への影響の可能性
+【開示タイトル】{title}
+
+【開示内容】{page_text}
+
+【要約フォーマット（合計400〜500文字）】
+
+■ 開示種別: （業績修正 / 配当変更 / 決算発表 / 資本政策 / その他）
+
+■ 主要な変更点:
+  - 変更前→変更後の数値を具体的に（例: 営業利益 500億円→620億円、+24%）
+  - 配当がある場合は1株あたりの金額も記載
+  - 複数項目ある場合はすべて列挙
+
+■ 背景・理由: なぜ修正・発表したか
+
+■ 株価への影響予測:
+  - ポジティブ / ネガティブ / 中立 とその理由
+  - 市場が注目すべきポイント
+
+■ 投資家へのアドバイス: 短期・中長期の観点で
 """
+    try:
         comment, ai_name = generate_ai_comment(prompt)
-        return f"{comment}\n\n_要約: {ai_name}_"
+        return comment + "\n\n_情報源: " + source_desc + " / AI: " + ai_name + "_"
     except Exception as e:
         return f"要約エラー: {e}"
+
+
 
 
 # ── ⑤ 日経新聞 マーケット RSS ───────────────────────────────────
