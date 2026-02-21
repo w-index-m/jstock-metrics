@@ -119,56 +119,142 @@ def fetch_yahoo_jp_news(ticker_code: str, max_items: int = 8) -> list[dict]:
 @st.cache_data(ttl=600)
 def fetch_kabutan_news(ticker_code: str, max_items: int = 8) -> list[dict]:
     """
-    株探の銘柄個別ニュースページ（/stock/news?code=XXXX）から
-    その銘柄に関するニュースのみ取得。
-    株探の銘柄ニュースページには、ニュースブロックが
-    <div class="s-news-list"> や <table class="stock_table"> の中にある。
+    株探の銘柄ニュースページから取得。
+    URL: https://kabutan.jp/stock/news?code=XXXX
+
+    HTMLファイル実測による確定構造:
+    ─────────────────────────────────────────────────
+    <table class="s_news_list mgbt0">
+      <tbody>
+        <tr>
+          <td class="news_time">
+            <time datetime="2026-02-19T17:00:03+09:00">26/02/19&nbsp;17:00</time>
+          </td>
+          <td>
+            <div class="newslist_ctg newsctg5_b">特集</div>
+          </td>
+          <td>
+            <a href="https://kabutan.jp/stock/news?code=5803&b=n202602191135">
+              レーティング日報【最上位を継続＋目標株価を増額】(2月19日)
+            </a>
+          </td>
+        </tr>
+        ...
+        <!-- 開示（PDF）の場合 -->
+        <tr>
+          <td class="news_time"><time ...>26/02/09&nbsp;14:00</time></td>
+          <td><div class="newslist_ctg newsctg_kaiji_b">開示</div></td>
+          <td class="td_kaiji">
+            <a href="https://kabutan.jp/disclosures/pdf/20260209/140120260206550334/" target="pdf">
+              2026年３月期通期連結業績予想...
+            </a>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+    ─────────────────────────────────────────────────
+    ※ このページ自体が code=XXXX の銘柄専用ページなので
+      取得記事はすべて銘柄固有情報。
+    ※ リンクURLに &b=n... (ニュース) または /disclosures/pdf/... (開示PDF) の2種類あり。
+    ※ プレミアム記事は <img class="vat pdr4"> が挿入される。
     """
     code = ticker_code.replace(".T", "")
     url = f"https://kabutan.jp/stock/news?code={code}"
+    headers = {
+        **_NEWS_HEADERS,
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+        "Referer": "https://kabutan.jp/",
+    }
     try:
-        r = requests.get(url, headers=_NEWS_HEADERS, timeout=15)
+        r = requests.get(url, headers=headers, timeout=15)
         if r.status_code != 200:
             return []
         html = r.text
 
-        # 株探の銘柄ニュースページ構造:
-        # <a href="/news/marketnews/?b=nXXXXXXXXXX">タイトル</a>
-        # marketnews の記事URLと一緒にある日時を抽出
-        pattern = re.compile(
-            r'<td[^>]*class="[^"]*kjTime[^"]*"[^>]*>([^<]+)</td>'
-            r'.*?<a\s+href="(/news/[^"]+)"[^>]*>([^<]{3,120})</a>',
-            re.DOTALL
+        # ── s_news_list テーブルを抽出 ─────────────────────────
+        # テーブル全体を取得
+        table_match = re.search(
+            r'class="s_news_list[^"]*"[^>]*>(.*?)</table>',
+            html, re.DOTALL
         )
-        matches = pattern.findall(html)
+        if not table_match:
+            return []
+        table_html = table_match.group(1)
 
-        # フォールバック: シンプルなリンクパターン
-        if not matches:
-            links = re.findall(
-                r'<a\s+href="(/news/marketnews/\?b=[^"]+)"[^>]*>([^<]{3,120})</a>',
-                html
-            )
-            times = re.findall(r'(\d{2}/\d{2}\s+\d{2}:\d{2})', html)
-            matches = [
-                (times[i] if i < len(times) else "", path, title)
-                for i, (path, title) in enumerate(links)
-            ]
+        # ── tr 行ごとにパース ──────────────────────────────────
+        rows = re.findall(r'<tr[^>]*>(.*?)</tr>', table_html, re.DOTALL)
+
+        # カテゴリ判定マップ
+        ctg_class_map = {
+            "newsctg2_b":    "材料",
+            "newsctg3_kk_b": "決算",
+            "newsctg4_b":    "テク",
+            "newsctg5_b":    "特集",
+            "newsctg_kaiji_b": "開示",
+        }
+        badge_emoji = {
+            "材料": "🟢", "決算": "🔵", "テク": "⚪",
+            "特集": "🟠", "開示": "🔴",
+        }
 
         items = []
-        for time_str, path, title in matches[:max_items]:
-            title = title.strip()
-            # ナビゲーションや汎用ラベルをスキップ
-            if len(title) < 4 or title in ("市場ニュース", "決算速報", "会社開示情報", "株価注意報"):
+        for row in rows:
+            # ① 日時: <time datetime="2026-02-19T17:00:03+09:00">
+            time_match = re.search(r'<time[^>]+datetime="([^"]+)"', row)
+            if not time_match:
                 continue
+            # datetime属性から読みやすい形式に変換
+            dt_raw = time_match.group(1)  # "2026-02-19T17:00:03+09:00"
+            dt_disp = re.search(r'(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2})', dt_raw)
+            date_str = f"{dt_disp.group(1)} {dt_disp.group(2)}" if dt_disp else dt_raw[:16]
+
+            # ② カテゴリバッジ: class="newslist_ctg newsctgX_b"
+            badge = ""
+            for cls, label in ctg_class_map.items():
+                if cls in row:
+                    badge = label
+                    break
+
+            # ③ リンクとタイトル: 2パターン
+            #    a) ニュース: href="https://kabutan.jp/stock/news?code=XXXX&b=nXXX"
+            #    b) 開示PDF:  href="https://kabutan.jp/disclosures/pdf/..."
+            link_match = re.search(
+                r'<a\s+href="(https://kabutan\.jp/(?:stock/news\?[^"]+|disclosures/pdf/[^"]+))"'
+                r'[^>]*>\s*(.*?)\s*</a>',
+                row, re.DOTALL
+            )
+            if not link_match:
+                continue
+
+            link = link_match.group(1).replace("&amp;", "&")
+            # タイトルからHTMLタグ（imgなど）を除去
+            title = re.sub(r'<[^>]+>', '', link_match.group(2)).strip()
+
+            if len(title) < 3:
+                continue
+
+            # ④ プレミアム記事の検出（ロック画像が挿入される）
+            is_premium = "🔒 " if "premium" in row.lower() or "pdr4" in row else ""
+
+            emoji = badge_emoji.get(badge, "📰")
+
             items.append({
                 "source": "株探(Kabutan)",
-                "title": title,
-                "link": f"https://kabutan.jp{path}",
-                "date": time_str.strip(),
+                "title": f"{is_premium}{title}",
+                "badge": badge,
+                "badge_emoji": emoji,
+                "link": link,
+                "date": date_str,
                 "summary": "",
                 "ticker_specific": True,
             })
+
+            if len(items) >= max_items:
+                break
+
         return items
+
     except Exception:
         return []
 
@@ -893,11 +979,18 @@ with tab_news:
                     with st.expander(f"{icon} [{item['source']}]　{title_short}"):
                         c1, c2 = st.columns([3, 1])
                         with c1:
+                            badge_text = item.get("badge", "")
+                            badge_map = {
+                                "特集": "🟠 特集", "材料": "🟢 材料", "決算": "🔵 決算",
+                                "開示": "🔴 開示", "テク": "⚪ テク", "速報": "🟡 速報",
+                            }
+                            badge_label = badge_map.get(badge_text, f"◾ {badge_text}" if badge_text else "")
+                            if badge_label:
+                                st.caption(badge_label)
                             st.markdown(f"**{item['title']}**")
-                            if badge:
-                                st.markdown(badge)
-                            if item.get("summary") and item["summary"] != "📄 適時開示PDF":
-                                st.caption(item["summary"])
+                            if item.get("summary") and item["summary"] not in ("📄 適時開示PDF", ""):
+                                if not item["summary"].startswith("["):
+                                    st.caption(item["summary"])
                         with c2:
                             if item.get("date"):
                                 st.caption(f"🕐 {item['date']}")
