@@ -975,6 +975,17 @@ with tab_analysis:
 with tab_news:
     st.subheader("📰 銘柄別ニュース")
 
+    # ── session_state 初期化 ──────────────────────────────────────
+    # ニュースデータとAI要約結果をページ再レンダリング後も保持する
+    if "news_by_src" not in st.session_state:
+        st.session_state.news_by_src = {}
+    if "news_ticker" not in st.session_state:
+        st.session_state.news_ticker = ""
+    if "tdnet_summaries" not in st.session_state:
+        st.session_state.tdnet_summaries = {}   # key: "{ticker}_{idx}" -> summary str
+    if "sentiment_result" not in st.session_state:
+        st.session_state.sentiment_result = {}  # key: ticker -> summary str
+
     # 銘柄選択
     ticker_options = {f"{name}（{t}）": t for t, (name, _) in ticker_name_map.items()}
     default_idx = list(ticker_options.keys()).index("トヨタ（7203.T）") if "トヨタ（7203.T）" in ticker_options else 0
@@ -982,6 +993,13 @@ with tab_news:
     selected_ticker = ticker_options[selected_label]
     selected_name   = ticker_name_map[selected_ticker][0]
     selected_code   = selected_ticker.replace(".T", "")
+
+    # 銘柄が変わったらキャッシュをリセット
+    if st.session_state.news_ticker != selected_ticker:
+        st.session_state.news_by_src = {}
+        st.session_state.tdnet_summaries = {}
+        st.session_state.sentiment_result = {}
+        st.session_state.news_ticker = selected_ticker
 
     col_btn1, col_btn2 = st.columns([1, 4])
     with col_btn1:
@@ -999,10 +1017,20 @@ with tab_news:
         "Reuters JP":        {"icon": "🟫", "label": "Reuters",            "desc": "銘柄言及のみ"},
     }
 
+    # ── ニュース取得（ボタン押下時のみ実行、結果はsession_stateへ）─
     if run_news:
         with st.spinner(f"{selected_name}（{selected_ticker}）のニュースを全ソースから並列取得中..."):
-            news_by_src = fetch_news_by_source(selected_ticker, selected_name, news_max_per_source)
+            st.session_state.news_by_src = fetch_news_by_source(
+                selected_ticker, selected_name, news_max_per_source
+            )
+        st.session_state.tdnet_summaries = {}   # 銘柄再取得したら要約リセット
+        st.session_state.sentiment_result = {}
 
+    # ── 取得済みデータがあれば常に表示 ───────────────────────────
+    news_by_src = st.session_state.news_by_src
+    if not news_by_src:
+        st.info("「▶ ニュースを取得」ボタンを押してください")
+    else:
         total = sum(len(v) for v in news_by_src.values())
         st.caption(f"取得完了 — 合計 {total} 件")
 
@@ -1037,32 +1065,42 @@ with tab_news:
                     continue
 
                 for idx_item, item in enumerate(items):
-                    title = item["title"]
-                    link  = item.get("link", "")
-                    date  = item.get("date", "")
+                    title       = item["title"]
+                    link        = item.get("link", "")
+                    date        = item.get("date", "")
                     badge_emoji = item.get("badge_emoji", "")
                     badge_text  = item.get("badge", "")
 
                     col_t, col_d = st.columns([5, 1])
                     with col_t:
                         if src_key == "TDnet（適時開示）":
-                            # TDnet: PDF リンク + AI要約ボタン
+                            # タイトル＋PDFリンク
                             if link:
                                 st.markdown(f"🔴 [{title} 📄]({link})")
                             else:
                                 st.markdown(f"🔴 {title} 📄")
-                            # AI要約ボタン（件数が多いので個別トリガー）
-                            btn_key = f"ai_tdnet_{selected_code}_{idx_item}"
+
+                            # AI要約ボタン
+                            summary_key = f"{selected_code}_{idx_item}"
+                            btn_key     = f"btn_tdnet_{summary_key}"
+
                             if st.button("🤖 AIで要約", key=btn_key):
                                 with st.spinner("PDF内容を取得・要約中..."):
-                                    summary = ai_summarize_tdnet_pdf(link, title)
-                                st.info(summary)
+                                    result = ai_summarize_tdnet_pdf(link, title)
+                                # session_state に保存 → ボタン再押しでも消えない
+                                st.session_state.tdnet_summaries[summary_key] = result
+
+                            # 要約結果を表示（session_stateから読む）
+                            if summary_key in st.session_state.tdnet_summaries:
+                                st.info(st.session_state.tdnet_summaries[summary_key])
+
                         else:
                             prefix = f"{badge_emoji}{badge_text} " if badge_text else ""
                             if link:
                                 st.markdown(f"{prefix}[{title}]({link})")
                             else:
                                 st.markdown(f"{prefix}{title}")
+
                     with col_d:
                         if date:
                             date_short = date[:10] if len(date) >= 10 else date
@@ -1072,19 +1110,23 @@ with tab_news:
                         st.markdown("---")
 
         # ── AI 総合センチメント ───────────────────────────────────
-        if run_ai and total > 0:
+        if run_ai:
             st.divider()
             st.subheader(f"🤖 {selected_name} AI センチメント分析")
 
-            # 全ソースのタイトルを集約してAIに渡す
-            all_headlines = []
-            for src_key, items in news_by_src.items():
-                for it in items:
-                    all_headlines.append(f"[{src_key}] {it['title']}")
-
-            with st.spinner("AI分析中..."):
-                ai_result = ai_news_summary(all_headlines, selected_name, selected_ticker)
-            st.info(ai_result)
+            # 既にsession_stateに結果があればそのまま表示
+            if selected_ticker in st.session_state.sentiment_result:
+                st.info(st.session_state.sentiment_result[selected_ticker])
+            elif total > 0:
+                all_headlines = [
+                    f"[{src}] {it['title']}"
+                    for src, its in news_by_src.items()
+                    for it in its
+                ]
+                with st.spinner("AI分析中..."):
+                    ai_result = ai_news_summary(all_headlines, selected_name, selected_ticker)
+                st.session_state.sentiment_result[selected_ticker] = ai_result
+                st.info(ai_result)
 
 
 # ─── Tab3: 市場全体ニュース ──────────────────────────────────────
