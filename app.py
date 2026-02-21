@@ -7,18 +7,21 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
 from groq import Groq
+import requests
+import xml.etree.ElementTree as ET
+import re
+from io import StringIO
 
 # -----------------------------
-# フォント設定（日本語対応・確実版）
+# フォント設定（日本語対応）
 # -----------------------------
 import matplotlib.font_manager as fm
 import os
 
-# リポジトリ内フォントを最優先、次にシステムフォントを探す
 _FONT_PATHS = [
-    "font/NotoSansCJK-Regular.ttc",        # ★ リポジトリ内（Streamlit Cloud用）
-    "font/NotoSansJP-ExtraBold.ttf",        # ★ リポジトリ内（同上）
-    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",  # Linuxシステム
+    "font/NotoSansCJK-Regular.ttc",
+    "font/NotoSansJP-ExtraBold.ttf",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Medium.ttc",
     "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf",
     "/usr/share/fonts/opentype/ipafont-gothic/ipag.ttf",
@@ -40,13 +43,13 @@ plt.rcParams["axes.unicode_minus"] = False
 # 定数
 # -----------------------------
 GEMINI_MODEL = "gemini-2.5-pro"
-GROQ_MODEL   = "llama3-70b-8192"   # フォールバック用
+GROQ_MODEL   = "llama3-70b-8192"
 
 # -----------------------------
 # ページ設定
 # -----------------------------
-st.set_page_config(layout="wide")
-st.title("📈 日本株 シャープレシオ分析")
+st.set_page_config(layout="wide", page_title="📈 日本株 分析ダッシュボード", page_icon="📈")
+st.title("📈 日本株 シャープレシオ分析 + ニュース統合")
 
 # -----------------------------
 # AI設定（Gemini優先 / Groqフォールバック）
@@ -58,22 +61,17 @@ gemini_model = genai.GenerativeModel(GEMINI_MODEL)
 groq_client  = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 def generate_ai_comment(prompt: str) -> tuple[str, str]:
-    """Geminiで生成。429/quota系エラー時はGroqへ自動フォールバック。
-    Returns: (コメント本文, 使用したAI名)
-    """
-    # --- Gemini を試みる ---
+    """Gemini → Groq フォールバック"""
     try:
         response = gemini_model.generate_content(prompt)
         return response.text, "Gemini"
     except Exception as e:
         err_str = str(e)
-        is_quota_error = "429" in err_str or "quota" in err_str.lower() or "RESOURCE_EXHAUSTED" in err_str
-        if not is_quota_error:
-            raise  # クォータ以外のエラーはそのまま上げる
-
-    # --- Groqへフォールバック ---
+        is_quota = "429" in err_str or "quota" in err_str.lower() or "RESOURCE_EXHAUSTED" in err_str
+        if not is_quota:
+            raise
     if groq_client is None:
-        raise RuntimeError("Geminiのクォータ超過。GROQ_API_KEY が設定されていないためフォールバック不可。")
+        raise RuntimeError("Geminiクォータ超過 & GROQ_API_KEY 未設定")
     chat = groq_client.chat.completions.create(
         model=GROQ_MODEL,
         messages=[{"role": "user", "content": prompt}],
@@ -81,18 +79,294 @@ def generate_ai_comment(prompt: str) -> tuple[str, str]:
     )
     return chat.choices[0].message.content, "Groq"
 
-# -----------------------------
-# サイドバー：入力パラメータ
-# -----------------------------
+# ================================================================
+# 📰 ニュース取得モジュール
+# ================================================================
+
+_NEWS_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+
+# ── ① Yahoo!ファイナンス Japan RSS ─────────────────────────────
+@st.cache_data(ttl=600)
+def fetch_yahoo_jp_news(ticker_code: str, max_items: int = 8) -> list[dict]:
+    """
+    Yahoo!ファイナンス Japan の銘柄別ニュースRSSを取得。
+    ticker_code: '7203' など（.T なし）
+    """
+    code = ticker_code.replace(".T", "")
+    url = f"https://finance.yahoo.co.jp/rss/stocks/{code}"
+    try:
+        r = requests.get(url, headers=_NEWS_HEADERS, timeout=10)
+        if r.status_code != 200:
+            return []
+        root = ET.fromstring(r.content)
+        items = []
+        for item in root.findall(".//item")[:max_items]:
+            title = item.findtext("title", "").strip()
+            link  = item.findtext("link", "").strip()
+            pubdate = item.findtext("pubDate", "").strip()
+            desc  = item.findtext("description", "").strip()
+            # HTMLタグ除去
+            desc = re.sub(r"<[^>]+>", "", desc)[:100]
+            if title:
+                items.append({"source": "Yahoo!Finance JP", "title": title,
+                              "link": link, "date": pubdate, "summary": desc})
+        return items
+    except Exception:
+        return []
+
+
+# ── ② 株探（Kabutan）銘柄別ニュース ────────────────────────────
+@st.cache_data(ttl=600)
+def fetch_kabutan_news(ticker_code: str, max_items: int = 8) -> list[dict]:
+    """
+    株探の銘柄ニュースページをスクレイピング。
+    ticker_code: '7203' など
+    """
+    code = ticker_code.replace(".T", "")
+    url = f"https://kabutan.jp/stock/news?code={code}"
+    try:
+        r = requests.get(url, headers=_NEWS_HEADERS, timeout=12)
+        if r.status_code != 200:
+            return []
+        # タイトルと日付を正規表現で抽出
+        # 株探の構造: <a href="/news/...">タイトル</a> と <time>日付</time>
+        titles = re.findall(
+            r'<a href="(/news/[^"]+)"[^>]*>([^<]{5,120})</a>', r.text
+        )
+        times  = re.findall(r'<time[^>]*>([^<]+)</time>', r.text)
+        items = []
+        for i, (path, title) in enumerate(titles[:max_items]):
+            title = title.strip()
+            if len(title) < 5 or "株探" in title:
+                continue
+            date = times[i].strip() if i < len(times) else ""
+            items.append({
+                "source": "株探(Kabutan)",
+                "title": title,
+                "link": f"https://kabutan.jp{path}",
+                "date": date,
+                "summary": "",
+            })
+        return items
+    except Exception:
+        return []
+
+
+# ── ③ みんかぶ 銘柄別ニュース ───────────────────────────────────
+@st.cache_data(ttl=600)
+def fetch_minkabu_news(ticker_code: str, max_items: int = 6) -> list[dict]:
+    """みんかぶの銘柄ニュースを取得"""
+    code = ticker_code.replace(".T", "")
+    url = f"https://minkabu.jp/stock/{code}/news"
+    try:
+        r = requests.get(url, headers=_NEWS_HEADERS, timeout=12)
+        if r.status_code != 200:
+            return []
+        # ニュースタイトルと日付の抽出
+        titles = re.findall(
+            r'<a[^>]+href="(/stock/[^"]+/news/[^"]+)"[^>]*>\s*<[^>]+>\s*([^<]{5,120})\s*</[^>]+>',
+            r.text,
+        )
+        if not titles:
+            # より広いパターン
+            titles = re.findall(
+                r'class="[^"]*news[^"]*"[^>]*>.*?<a[^>]+href="([^"]+)"[^>]*>([^<]{5,120})</a>',
+                r.text, re.DOTALL
+            )
+        dates = re.findall(r'\d{4}/\d{2}/\d{2}', r.text)
+        items = []
+        for i, (path, title) in enumerate(titles[:max_items]):
+            title = title.strip()
+            if len(title) < 5:
+                continue
+            link = f"https://minkabu.jp{path}" if path.startswith("/") else path
+            date = dates[i] if i < len(dates) else ""
+            items.append({
+                "source": "みんかぶ",
+                "title": title,
+                "link": link,
+                "date": date,
+                "summary": "",
+            })
+        return items
+    except Exception:
+        return []
+
+
+# ── ④ TDnet（適時開示情報）銘柄別 ─────────────────────────────
+@st.cache_data(ttl=900)
+def fetch_tdnet_news(ticker_code: str, max_items: int = 6) -> list[dict]:
+    """
+    TDnet（東京証券取引所 適時開示情報）から銘柄の最新開示を取得。
+    JPX の開示検索API（非公式）を使用。
+    """
+    code = ticker_code.replace(".T", "")
+    url = (
+        "https://www.release.tdnet.info/inbs/I_list_001_"
+        f"{datetime.today().strftime('%Y%m%d')}.html"
+    )
+    # TDnet の検索エンドポイント（銘柄コード指定）
+    search_url = f"https://www.release.tdnet.info/inbs/I_main_00.html?target-code={code}"
+    try:
+        r = requests.get(search_url, headers=_NEWS_HEADERS, timeout=12)
+        if r.status_code != 200:
+            return []
+        # タイトルと PDF リンクを抽出
+        rows = re.findall(
+            r'<td[^>]*class="[^"]*kjTitle[^"]*"[^>]*>(.*?)</td>.*?'
+            r'href="([^"]+\.pdf)"',
+            r.text, re.DOTALL
+        )
+        items = []
+        for title_raw, pdf_path in rows[:max_items]:
+            title = re.sub(r"<[^>]+>", "", title_raw).strip()
+            if not title:
+                continue
+            link = f"https://www.release.tdnet.info{pdf_path}" if pdf_path.startswith("/") else pdf_path
+            items.append({
+                "source": "TDnet（適時開示）",
+                "title": title,
+                "link": link,
+                "date": "",
+                "summary": "📄 PDF",
+            })
+        return items
+    except Exception:
+        return []
+
+
+# ── ⑤ 日経新聞 マーケット RSS ───────────────────────────────────
+@st.cache_data(ttl=600)
+def fetch_nikkei_market_rss(max_items: int = 8) -> list[dict]:
+    """日経新聞マーケットニュース RSS（全体市況）"""
+    url = "https://www.nikkei.com/rss/market.xml"
+    try:
+        r = requests.get(url, headers=_NEWS_HEADERS, timeout=10)
+        if r.status_code != 200:
+            return []
+        root = ET.fromstring(r.content)
+        items = []
+        for item in root.findall(".//item")[:max_items]:
+            title   = item.findtext("title", "").strip()
+            link    = item.findtext("link", "").strip()
+            pubdate = item.findtext("pubDate", "").strip()
+            if title:
+                items.append({"source": "日経新聞", "title": title,
+                              "link": link, "date": pubdate, "summary": ""})
+        return items
+    except Exception:
+        return []
+
+
+# ── ⑥ Reuters Japan RSS ────────────────────────────────────────
+@st.cache_data(ttl=600)
+def fetch_reuters_jp_rss(max_items: int = 8) -> list[dict]:
+    """Reuters日本語マーケットニュース"""
+    url = "https://feeds.reuters.com/reuters/JPBusinessNews"
+    try:
+        r = requests.get(url, headers=_NEWS_HEADERS, timeout=10)
+        if r.status_code != 200:
+            return []
+        root = ET.fromstring(r.content)
+        items = []
+        for item in root.findall(".//item")[:max_items]:
+            title   = item.findtext("title", "").strip()
+            link    = item.findtext("link", "").strip()
+            pubdate = item.findtext("pubDate", "").strip()
+            if title:
+                items.append({"source": "Reuters JP", "title": title,
+                              "link": link, "date": pubdate, "summary": ""})
+        return items
+    except Exception:
+        return []
+
+
+# ── ⑦ 統合ニュース取得（銘柄別 + 全体）─────────────────────────
+def fetch_all_news(ticker_code: str, max_per_source: int = 5) -> list[dict]:
+    """
+    全ニュースソースを並列取得してまとめる。
+    返り値: [{source, title, link, date, summary}, ...]
+    """
+    import concurrent.futures
+    code = ticker_code.replace(".T", "")
+
+    tasks = {
+        "yahoo_jp":  lambda: fetch_yahoo_jp_news(code, max_per_source),
+        "kabutan":   lambda: fetch_kabutan_news(code, max_per_source),
+        "minkabu":   lambda: fetch_minkabu_news(code, max_per_source),
+        "tdnet":     lambda: fetch_tdnet_news(code, max_per_source),
+        "nikkei":    lambda: fetch_nikkei_market_rss(max_per_source),
+        "reuters":   lambda: fetch_reuters_jp_rss(max_per_source),
+    }
+
+    all_items = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
+        futures = {ex.submit(fn): key for key, fn in tasks.items()}
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                all_items.extend(future.result())
+            except Exception:
+                pass
+
+    # 重複除去（タイトルが完全一致するもの）
+    seen, unique = set(), []
+    for item in all_items:
+        if item["title"] not in seen:
+            seen.add(item["title"])
+            unique.append(item)
+
+    return unique
+
+
+# ── ⑧ AI によるニュース要約・センチメント ───────────────────────
+def ai_news_summary(news_items: list[dict], company_name: str, ticker: str) -> str:
+    """ニュース一覧をAIで日本語要約・センチメント分析"""
+    if not news_items:
+        return "ニュースが取得できませんでした。"
+
+    headlines = "\n".join(
+        f"[{it['source']}] {it['title']}" for it in news_items[:15]
+    )
+    prompt = f"""
+以下は日本株「{company_name}（{ticker}）」に関する最新ニュース・適時開示の見出しです。
+
+{headlines}
+
+投資家向けに以下を日本語300文字以内でまとめてください：
+1. センチメント判定: 【強気 / 弱気 / 中立】
+2. 注目イベントの要点
+3. 株価への影響の可能性
+"""
+    try:
+        comment, ai_name = generate_ai_comment(prompt)
+        return f"{comment}\n\n_AI: {ai_name}_"
+    except Exception as e:
+        return f"AI分析エラー: {e}"
+
+
+# ================================================================
+# サイドバー
+# ================================================================
 with st.sidebar:
     st.header("⚙️ 分析パラメータ")
-    years = st.number_input("📅 過去何年で分析？", 1, 10, 3)
+    years          = st.number_input("📅 過去何年で分析？", 1, 10, 3)
     risk_free_rate = st.number_input("📉 無リスク金利（%）", 0.0, 10.0, 1.0, step=0.1) / 100
-    top_n = st.number_input("📊 上位何社を表示？", 5, 50, 20, step=5)
+    top_n          = st.number_input("📊 上位何社を表示？", 5, 50, 20, step=5)
+    st.divider()
 
-# -----------------------------
-# 銘柄
-# -----------------------------
+    st.header("📰 ニュース設定")
+    news_max_per_source = st.slider("各ソースの最大取得件数", 3, 10, 5)
+    show_news_sources = st.multiselect(
+        "表示するニュースソース",
+        ["Yahoo!Finance JP", "株探(Kabutan)", "みんかぶ", "TDnet（適時開示）", "日経新聞", "Reuters JP"],
+        default=["Yahoo!Finance JP", "株探(Kabutan)", "TDnet（適時開示）", "日経新聞", "Reuters JP"],
+    )
+    st.divider()
+    st.caption("データソース: Yahoo Finance, TDnet, 株探, みんかぶ, 日経, Reuters")
+
+# ================================================================
+# 銘柄マスタ
+# ================================================================
 ticker_name_map = {
     '1332.T': ('ニッスイ', '水産'),
     '1605.T': ('ＩＮＰＥＸ', '鉱業'),
@@ -321,13 +595,12 @@ ticker_name_map = {
     '9984.T': ('ＳＢＧ', '通信'),
 }
 
-# -----------------------------
-# データ取得（キャッシュあり）
-# -----------------------------
+# ================================================================
+# データ取得
+# ================================================================
 @st.cache_data(ttl=3600)
 def get_price(ticker, start, end):
     df = yf.download(ticker, start=start, end=end, progress=False)
-    # yfinance v0.2以降のMultiIndex対策
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.droplevel(1)
     return df
@@ -339,133 +612,238 @@ def get_benchmark(start, end):
         df.columns = df.columns.droplevel(1)
     return df
 
-# -----------------------------
-# 実行ボタン
-# -----------------------------
-if st.button("分析実行"):
+# ================================================================
+# メインタブ
+# ================================================================
+tab_analysis, tab_news, tab_market_news = st.tabs([
+    "📊 パフォーマンス分析",
+    "📰 銘柄別ニュース",
+    "🌐 市場全体ニュース",
+])
 
-    end_date = datetime.today()
-    # 修正: relativedeltaで正確な年数計算（閏年対応）
-    start_date = end_date - relativedelta(years=int(years))
+# ─── Tab1: パフォーマンス分析（既存機能） ────────────────────────
+with tab_analysis:
+    if st.button("▶ 分析実行", type="primary"):
+        end_date   = datetime.today()
+        start_date = end_date - relativedelta(years=int(years))
 
-    with st.spinner("市場データを取得中..."):
-        benchmark = get_benchmark(start_date, end_date)
+        with st.spinner("市場データ（日経225）を取得中..."):
+            benchmark = get_benchmark(start_date, end_date)
 
-    if benchmark.empty:
-        st.error("市場データ取得失敗")
-        st.stop()
+        if benchmark.empty:
+            st.error("市場データ取得失敗")
+            st.stop()
 
-    market_returns = benchmark["Close"].pct_change().dropna()
-    annual_market_return = market_returns.mean() * 252
+        market_returns = benchmark["Close"].pct_change().dropna()
 
-    results = []
-    progress = st.progress(0)
-    status_text = st.empty()
+        results = []
+        progress    = st.progress(0)
+        status_text = st.empty()
 
-    for i, (ticker, (name, sector)) in enumerate(ticker_name_map.items()):
-        status_text.text(f"取得中: {name} ({ticker})")
-        df = get_price(ticker, start_date, end_date)
-        progress.progress((i + 1) / len(ticker_name_map))
+        for i, (ticker, (name, sector)) in enumerate(ticker_name_map.items()):
+            status_text.text(f"取得中: {name} ({ticker})")
+            df = get_price(ticker, start_date, end_date)
+            progress.progress((i + 1) / len(ticker_name_map))
+            if df.empty:
+                continue
+            returns = df["Close"].pct_change().dropna()
+            common  = returns.index.intersection(market_returns.index)
+            if len(common) < 30:
+                continue
+            x = returns.loc[common].values.flatten()
+            y = market_returns.loc[common].values.flatten()
+            annual_return = x.mean() * 252
+            annual_vol    = x.std() * np.sqrt(252)
+            beta   = np.cov(x, y)[0][1] / np.var(y)
+            sharpe = (annual_return - risk_free_rate) / annual_vol
+            results.append({
+                "企業名": name, "業種": sector,
+                "年間平均リターン(%)": annual_return * 100,
+                "年間リスク(%)": annual_vol * 100,
+                "シャープレシオ": sharpe, "ベータ": beta,
+            })
 
-        if df.empty:
-            continue
+        progress.empty()
+        status_text.empty()
 
-        returns = df["Close"].pct_change().dropna()
-        common = returns.index.intersection(market_returns.index)
+        df_results = pd.DataFrame(results)
+        if df_results.empty:
+            st.error("データなし")
+            st.stop()
 
-        if len(common) < 30:
-            continue
+        df_results = df_results.sort_values("シャープレシオ", ascending=False)
 
-        x = returns.loc[common].values.flatten()
-        y = market_returns.loc[common].values.flatten()
+        st.subheader("📋 分析結果一覧")
+        st.dataframe(
+            df_results.style.format({
+                "年間平均リターン(%)": "{:.2f}",
+                "年間リスク(%)": "{:.2f}",
+                "シャープレシオ": "{:.2f}",
+                "ベータ": "{:.2f}",
+            }),
+            use_container_width=True,
+        )
 
-        annual_return = x.mean() * 252
-        annual_vol = x.std() * np.sqrt(252)
-        beta = np.cov(x, y)[0][1] / np.var(y)
-        # 修正: サイドバーで設定した無リスク金利を使用
-        sharpe = (annual_return - risk_free_rate) / annual_vol
+        top_n_int   = int(top_n)
+        top_stocks  = df_results.head(top_n_int)
 
-        results.append({
-            "企業名": name,
-            "業種": sector,
-            "年間平均リターン(%)": annual_return * 100,
-            "年間リスク(%)": annual_vol * 100,
-            "シャープレシオ": sharpe,
-            "ベータ": beta
-        })
+        fig1, ax1 = plt.subplots(figsize=(14, 6))
+        ax1.bar(top_stocks["企業名"], top_stocks["シャープレシオ"], color="green")
+        ax1.set_title(f"シャープレシオ 上位{top_n_int}社")
+        ax1.set_ylabel("シャープレシオ")
+        ax1.tick_params(axis="x", rotation=45)
+        plt.tight_layout()
+        st.pyplot(fig1)
+        plt.close(fig1)
 
-    # プログレスバーとステータステキストを消去
-    progress.empty()
-    status_text.empty()
+        fig2, ax2 = plt.subplots(figsize=(14, 6))
+        ax2.bar(top_stocks["企業名"], top_stocks["年間平均リターン(%)"], color="steelblue")
+        ax2.set_title(f"年間平均リターン(%) 上位{top_n_int}社")
+        ax2.set_ylabel("年間平均リターン(%)")
+        ax2.tick_params(axis="x", rotation=45)
+        plt.tight_layout()
+        st.pyplot(fig2)
+        plt.close(fig2)
 
-    df_results = pd.DataFrame(results)
+        # AI コメント
+        summary = top_stocks.head(5).to_string()
+        prompt = f"""
+以下は日本株のリスク・リターン分析結果です。
+投資家向けに簡潔に300文字以内で評価してください。
 
-    if df_results.empty:
-        st.error("データなし")
-        st.stop()
+{summary}
+"""
+        try:
+            comment, ai_name = generate_ai_comment(prompt)
+            st.subheader(f"🤖 AIコメント（{ai_name}）")
+            st.write(comment)
+        except Exception as e:
+            st.warning(f"AI APIエラー: {e}")
 
-    df_results = df_results.sort_values("シャープレシオ", ascending=False)
+# ─── Tab2: 銘柄別ニュース ────────────────────────────────────────
+with tab_news:
+    st.subheader("📰 銘柄別ニュース・適時開示")
 
-    # =============================
-    # 📋 表表示
-    # =============================
-    st.subheader("📋 分析結果一覧")
+    # 銘柄選択
+    ticker_options = {f"{name}（{t}）": t for t, (name, _) in ticker_name_map.items()}
+    selected_label = st.selectbox("銘柄を選択", list(ticker_options.keys()),
+                                  index=list(ticker_options.keys()).index("トヨタ（7203.T）") if "トヨタ（7203.T）" in ticker_options else 0)
+    selected_ticker = ticker_options[selected_label]
+    selected_name   = ticker_name_map[selected_ticker][0]
 
-    st.dataframe(
-        df_results.style.format({
-            "年間平均リターン(%)": "{:.2f}",
-            "年間リスク(%)": "{:.2f}",
-            "シャープレシオ": "{:.2f}",
-            "ベータ": "{:.2f}"
-        }),
-        use_container_width=True
-    )
+    col_btn1, col_btn2 = st.columns([1, 4])
+    with col_btn1:
+        run_news = st.button("▶ ニュースを取得", type="primary")
+    with col_btn2:
+        run_ai   = st.checkbox("🤖 AIによる要約・センチメント分析も行う", value=True)
 
-    # =============================
-    # 📊 上位N社データ（修正: ifブロック内に移動）
-    # =============================
-    top_n = int(top_n)
-    top_stocks = df_results.head(top_n)
+    if run_news:
+        with st.spinner(f"{selected_name} のニュースを全ソースから取得中..."):
+            all_news = fetch_all_news(selected_ticker, news_max_per_source)
 
-    # =============================
-    # 📊 シャープレシオ（縦棒）
-    # =============================
-    fig1, ax1 = plt.subplots(figsize=(14, 6))
-    ax1.bar(top_stocks["企業名"], top_stocks["シャープレシオ"], color="green")
-    ax1.set_title(f"シャープレシオ 上位{top_n}社")
-    ax1.set_ylabel("シャープレシオ")
-    ax1.tick_params(axis='x', rotation=45)
-    plt.tight_layout()
-    st.pyplot(fig1)
-    plt.close(fig1)
+        # フィルタリング（サイドバーで選択したソースのみ）
+        filtered = [n for n in all_news if n["source"] in show_news_sources] if show_news_sources else all_news
 
-    # =============================
-    # 📊 年間平均リターン（縦棒）
-    # =============================
-    fig2, ax2 = plt.subplots(figsize=(14, 6))
-    ax2.bar(top_stocks["企業名"], top_stocks["年間平均リターン(%)"], color="steelblue")
-    ax2.set_title(f"年間平均リターン(%) 上位{top_n}社")
-    ax2.set_ylabel("年間平均リターン(%)")
-    ax2.tick_params(axis='x', rotation=45)
-    plt.tight_layout()
-    st.pyplot(fig2)
-    plt.close(fig2)
+        if not filtered:
+            st.warning("ニュースが取得できませんでした（ソース設定を確認してください）")
+        else:
+            # ソース別に色分け表示
+            source_colors = {
+                "Yahoo!Finance JP":  "🟦",
+                "株探(Kabutan)":     "🟩",
+                "みんかぶ":          "🟨",
+                "TDnet（適時開示）": "🟥",
+                "日経新聞":          "⬛",
+                "Reuters JP":        "🟫",
+            }
 
-    # =============================
-    # 🤖 Geminiコメント（修正: ifブロック内に移動）
-    # =============================
-    summary = top_stocks.head(5).to_string()
+            # ソース別集計
+            from collections import Counter
+            src_counts = Counter(n["source"] for n in filtered)
+            cols_stat  = st.columns(len(src_counts))
+            for i, (src, cnt) in enumerate(src_counts.items()):
+                icon = source_colors.get(src, "⚪")
+                cols_stat[i].metric(f"{icon} {src}", f"{cnt}件")
 
-    prompt = f"""
-    以下は日本株のリスク・リターン分析結果です。
-    投資家向けに簡潔に300文字以内で評価してください。
+            st.divider()
 
-    {summary}
-    """
+            # ニュース一覧表示
+            for item in filtered:
+                icon = source_colors.get(item["source"], "⚪")
+                with st.expander(f"{icon} [{item['source']}] {item['title'][:60]}{'…' if len(item['title'])>60 else ''}"):
+                    c1, c2 = st.columns([3, 1])
+                    with c1:
+                        st.markdown(f"**{item['title']}**")
+                        if item.get("summary"):
+                            st.caption(item["summary"])
+                    with c2:
+                        if item.get("date"):
+                            st.caption(f"📅 {item['date']}")
+                        if item.get("link"):
+                            st.markdown(f"[🔗 記事を開く]({item['link']})")
 
-    try:
-        comment, ai_name = generate_ai_comment(prompt)
-        st.subheader(f"🤖 AIコメント（{ai_name}）")
-        st.write(comment)
-    except Exception as e:
-        st.warning(f"AI APIエラー: {e}")
+            # AI 分析
+            if run_ai:
+                st.divider()
+                st.subheader("🤖 AI ニュース分析（センチメント）")
+                with st.spinner("AI分析中..."):
+                    ai_result = ai_news_summary(filtered, selected_name, selected_ticker)
+                st.info(ai_result)
+
+# ─── Tab3: 市場全体ニュース ──────────────────────────────────────
+with tab_market_news:
+    st.subheader("🌐 市場全体ニュース（日経・Reuters）")
+
+    if st.button("▶ 市場ニュースを取得", type="primary"):
+        import concurrent.futures
+
+        with st.spinner("市場ニュースを取得中..."):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+                f_nikkei  = ex.submit(fetch_nikkei_market_rss, 10)
+                f_reuters = ex.submit(fetch_reuters_jp_rss, 10)
+                nikkei_news  = f_nikkei.result()
+                reuters_news = f_reuters.result()
+
+        col_n, col_r = st.columns(2)
+
+        with col_n:
+            st.markdown("### ⬛ 日経新聞 マーケットニュース")
+            if nikkei_news:
+                for item in nikkei_news:
+                    st.markdown(f"- [{item['title']}]({item['link']})")
+                    if item.get("date"):
+                        st.caption(f"  📅 {item['date']}")
+            else:
+                st.info("取得できませんでした（日経新聞RSSは会員制の場合があります）")
+
+        with col_r:
+            st.markdown("### 🟫 Reuters Japan ビジネスニュース")
+            if reuters_news:
+                for item in reuters_news:
+                    st.markdown(f"- [{item['title']}]({item['link']})")
+                    if item.get("date"):
+                        st.caption(f"  📅 {item['date']}")
+            else:
+                st.info("取得できませんでした")
+
+        # 全市場ニュースをAIで要約
+        all_market = nikkei_news + reuters_news
+        if all_market and st.checkbox("🤖 市場全体のAI要約を表示", value=True):
+            headlines = "\n".join(f"[{n['source']}] {n['title']}" for n in all_market[:12])
+            prompt = f"""
+以下は本日の日本株マーケット関連ニュースです。
+
+{headlines}
+
+投資家向けに以下を日本語300文字以内でまとめてください：
+1. 本日の市場全体のセンチメント（強気/弱気/中立）
+2. 注目テーマ・セクター
+3. 今後の注意点
+"""
+            with st.spinner("AI要約中..."):
+                try:
+                    comment, ai_name = generate_ai_comment(prompt)
+                    st.subheader(f"🤖 市場全体AI要約（{ai_name}）")
+                    st.info(comment)
+                except Exception as e:
+                    st.warning(f"AI APIエラー: {e}")
