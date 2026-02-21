@@ -344,59 +344,169 @@ def fetch_kabutan_news(ticker_code: str, max_items: int = 8) -> list[dict]:
         return []
 
 
-# ── ③ CNBC Asia / Japan RSS ─────────────────────────────────────
+# ── 英語社名マッピング（主要銘柄） ───────────────────────────────
+_JP_EN_NAME_MAP = {
+    "トヨタ": "Toyota", "ホンダ": "Honda", "日産自": "Nissan", "ソニーＧ": "Sony",
+    "三菱ＵＦＪ": "Mitsubishi UFJ", "三井住友ＦＧ": "Sumitomo Mitsui",
+    "みずほＦＧ": "Mizuho", "ソフトバンク": "SoftBank", "ＳＢＧ": "SoftBank",
+    "任天堂": "Nintendo", "パナＨＤ": "Panasonic", "日立": "Hitachi",
+    "富士通": "Fujitsu", "ＮＥＣ": "NEC", "キヤノン": "Canon",
+    "シャープ": "Sharp", "東エレク": "Tokyo Electron", "信越化": "Shin-Etsu",
+    "村田製": "Murata", "京セラ": "Kyocera", "ダイキン": "Daikin",
+    "コマツ": "Komatsu", "ファナック": "Fanuc", "キーエンス": "Keyence",
+    "ルネサス": "Renesas", "アドテスト": "Advantest", "レーザーテク": "Lasertec",
+    "ディスコ": "Disco", "ニデック": "Nidec", "三菱電": "Mitsubishi Electric",
+    "伊藤忠": "Itochu", "三菱商": "Mitsubishi Corp", "三井物": "Mitsui",
+    "住友商": "Sumitomo Corp", "丸紅": "Marubeni", "武田": "Takeda",
+    "エーザイ": "Eisai", "第一三共": "Daiichi Sankyo", "中外薬": "Chugai",
+    "アステラス": "Astellas", "リクルート": "Recruit", "メルカリ": "Mercari",
+    "楽天グループ": "Rakuten", "ＮＴＴ": "NTT", "ＫＤＤＩ": "KDDI",
+    "東京海上": "Tokio Marine", "ＪＴ": "Japan Tobacco",
+    "日本製鉄": "Nippon Steel", "ブリヂストン": "Bridgestone",
+    "ＪＡＬ": "Japan Airlines", "ＡＮＡＨＤ": "ANA",
+}
+
+def _get_en_name(company_name: str) -> str:
+    """日本語社名から英語名を推定"""
+    for jp, en in _JP_EN_NAME_MAP.items():
+        if jp in company_name:
+            return en
+    # ローマ字っぽい文字列を含む場合はそのまま
+    ascii_part = re.sub(r'[^\x20-\x7E]', '', company_name).strip()
+    return ascii_part if len(ascii_part) >= 2 else ""
+
+
+# ── Google News RSS（過去90日）銘柄検索 ──────────────────────────
+@st.cache_data(ttl=600)
+def _fetch_google_news_rss(query: str, source_filter: str, max_items: int, days: int = 90) -> list[dict]:
+    """
+    Google News RSS で query を検索し、指定ソースの記事のみ返す。
+    days: 過去何日以内の記事のみ返すか
+    """
+    import datetime as dt
+    import urllib.parse
+
+    q_enc = urllib.parse.quote(query)
+    url = f"https://news.google.com/rss/search?q={q_enc}&hl=ja&gl=JP&ceid=JP:ja"
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)
+
+    try:
+        r = requests.get(url, headers=_NEWS_HEADERS, timeout=15)
+        if r.status_code != 200:
+            return []
+        # Google News RSSはUTF-8
+        content = r.content
+        # namespace宣言が壊れることがあるので前処理
+        content = re.sub(rb'<\?xml[^?]*\?>', b'<?xml version="1.0" encoding="UTF-8"?>', content)
+        root = ET.fromstring(content)
+        items = []
+        for item in root.findall(".//item"):
+            title   = item.findtext("title", "").strip()
+            link    = item.findtext("link", "").strip()
+            pubdate = item.findtext("pubDate", "").strip()
+            source_elem = item.find("source")
+            source_name = source_elem.text.strip() if source_elem is not None else ""
+
+            if not title:
+                continue
+
+            # ソースフィルタ（部分一致）
+            if source_filter and source_filter.lower() not in source_name.lower():
+                continue
+
+            # 日付フィルタ（過去days日以内）
+            if pubdate:
+                try:
+                    from email.utils import parsedate_to_datetime
+                    pub_dt = parsedate_to_datetime(pubdate)
+                    if pub_dt.tzinfo is None:
+                        import datetime as dt2
+                        pub_dt = pub_dt.replace(tzinfo=dt2.timezone.utc)
+                    if pub_dt < cutoff:
+                        continue
+                    date_str = pub_dt.strftime("%Y-%m-%d %H:%M")
+                except Exception:
+                    date_str = pubdate[:16]
+            else:
+                date_str = ""
+
+            items.append({
+                "title": title,
+                "link": link,
+                "date": date_str,
+                "source_name": source_name,
+            })
+            if len(items) >= max_items:
+                break
+        return items
+    except Exception:
+        return []
+
+
+# ── ③ 日経新聞 銘柄別（Google News経由・過去90日） ────────────────
+@st.cache_data(ttl=600)
+def fetch_nikkei_stock_news(company_name: str, ticker_code: str, max_items: int = 10) -> list[dict]:
+    """日経新聞の銘柄関連記事をGoogle News RSS経由で取得（過去90日）"""
+    code = ticker_code.replace(".T", "")
+    en_name = _get_en_name(company_name)
+    company_short = re.sub(r'[　（）()ＨＤホールディングス\s]', '', company_name)
+
+    # 複数クエリを試してマージ
+    queries = [f"{company_short} site:nikkei.com", f"{code} 日経"]
+    if en_name:
+        queries.append(f"{en_name} nikkei")
+
+    all_items = []
+    seen = set()
+    for q in queries:
+        for it in _fetch_google_news_rss(q, "日経", max_items * 2, days=90):
+            k = it["title"][:40]
+            if k not in seen:
+                seen.add(k)
+                all_items.append({
+                    "source": "日経新聞",
+                    "title": it["title"],
+                    "link": it["link"],
+                    "date": it["date"],
+                    "summary": "",
+                    "ticker_specific": True,
+                })
+        if len(all_items) >= max_items:
+            break
+    return all_items[:max_items]
+
+
+# ── ④ CNBC 銘柄別（Google News経由・過去90日） ───────────────────
 @st.cache_data(ttl=600)
 def fetch_cnbc_news(company_name: str, ticker_code: str, max_items: int = 10) -> list[dict]:
-    """
-    CNBC の Asia Business / World Business RSS から銘柄関連記事を取得。
-    全件取得後に会社名・コードでフィルタリング。
-    """
+    """CNBCの銘柄関連記事をGoogle News RSS経由で取得（過去90日）"""
     code = ticker_code.replace(".T", "")
-    company_short = re.sub(r"[　ＨＤ（）()ホールディングス]", "", company_name)[:6]
-    keywords = {code, company_name, company_short,
-                company_name.replace("ＨＤ", "").strip(),
-                company_name[:4]}
-    keywords = {k for k in keywords if len(k) >= 2}
+    en_name = _get_en_name(company_name)
 
-    # 英語名での検索も試みるため、会社名をローマ字で推定（主要銘柄対応）
-    rss_urls = [
-        "https://www.cnbc.com/id/19832390/device/rss/rss.html",   # Asia Pacific
-        "https://www.cnbc.com/id/100003114/device/rss/rss.html",  # Business
-        "https://www.cnbc.com/id/10000664/device/rss/rss.html",   # World Markets
-    ]
+    queries = []
+    if en_name:
+        queries.append(f"{en_name} site:cnbc.com")
+        queries.append(f"{en_name} CNBC")
+    queries.append(f"{code} CNBC")
+
     all_items = []
-    for url in rss_urls:
-        try:
-            r = requests.get(url, headers=_NEWS_HEADERS, timeout=10)
-            if r.status_code != 200:
-                continue
-            root = ET.fromstring(r.content)
-            for item in root.findall(".//item"):
-                title   = item.findtext("title", "").strip()
-                link    = item.findtext("link", "").strip()
-                pubdate = item.findtext("pubDate", "").strip()
-                desc    = re.sub(r"<[^>]+>", "", item.findtext("description", "")).strip()[:120]
-                if title and any(kw.lower() in title.lower() or kw.lower() in desc.lower()
-                                  for kw in keywords):
-                    all_items.append({
-                        "source": "CNBC",
-                        "title": title,
-                        "link": link,
-                        "date": pubdate,
-                        "summary": desc,
-                        "ticker_specific": True,
-                    })
-        except Exception:
-            continue
-
-    # 重複除去
-    seen, unique = set(), []
-    for it in all_items:
-        k = it["title"][:40]
-        if k not in seen:
-            seen.add(k)
-            unique.append(it)
-    return unique[:max_items]
+    seen = set()
+    for q in queries:
+        for it in _fetch_google_news_rss(q, "CNBC", max_items * 2, days=90):
+            k = it["title"][:40]
+            if k not in seen:
+                seen.add(k)
+                all_items.append({
+                    "source": "CNBC",
+                    "title": it["title"],
+                    "link": it["link"],
+                    "date": it["date"],
+                    "summary": "",
+                    "ticker_specific": True,
+                })
+        if len(all_items) >= max_items:
+            break
+    return all_items[:max_items]
 
 
 # ── ④ TDnet（適時開示）銘柄別 ────────────────────────────────────
@@ -585,7 +695,42 @@ def ai_summarize_tdnet_pdf(pdf_url: str, title: str) -> str:
 
 
 
-# ── ⑤ 日経新聞 マーケット RSS ───────────────────────────────────
+# ── ⑤ Reuters 銘柄別（Google News経由・過去90日） ────────────────
+@st.cache_data(ttl=600)
+def fetch_reuters_stock_news(company_name: str, ticker_code: str, max_items: int = 10) -> list[dict]:
+    """Reutersの銘柄関連記事をGoogle News RSS経由で取得（過去90日）"""
+    code = ticker_code.replace(".T", "")
+    en_name = _get_en_name(company_name)
+    company_short = re.sub(r'[　（）()ＨＤホールディングス\s]', '', company_name)
+
+    queries = []
+    if en_name:
+        queries.append(f"{en_name} site:reuters.com")
+        queries.append(f"{en_name} Reuters")
+    queries.append(f"{company_short} ロイター")
+    queries.append(f"{code} Reuters")
+
+    all_items = []
+    seen = set()
+    for q in queries:
+        for it in _fetch_google_news_rss(q, "Reuters", max_items * 2, days=90):
+            k = it["title"][:40]
+            if k not in seen:
+                seen.add(k)
+                all_items.append({
+                    "source": "Reuters JP",
+                    "title": it["title"],
+                    "link": it["link"],
+                    "date": it["date"],
+                    "summary": "",
+                    "ticker_specific": True,
+                })
+        if len(all_items) >= max_items:
+            break
+    return all_items[:max_items]
+
+
+# ── ⑥ 日経新聞 マーケット RSS（全体・Tab3用）───────────────────────
 @st.cache_data(ttl=600)
 def fetch_nikkei_market_rss(max_items: int = 8) -> list[dict]:
     """日経新聞マーケットニュース RSS（全体市況）"""
@@ -608,7 +753,7 @@ def fetch_nikkei_market_rss(max_items: int = 8) -> list[dict]:
         return []
 
 
-# ── ⑥ Reuters Japan RSS ────────────────────────────────────────
+# ── ⑦ Reuters Japan RSS（全体・Tab3用）────────────────────────────
 @st.cache_data(ttl=600)
 def fetch_reuters_jp_rss(max_items: int = 8) -> list[dict]:
     """Reuters日本語マーケットニュース"""
@@ -662,9 +807,9 @@ def fetch_news_by_source(
         "Yahoo!Finance JP":  lambda: fetch_yahoo_jp_news(code, max_per_source),
         "株探(Kabutan)":     lambda: fetch_kabutan_news(code, max_per_source),
         "TDnet（適時開示）": lambda: fetch_tdnet_news(code, max_items=30, months=3),
-        "日経新聞":          lambda: fetch_nikkei_market_rss(max_per_source * 4),
+        "日経新聞":          lambda: fetch_nikkei_stock_news(company_name, code, max_per_source),
         "CNBC":              lambda: fetch_cnbc_news(company_name, code, max_per_source),
-        "Reuters JP":        lambda: fetch_reuters_jp_rss(max_per_source * 4),
+        "Reuters JP":        lambda: fetch_reuters_stock_news(company_name, code, max_per_source),
     }
 
     results_by_source = {k: [] for k in tasks}
@@ -675,12 +820,6 @@ def fetch_news_by_source(
             key = futures[future]
             try:
                 items = future.result()
-                # 全体ニュースは銘柄関連のみ残す
-                if key in ("日経新聞", "Reuters JP"):
-                    items = [
-                        it for it in items
-                        if any(kw in it.get("title", "") for kw in keywords)
-                    ]
                 results_by_source[key] = items
             except Exception:
                 results_by_source[key] = []
@@ -1216,6 +1355,23 @@ with tab_news:
                                 st.session_state.tdnet_summaries[summary_key] = result
 
                             # 要約結果を表示（session_stateから読む）
+                            if summary_key in st.session_state.tdnet_summaries:
+                                st.info(st.session_state.tdnet_summaries[summary_key])
+
+                        elif src_key == "株探(Kabutan)":
+                            prefix = f"{badge_emoji}{badge_text} " if badge_text else ""
+                            if link:
+                                st.markdown(f"{prefix}[{title}]({link})")
+                            else:
+                                st.markdown(f"{prefix}{title}")
+
+                            # 株探 AI要約ボタン
+                            summary_key = f"kabutan_{selected_code}_{idx_item}"
+                            btn_key     = f"btn_kabutan_{summary_key}"
+                            if st.button("🤖 AIで要約", key=btn_key):
+                                with st.spinner("記事内容を取得・要約中..."):
+                                    result = ai_summarize_tdnet_pdf(link, title)
+                                st.session_state.tdnet_summaries[summary_key] = result
                             if summary_key in st.session_state.tdnet_summaries:
                                 st.info(st.session_state.tdnet_summaries[summary_key])
 
