@@ -11,7 +11,50 @@ import requests
 import xml.etree.ElementTree as ET
 import re
 from io import StringIO
+# ===========================
+# Google Analytics
+# ===========================
+def inject_ga():
+    """Google Analyticsタグを注入"""
+    if not GA_MEASUREMENT_ID or not GA_MEASUREMENT_ID.startswith("G-"):
+        return
 
+    components.html(
+        f"""
+        <script async src="https://www.googletagmanager.com/gtag/js?id={sanitize_html(GA_MEASUREMENT_ID)}"></script>
+        <script>
+          window.dataLayer = window.dataLayer || [];
+          function gtag(){{dataLayer.push(arguments);}}
+          gtag('js', new Date());
+          gtag('config', '{sanitize_html(GA_MEASUREMENT_ID)}', {{
+              'send_page_view': false   // ← 自動送信を止める
+          }});
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
+inject_ga()
+def track_page_view():
+    if not GA_MEASUREMENT_ID:
+        return
+
+    components.html(
+        """
+        <script>
+        if (typeof gtag !== 'undefined') {
+            gtag('event', 'page_view', {
+                page_title: document.title,
+                page_location: window.location.href
+            });
+        }
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
+
+track_page_view()
 # -----------------------------
 # フォント設定（日本語対応）
 # -----------------------------
