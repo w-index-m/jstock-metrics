@@ -314,27 +314,21 @@ def fetch_cnbc_news(company_name: str, ticker_code: str, max_items: int = 10) ->
     return unique[:max_items]
 
 
-# ── ④ TDnet（適時開示）銘柄別・過去3ヶ月 ──────────────────────
+# ── ④ TDnet（適時開示）銘柄別 ────────────────────────────────────
 @st.cache_data(ttl=3600)
 def fetch_tdnet_news(ticker_code: str, max_items: int = 20, months: int = 3) -> list[dict]:
     """
-    株探の銘柄ページ内「開示情報」タブを使い、過去3ヶ月分の適時開示を取得。
-    URL: https://kabutan.jp/stock/news?code=XXXX&nmode=3
-         （nmode=3 が開示情報タブ）
+    株探の開示タブ（nmode=3）から過去N ヶ月分の適時開示を取得。
 
-    確定済み構造（フジクラHTMLより）:
-      <table class="s_news_list mgbt0">
-        <tr>
-          <td class="news_time"><time datetime="2026-02-09T14:00:00+09:00">...</time></td>
-          <td><div class="newslist_ctg newsctg_kaiji_b">開示</div></td>
-          <td class="td_kaiji">
-            <a href="https://kabutan.jp/disclosures/pdf/20260209/14012.../"> タイトル </a>
-          </td>
-        </tr>
-      </table>
+    ▼ データソース選定の根拠
+      TDnet本家 (release.tdnet.info) は日付選択式で過去約1ヶ月分のみ。
+      株探の開示タブ (kabutan.jp/stock/news?code=XXXX&nmode=3) は
+      複数ページで数年分まで遡れるため、こちらを使用する。
 
-    nmode=3 は「開示情報」のみのフィルタ。
-    複数ページ（page=1〜N）をたどって過去3ヶ月分を収集する。
+    ▼ 取得戦略
+      - 新しい順（デフォルト）で page=1 から順にたどる
+      - 各行の datetime を見てカットオフより古くなったら終了
+      - PDFリンクは kabutan.jp/disclosures/pdf/... 形式
     """
     import datetime as dt
     code = ticker_code.replace(".T", "")
@@ -348,7 +342,7 @@ def fetch_tdnet_news(ticker_code: str, max_items: int = 20, months: int = 3) -> 
     items = []
     page = 1
 
-    while len(items) < max_items:
+    while len(items) < max_items and page <= 10:  # 最大10ページ
         url = f"https://kabutan.jp/stock/news?code={code}&nmode=3&page={page}"
         try:
             r = requests.get(url, headers=base_headers, timeout=15)
@@ -356,7 +350,6 @@ def fetch_tdnet_news(ticker_code: str, max_items: int = 20, months: int = 3) -> 
                 break
             html = r.text
 
-            # s_news_list テーブル取得
             table_match = re.search(
                 r'class="s_news_list[^"]*"[^>]*>(.*?)</table>',
                 html, re.DOTALL
@@ -369,8 +362,9 @@ def fetch_tdnet_news(ticker_code: str, max_items: int = 20, months: int = 3) -> 
                 break
 
             found_on_page = 0
+            hit_cutoff = False
+
             for row in rows:
-                # 日時
                 time_match = re.search(r'<time[^>]+datetime="([^"]+)"', row)
                 if not time_match:
                     continue
@@ -380,15 +374,15 @@ def fetch_tdnet_news(ticker_code: str, max_items: int = 20, months: int = 3) -> 
                     continue
                 date_str = f"{dt_disp.group(1)} {dt_disp.group(2)}"
 
-                # カットオフより古いものは打ち切り
+                # カットオフチェック（新しい順なのでここ以降は全部古い）
                 try:
                     row_dt = dt.datetime.strptime(date_str, "%Y-%m-%d %H:%M")
                     if row_dt < cutoff:
-                        return items  # 古い順に並んでいるため以降は不要
+                        hit_cutoff = True
+                        break
                 except Exception:
                     pass
 
-                # 開示PDFリンクとタイトル
                 link_match = re.search(
                     r'<a\s+href="(https://kabutan\.jp/disclosures/[^"]+)"[^>]*>\s*(.*?)\s*</a>',
                     row, re.DOTALL
@@ -414,8 +408,7 @@ def fetch_tdnet_news(ticker_code: str, max_items: int = 20, months: int = 3) -> 
                 if len(items) >= max_items:
                     return items
 
-            # ページに1件もなければ終了
-            if found_on_page == 0:
+            if hit_cutoff or found_on_page == 0:
                 break
             page += 1
 
@@ -423,6 +416,48 @@ def fetch_tdnet_news(ticker_code: str, max_items: int = 20, months: int = 3) -> 
             break
 
     return items
+
+
+@st.cache_data(ttl=7200)
+def ai_summarize_tdnet_pdf(pdf_url: str, title: str) -> str:
+    """
+    株探の開示PDFページから本文テキストを取得し、AIで要約する。
+    PDFは直接パースせず、株探の開示詳細ページのテキストを利用。
+    """
+    try:
+        r = requests.get(pdf_url, headers={
+            **_NEWS_HEADERS,
+            "Referer": "https://kabutan.jp/",
+        }, timeout=20)
+        if r.status_code != 200:
+            return f"ページ取得失敗（HTTP {r.status_code}）"
+
+        # HTMLの場合はテキスト抽出、PDFの場合はバイナリ
+        content_type = r.headers.get("Content-Type", "")
+        if "pdf" in content_type.lower():
+            # PDFは直接パースできないのでタイトルのみでAI分析
+            page_text = f"適時開示タイトル: {title}"
+        else:
+            # HTML形式ならテキスト抽出
+            text = re.sub(r'<[^>]+>', ' ', r.text)
+            text = re.sub(r'\s+', ' ', text).strip()
+            page_text = text[:3000]
+
+        prompt = f"""
+以下は日本株の適時開示情報です。投資家向けに日本語200文字以内で要点をまとめてください。
+
+タイトル: {title}
+内容: {page_text}
+
+要約のポイント:
+- 何が変わったか（業績修正・配当・資本政策など）
+- 数値があれば具体的に記載
+- 株価への影響の可能性
+"""
+        comment, ai_name = generate_ai_comment(prompt)
+        return f"{comment}\n\n_要約: {ai_name}_"
+    except Exception as e:
+        return f"要約エラー: {e}"
 
 
 # ── ⑤ 日経新聞 マーケット RSS ───────────────────────────────────
@@ -1001,32 +1036,38 @@ with tab_news:
                         st.caption(f"※ {selected_name} に言及する記事が直近ありませんでした")
                     continue
 
-                for item in items:
+                for idx_item, item in enumerate(items):
                     title = item["title"]
                     link  = item.get("link", "")
                     date  = item.get("date", "")
-
-                    # カテゴリバッジ（株探のみ）
                     badge_emoji = item.get("badge_emoji", "")
                     badge_text  = item.get("badge", "")
 
-                    # TDnetはPDFアイコン付き
-                    pdf_mark = " 📄" if src_key == "TDnet（適時開示）" else ""
-
                     col_t, col_d = st.columns([5, 1])
                     with col_t:
-                        prefix = f"{badge_emoji}{badge_text} " if badge_text else ""
-                        if link:
-                            st.markdown(f"{prefix}[{title}{pdf_mark}]({link})")
+                        if src_key == "TDnet（適時開示）":
+                            # TDnet: PDF リンク + AI要約ボタン
+                            if link:
+                                st.markdown(f"🔴 [{title} 📄]({link})")
+                            else:
+                                st.markdown(f"🔴 {title} 📄")
+                            # AI要約ボタン（件数が多いので個別トリガー）
+                            btn_key = f"ai_tdnet_{selected_code}_{idx_item}"
+                            if st.button("🤖 AIで要約", key=btn_key):
+                                with st.spinner("PDF内容を取得・要約中..."):
+                                    summary = ai_summarize_tdnet_pdf(link, title)
+                                st.info(summary)
                         else:
-                            st.markdown(f"{prefix}{title}{pdf_mark}")
+                            prefix = f"{badge_emoji}{badge_text} " if badge_text else ""
+                            if link:
+                                st.markdown(f"{prefix}[{title}]({link})")
+                            else:
+                                st.markdown(f"{prefix}{title}")
                     with col_d:
                         if date:
-                            # 日付を短く表示
                             date_short = date[:10] if len(date) >= 10 else date
                             st.caption(date_short)
 
-                    # TDnet以外はセパレーター
                     if src_key != "TDnet（適時開示）":
                         st.markdown("---")
 
