@@ -16,6 +16,10 @@ import html
 # ===========================
 # Google Analytics
 # ===========================
+GA_MEASUREMENT_ID = st.secrets.get("GA_MEASUREMENT_ID", "")
+
+def sanitize_html(text: str) -> str:
+    return html.escape(text, quote=True)
 def inject_ga():
     """Google Analyticsタグを注入"""
     if not GA_MEASUREMENT_ID or not GA_MEASUREMENT_ID.startswith("G-"):
@@ -29,7 +33,7 @@ def inject_ga():
           function gtag(){{dataLayer.push(arguments);}}
           gtag('js', new Date());
           gtag('config', '{sanitize_html(GA_MEASUREMENT_ID)}', {{
-              'send_page_view': false   // ← 自動送信を止める
+              'send_page_view': false
           }});
         </script>
         """,
