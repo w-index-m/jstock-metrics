@@ -1298,8 +1298,9 @@ with tab_analysis:
         summary = top_stocks.head(5).to_string()
          prompt = (
             "以下は日本株のリスク・リターン分析結果です。\n"
-            "投資家向けに簡潔に300文字以内で評価してください。\n\n"
-            f"{summary}\n"
+            "投資家向けに簡潔に300文字以内で評価してください。\n\
+           "日本語テキスト\n"
+
         )
 """
         try:
