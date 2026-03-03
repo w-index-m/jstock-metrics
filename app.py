@@ -12,6 +12,8 @@ import requests
 import xml.etree.ElementTree as ET
 import re
 from io import StringIO
+import streamlit.components.v1 as components
+import html
 
 # -----------------------------
 # フォント設定（日本語対応）
