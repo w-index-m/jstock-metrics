@@ -12,8 +12,6 @@ import requests
 import xml.etree.ElementTree as ET
 import re
 from io import StringIO
-import streamlit.components.v1 as components
-import html
 
 # -----------------------------
 # フォント設定（日本語対応）
@@ -46,7 +44,7 @@ plt.rcParams["axes.unicode_minus"] = False
 # 定数
 # -----------------------------
 GEMINI_MODEL = "gemini-2.5-pro"
-GROQ_MODEL   = "llama3-70b-8192"
+GROQ_MODEL = "llama-3.1-70b-versatile"
 
 # -----------------------------
 # ページ設定
@@ -68,11 +66,28 @@ def generate_ai_comment(prompt: str) -> tuple[str, str]:
     try:
         response = gemini_model.generate_content(prompt)
         return response.text, "Gemini"
+def generate_ai_comment(prompt: str) -> tuple[str, str]:
+    try:
+        response = gemini_model.generate_content(prompt)
+        return response.text, "Gemini"
+
     except Exception as e:
-        err_str = str(e)
-        is_quota = "429" in err_str or "quota" in err_str.lower() or "RESOURCE_EXHAUSTED" in err_str
-        if not is_quota:
-            raise
+        print("Gemini Error:", e)
+
+        if groq_client is None:
+            return f"Geminiエラー: {e}", "Error"
+
+        try:
+            chat = groq_client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=400,
+            )
+            return chat.choices[0].message.content, "Groq"
+
+        except Exception as e2:
+            return f"Groqもエラー: {e2}", "Error"
+            
     if groq_client is None:
         raise RuntimeError("Geminiクォータ超過 & GROQ_API_KEY 未設定")
     chat = groq_client.chat.completions.create(
