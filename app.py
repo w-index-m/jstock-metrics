@@ -62,10 +62,12 @@ gemini_model = genai.GenerativeModel(GEMINI_MODEL)
 groq_client  = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 def generate_ai_comment(prompt: str) -> tuple[str, str]:
-    """Gemini → Groq フォールバック（完全安定版）"""
+    """Gemini → Groq フォールバック（安定版）"""
+
     # ---- Gemini ----
     try:
         response = gemini_model.generate_content(prompt)
+
         text = getattr(response, "text", None)
         if not text and hasattr(response, "candidates") and response.candidates:
             text = response.candidates[0].content.parts[0].text
@@ -91,6 +93,7 @@ def generate_ai_comment(prompt: str) -> tuple[str, str]:
     except Exception as e:
         print("Groq Error:", e)
         return f"Groqも失敗: {e}", "Error"
+        
     if groq_client is None:
         raise RuntimeError("Geminiクォータ超過 & GROQ_API_KEY 未設定")
     chat = groq_client.chat.completions.create(
