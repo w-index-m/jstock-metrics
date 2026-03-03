@@ -1296,11 +1296,11 @@ with tab_analysis:
 
         # AI コメント
         summary = top_stocks.head(5).to_string()
-        prompt = f"""
-以下は日本株のリスク・リターン分析結果です。
-投資家向けに簡潔に300文字以内で評価してください。
-
-{summary}
+         prompt = (
+            "以下は日本株のリスク・リターン分析結果です。\n"
+            "投資家向けに簡潔に300文字以内で評価してください。\n\n"
+            f"{summary}\n"
+        )
 """
         try:
             comment, ai_name = generate_ai_comment(prompt)
@@ -1923,8 +1923,13 @@ with tab_market_news:
             headlines = "\n".join(f"[{n['source']}] {n['title']}" for n in all_market[:12])
             prompt = f"""
 以下は本日の日本株マーケット関連ニュースです。
-
 {headlines}
+
+投資家向けに以下を日本語300文字以内でまとめてください：
+1. 本日の市場全体のセンチメント（強気/弱気/中立）
+2. 注目テーマ・セクター
+3. 今後の注意点
+"""
 
 投資家向けに以下を日本語300文字以内でまとめてください：
 1. 本日の市場全体のセンチメント（強気/弱気/中立）
