@@ -4,6 +4,7 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
 from groq import Groq
@@ -11,56 +12,7 @@ import requests
 import xml.etree.ElementTree as ET
 import re
 from io import StringIO
-import streamlit.components.v1 as components
-import html
-# ===========================
-# Google Analytics
-# ===========================
-GA_MEASUREMENT_ID = st.secrets.get("GA_MEASUREMENT_ID", "")
 
-def sanitize_html(text: str) -> str:
-    return html.escape(text, quote=True)
-def inject_ga():
-    """Google Analyticsタグを注入"""
-    if not GA_MEASUREMENT_ID or not GA_MEASUREMENT_ID.startswith("G-"):
-        return
-
-    components.html(
-        f"""
-        <script async src="https://www.googletagmanager.com/gtag/js?id={sanitize_html(GA_MEASUREMENT_ID)}"></script>
-        <script>
-          window.dataLayer = window.dataLayer || [];
-          function gtag(){{dataLayer.push(arguments);}}
-          gtag('js', new Date());
-          gtag('config', '{sanitize_html(GA_MEASUREMENT_ID)}', {{
-              'send_page_view': false
-          }});
-        </script>
-        """,
-        height=0,
-        width=0,
-    )
-inject_ga()
-def track_page_view():
-    if not GA_MEASUREMENT_ID:
-        return
-
-    components.html(
-        """
-        <script>
-        if (typeof gtag !== 'undefined') {
-            gtag('event', 'page_view', {
-                page_title: document.title,
-                page_location: window.location.href
-            });
-        }
-        </script>
-        """,
-        height=0,
-        width=0,
-    )
-
-track_page_view()
 # -----------------------------
 # フォント設定（日本語対応）
 # -----------------------------
@@ -92,7 +44,7 @@ plt.rcParams["axes.unicode_minus"] = False
 # 定数
 # -----------------------------
 GEMINI_MODEL = "gemini-2.5-pro"
-GROQ_MODEL   = "llama-3.3-70b-versatile"
+GROQ_MODEL   = "llama3-70b-8192"
 
 # -----------------------------
 # ページ設定
@@ -109,60 +61,24 @@ genai.configure(api_key=GEMINI_API_KEY)
 gemini_model = genai.GenerativeModel(GEMINI_MODEL)
 groq_client  = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
-OPENROUTER_API_KEY = st.secrets.get("OPENROUTER_API_KEY", "")
-
 def generate_ai_comment(prompt: str) -> tuple[str, str]:
-    """Gemini -> Groq -> OpenRouter の順でフォールバック"""
-    # 1) Gemini
+    """Gemini → Groq フォールバック"""
     try:
         response = gemini_model.generate_content(prompt)
         return response.text, "Gemini"
     except Exception as e:
-        gemini_err = str(e)
-
-    # 2) Groq
-    if groq_client:
-        try:
-            chat = groq_client.chat.completions.create(
-                model=GROQ_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=600,
-            )
-            return chat.choices[0].message.content, "Groq"
-        except Exception as e:
-            groq_err = str(e)
-    else:
-        groq_err = "GROQ_API_KEY 未設定"
-
-    # 3) OpenRouter
-    if OPENROUTER_API_KEY:
-        try:
-            r = requests.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                    "Content-Type": "application/json",
-                    "HTTP-Referer": "https://jstock-dashboard.streamlit.app",
-                    "X-Title": "JStock Dashboard",
-                },
-                json={
-                    "model": "meta-llama/llama-3.1-8b-instruct:free",
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 600,
-                },
-                timeout=30,
-            )
-            r.raise_for_status()
-            text = r.json()["choices"][0]["message"]["content"]
-            return text, "OpenRouter"
-        except Exception as e:
-            or_err = str(e)
-    else:
-        or_err = "OPENROUTER_API_KEY 未設定"
-
-    raise RuntimeError(
-        f"全AIバックエンド失敗 / Gemini: {gemini_err} / Groq: {groq_err} / OpenRouter: {or_err}"
+        err_str = str(e)
+        is_quota = "429" in err_str or "quota" in err_str.lower() or "RESOURCE_EXHAUSTED" in err_str
+        if not is_quota:
+            raise
+    if groq_client is None:
+        raise RuntimeError("Geminiクォータ超過 & GROQ_API_KEY 未設定")
+    chat = groq_client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=400,
     )
+    return chat.choices[0].message.content, "Groq"
 
 # ================================================================
 # 📰 ニュース取得モジュール
@@ -204,533 +120,123 @@ def fetch_yahoo_jp_news(ticker_code: str, max_items: int = 8) -> list[dict]:
 @st.cache_data(ttl=600)
 def fetch_kabutan_news(ticker_code: str, max_items: int = 8) -> list[dict]:
     """
-    株探の銘柄ニュースページから取得。
-    URL: https://kabutan.jp/stock/news?code=XXXX
-
-    HTMLファイル実測による確定構造:
-    ─────────────────────────────────────────────────
-    <table class="s_news_list mgbt0">
-      <tbody>
-        <tr>
-          <td class="news_time">
-            <time datetime="2026-02-19T17:00:03+09:00">26/02/19&nbsp;17:00</time>
-          </td>
-          <td>
-            <div class="newslist_ctg newsctg5_b">特集</div>
-          </td>
-          <td>
-            <a href="https://kabutan.jp/stock/news?code=5803&b=n202602191135">
-              レーティング日報【最上位を継続＋目標株価を増額】(2月19日)
-            </a>
-          </td>
-        </tr>
-        ...
-        <!-- 開示（PDF）の場合 -->
-        <tr>
-          <td class="news_time"><time ...>26/02/09&nbsp;14:00</time></td>
-          <td><div class="newslist_ctg newsctg_kaiji_b">開示</div></td>
-          <td class="td_kaiji">
-            <a href="https://kabutan.jp/disclosures/pdf/20260209/140120260206550334/" target="pdf">
-              2026年３月期通期連結業績予想...
-            </a>
-          </td>
-        </tr>
-      </tbody>
-    </table>
-    ─────────────────────────────────────────────────
-    ※ このページ自体が code=XXXX の銘柄専用ページなので
-      取得記事はすべて銘柄固有情報。
-    ※ リンクURLに &b=n... (ニュース) または /disclosures/pdf/... (開示PDF) の2種類あり。
-    ※ プレミアム記事は <img class="vat pdr4"> が挿入される。
+    株探の銘柄ニュースページをスクレイピング。
+    ticker_code: '7203' など
     """
     code = ticker_code.replace(".T", "")
     url = f"https://kabutan.jp/stock/news?code={code}"
-    headers = {
-        **_NEWS_HEADERS,
-        "Accept": "text/html,application/xhtml+xml",
-        "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
-        "Referer": "https://kabutan.jp/",
-    }
     try:
-        r = requests.get(url, headers=headers, timeout=15)
+        r = requests.get(url, headers=_NEWS_HEADERS, timeout=12)
         if r.status_code != 200:
             return []
-        html = r.text
-
-        # ── s_news_list テーブルを抽出 ─────────────────────────
-        # テーブル全体を取得
-        table_match = re.search(
-            r'class="s_news_list[^"]*"[^>]*>(.*?)</table>',
-            html, re.DOTALL
+        # タイトルと日付を正規表現で抽出
+        # 株探の構造: <a href="/news/...">タイトル</a> と <time>日付</time>
+        titles = re.findall(
+            r'<a href="(/news/[^"]+)"[^>]*>([^<]{5,120})</a>', r.text
         )
-        if not table_match:
-            return []
-        table_html = table_match.group(1)
-
-        # ── tr 行ごとにパース ──────────────────────────────────
-        rows = re.findall(r'<tr[^>]*>(.*?)</tr>', table_html, re.DOTALL)
-
-        # カテゴリ判定マップ
-        ctg_class_map = {
-            "newsctg2_b":    "材料",
-            "newsctg3_kk_b": "決算",
-            "newsctg4_b":    "テク",
-            "newsctg5_b":    "特集",
-            "newsctg_kaiji_b": "開示",
-        }
-        badge_emoji = {
-            "材料": "🟢", "決算": "🔵", "テク": "⚪",
-            "特集": "🟠", "開示": "🔴",
-        }
-
+        times  = re.findall(r'<time[^>]*>([^<]+)</time>', r.text)
         items = []
-        for row in rows:
-            # ① 日時: <time datetime="2026-02-19T17:00:03+09:00">
-            time_match = re.search(r'<time[^>]+datetime="([^"]+)"', row)
-            if not time_match:
+        for i, (path, title) in enumerate(titles[:max_items]):
+            title = title.strip()
+            if len(title) < 5 or "株探" in title:
                 continue
-            # datetime属性から読みやすい形式に変換
-            dt_raw = time_match.group(1)  # "2026-02-19T17:00:03+09:00"
-            dt_disp = re.search(r'(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2})', dt_raw)
-            date_str = f"{dt_disp.group(1)} {dt_disp.group(2)}" if dt_disp else dt_raw[:16]
-
-            # ② カテゴリバッジ: class="newslist_ctg newsctgX_b"
-            badge = ""
-            for cls, label in ctg_class_map.items():
-                if cls in row:
-                    badge = label
-                    break
-
-            # ③ リンクとタイトル: 2パターン
-            #    a) ニュース: href="https://kabutan.jp/stock/news?code=XXXX&b=nXXX"
-            #    b) 開示PDF:  href="https://kabutan.jp/disclosures/pdf/..."
-            link_match = re.search(
-                r'<a\s+href="(https://kabutan\.jp/(?:stock/news\?[^"]+|disclosures/pdf/[^"]+))"'
-                r'[^>]*>\s*(.*?)\s*</a>',
-                row, re.DOTALL
-            )
-            if not link_match:
-                continue
-
-            link = link_match.group(1).replace("&amp;", "&")
-            # タイトルからHTMLタグ（imgなど）を除去
-            title = re.sub(r'<[^>]+>', '', link_match.group(2)).strip()
-
-            if len(title) < 3:
-                continue
-
-            # ④ プレミアム記事の検出（ロック画像が挿入される）
-            is_premium = "🔒 " if "premium" in row.lower() or "pdr4" in row else ""
-
-            emoji = badge_emoji.get(badge, "📰")
-
+            date = times[i].strip() if i < len(times) else ""
             items.append({
                 "source": "株探(Kabutan)",
-                "title": f"{is_premium}{title}",
-                "badge": badge,
-                "badge_emoji": emoji,
-                "link": link,
-                "date": date_str,
+                "title": title,
+                "link": f"https://kabutan.jp{path}",
+                "date": date,
                 "summary": "",
-                "ticker_specific": True,
             })
-
-            if len(items) >= max_items:
-                break
-
         return items
-
     except Exception:
         return []
 
 
-# ── 英語社名マッピング（主要銘柄） ───────────────────────────────
-_JP_EN_NAME_MAP = {
-    "トヨタ": "Toyota", "ホンダ": "Honda", "日産自": "Nissan", "ソニーＧ": "Sony",
-    "三菱ＵＦＪ": "Mitsubishi UFJ", "三井住友ＦＧ": "Sumitomo Mitsui",
-    "みずほＦＧ": "Mizuho", "ソフトバンク": "SoftBank", "ＳＢＧ": "SoftBank",
-    "任天堂": "Nintendo", "パナＨＤ": "Panasonic", "日立": "Hitachi",
-    "富士通": "Fujitsu", "ＮＥＣ": "NEC", "キヤノン": "Canon",
-    "シャープ": "Sharp", "東エレク": "Tokyo Electron", "信越化": "Shin-Etsu",
-    "村田製": "Murata", "京セラ": "Kyocera", "ダイキン": "Daikin",
-    "コマツ": "Komatsu", "ファナック": "Fanuc", "キーエンス": "Keyence",
-    "ルネサス": "Renesas", "アドテスト": "Advantest", "レーザーテク": "Lasertec",
-    "ディスコ": "Disco", "ニデック": "Nidec", "三菱電": "Mitsubishi Electric",
-    "伊藤忠": "Itochu", "三菱商": "Mitsubishi Corp", "三井物": "Mitsui",
-    "住友商": "Sumitomo Corp", "丸紅": "Marubeni", "武田": "Takeda",
-    "エーザイ": "Eisai", "第一三共": "Daiichi Sankyo", "中外薬": "Chugai",
-    "アステラス": "Astellas", "リクルート": "Recruit", "メルカリ": "Mercari",
-    "楽天グループ": "Rakuten", "ＮＴＴ": "NTT", "ＫＤＤＩ": "KDDI",
-    "東京海上": "Tokio Marine", "ＪＴ": "Japan Tobacco",
-    "日本製鉄": "Nippon Steel", "ブリヂストン": "Bridgestone",
-    "ＪＡＬ": "Japan Airlines", "ＡＮＡＨＤ": "ANA",
-}
-
-def _get_en_name(company_name: str) -> str:
-    """日本語社名から英語名を推定"""
-    for jp, en in _JP_EN_NAME_MAP.items():
-        if jp in company_name:
-            return en
-    # ローマ字っぽい文字列を含む場合はそのまま
-    ascii_part = re.sub(r'[^\x20-\x7E]', '', company_name).strip()
-    return ascii_part if len(ascii_part) >= 2 else ""
-
-
-# ── Google News RSS（過去90日）銘柄検索 ──────────────────────────
+# ── ③ みんかぶ 銘柄別ニュース ───────────────────────────────────
 @st.cache_data(ttl=600)
-def _fetch_google_news_rss(query: str, source_filter: str, max_items: int, days: int = 90) -> list[dict]:
-    """
-    Google News RSS で query を検索し、指定ソースの記事のみ返す。
-    days: 過去何日以内の記事のみ返すか
-    """
-    import datetime as dt
-    import urllib.parse
-
-    q_enc = urllib.parse.quote(query)
-    url = f"https://news.google.com/rss/search?q={q_enc}&hl=ja&gl=JP&ceid=JP:ja"
-    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)
-
+def fetch_minkabu_news(ticker_code: str, max_items: int = 6) -> list[dict]:
+    """みんかぶの銘柄ニュースを取得"""
+    code = ticker_code.replace(".T", "")
+    url = f"https://minkabu.jp/stock/{code}/news"
     try:
-        r = requests.get(url, headers=_NEWS_HEADERS, timeout=15)
+        r = requests.get(url, headers=_NEWS_HEADERS, timeout=12)
         if r.status_code != 200:
             return []
-        # Google News RSSはUTF-8
-        content = r.content
-        # namespace宣言が壊れることがあるので前処理
-        content = re.sub(rb'<\?xml[^?]*\?>', b'<?xml version="1.0" encoding="UTF-8"?>', content)
-        root = ET.fromstring(content)
+        # ニュースタイトルと日付の抽出
+        titles = re.findall(
+            r'<a[^>]+href="(/stock/[^"]+/news/[^"]+)"[^>]*>\s*<[^>]+>\s*([^<]{5,120})\s*</[^>]+>',
+            r.text,
+        )
+        if not titles:
+            # より広いパターン
+            titles = re.findall(
+                r'class="[^"]*news[^"]*"[^>]*>.*?<a[^>]+href="([^"]+)"[^>]*>([^<]{5,120})</a>',
+                r.text, re.DOTALL
+            )
+        dates = re.findall(r'\d{4}/\d{2}/\d{2}', r.text)
         items = []
-        for item in root.findall(".//item"):
-            title   = item.findtext("title", "").strip()
-            link    = item.findtext("link", "").strip()
-            pubdate = item.findtext("pubDate", "").strip()
-            source_elem = item.find("source")
-            source_name = source_elem.text.strip() if source_elem is not None else ""
-
-            if not title:
+        for i, (path, title) in enumerate(titles[:max_items]):
+            title = title.strip()
+            if len(title) < 5:
                 continue
-
-            # ソースフィルタ（部分一致）
-            if source_filter and source_filter.lower() not in source_name.lower():
-                continue
-
-            # 日付フィルタ（過去days日以内）
-            if pubdate:
-                try:
-                    from email.utils import parsedate_to_datetime
-                    pub_dt = parsedate_to_datetime(pubdate)
-                    if pub_dt.tzinfo is None:
-                        import datetime as dt2
-                        pub_dt = pub_dt.replace(tzinfo=dt2.timezone.utc)
-                    if pub_dt < cutoff:
-                        continue
-                    date_str = pub_dt.strftime("%Y-%m-%d %H:%M")
-                except Exception:
-                    date_str = pubdate[:16]
-            else:
-                date_str = ""
-
+            link = f"https://minkabu.jp{path}" if path.startswith("/") else path
+            date = dates[i] if i < len(dates) else ""
             items.append({
+                "source": "みんかぶ",
                 "title": title,
                 "link": link,
-                "date": date_str,
-                "source_name": source_name,
+                "date": date,
+                "summary": "",
             })
-            if len(items) >= max_items:
-                break
         return items
     except Exception:
         return []
 
 
-# ── ③ 日経新聞 銘柄別（Google News経由・過去90日） ────────────────
-@st.cache_data(ttl=600)
-def fetch_nikkei_stock_news(company_name: str, ticker_code: str, max_items: int = 10) -> list[dict]:
-    """日経新聞の銘柄関連記事をGoogle News RSS経由で取得（過去90日）"""
+# ── ④ TDnet（適時開示情報）銘柄別 ─────────────────────────────
+@st.cache_data(ttl=900)
+def fetch_tdnet_news(ticker_code: str, max_items: int = 6) -> list[dict]:
+    """
+    TDnet（東京証券取引所 適時開示情報）から銘柄の最新開示を取得。
+    JPX の開示検索API（非公式）を使用。
+    """
     code = ticker_code.replace(".T", "")
-    en_name = _get_en_name(company_name)
-    company_short = re.sub(r'[　（）()ＨＤホールディングス\s]', '', company_name)
-
-    # 複数クエリを試してマージ
-    queries = [f"{company_short} site:nikkei.com", f"{code} 日経"]
-    if en_name:
-        queries.append(f"{en_name} nikkei")
-
-    all_items = []
-    seen = set()
-    for q in queries:
-        for it in _fetch_google_news_rss(q, "日経", max_items * 2, days=90):
-            k = it["title"][:40]
-            if k not in seen:
-                seen.add(k)
-                all_items.append({
-                    "source": "日経新聞",
-                    "title": it["title"],
-                    "link": it["link"],
-                    "date": it["date"],
-                    "summary": "",
-                    "ticker_specific": True,
-                })
-        if len(all_items) >= max_items:
-            break
-    return all_items[:max_items]
-
-
-# ── ④ CNBC 銘柄別（Google News経由・過去90日） ───────────────────
-@st.cache_data(ttl=600)
-def fetch_cnbc_news(company_name: str, ticker_code: str, max_items: int = 10) -> list[dict]:
-    """CNBCの銘柄関連記事をGoogle News RSS経由で取得（過去90日）"""
-    code = ticker_code.replace(".T", "")
-    en_name = _get_en_name(company_name)
-
-    queries = []
-    if en_name:
-        queries.append(f"{en_name} site:cnbc.com")
-        queries.append(f"{en_name} CNBC")
-    queries.append(f"{code} CNBC")
-
-    all_items = []
-    seen = set()
-    for q in queries:
-        for it in _fetch_google_news_rss(q, "CNBC", max_items * 2, days=90):
-            k = it["title"][:40]
-            if k not in seen:
-                seen.add(k)
-                all_items.append({
-                    "source": "CNBC",
-                    "title": it["title"],
-                    "link": it["link"],
-                    "date": it["date"],
-                    "summary": "",
-                    "ticker_specific": True,
-                })
-        if len(all_items) >= max_items:
-            break
-    return all_items[:max_items]
-
-
-# ── ④ TDnet（適時開示）銘柄別 ────────────────────────────────────
-@st.cache_data(ttl=3600)
-def fetch_tdnet_news(ticker_code: str, max_items: int = 20, months: int = 3) -> list[dict]:
-    """
-    株探の開示タブ（nmode=3）から過去N ヶ月分の適時開示を取得。
-
-    ▼ データソース選定の根拠
-      TDnet本家 (release.tdnet.info) は日付選択式で過去約1ヶ月分のみ。
-      株探の開示タブ (kabutan.jp/stock/news?code=XXXX&nmode=3) は
-      複数ページで数年分まで遡れるため、こちらを使用する。
-
-    ▼ 取得戦略
-      - 新しい順（デフォルト）で page=1 から順にたどる
-      - 各行の datetime を見てカットオフより古くなったら終了
-      - PDFリンクは kabutan.jp/disclosures/pdf/... 形式
-    """
-    import datetime as dt
-    code = ticker_code.replace(".T", "")
-    cutoff = dt.datetime.now() - dt.timedelta(days=months * 31)
-    base_headers = {
-        **_NEWS_HEADERS,
-        "Accept": "text/html,application/xhtml+xml",
-        "Accept-Language": "ja,en-US;q=0.9",
-        "Referer": "https://kabutan.jp/",
-    }
-    items = []
-    page = 1
-
-    while len(items) < max_items and page <= 10:  # 最大10ページ
-        url = f"https://kabutan.jp/stock/news?code={code}&nmode=3&page={page}"
-        try:
-            r = requests.get(url, headers=base_headers, timeout=15)
-            if r.status_code != 200:
-                break
-            html = r.text
-
-            table_match = re.search(
-                r'class="s_news_list[^"]*"[^>]*>(.*?)</table>',
-                html, re.DOTALL
-            )
-            if not table_match:
-                break
-            table_html = table_match.group(1)
-            rows = re.findall(r'<tr[^>]*>(.*?)</tr>', table_html, re.DOTALL)
-            if not rows:
-                break
-
-            found_on_page = 0
-            hit_cutoff = False
-
-            for row in rows:
-                time_match = re.search(r'<time[^>]+datetime="([^"]+)"', row)
-                if not time_match:
-                    continue
-                dt_raw = time_match.group(1)
-                dt_disp = re.search(r'(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2})', dt_raw)
-                if not dt_disp:
-                    continue
-                date_str = f"{dt_disp.group(1)} {dt_disp.group(2)}"
-
-                # カットオフチェック（新しい順なのでここ以降は全部古い）
-                try:
-                    row_dt = dt.datetime.strptime(date_str, "%Y-%m-%d %H:%M")
-                    if row_dt < cutoff:
-                        hit_cutoff = True
-                        break
-                except Exception:
-                    pass
-
-                link_match = re.search(
-                    r'<a\s+href="(https://kabutan\.jp/disclosures/[^"]+)"[^>]*>\s*(.*?)\s*</a>',
-                    row, re.DOTALL
-                )
-                if not link_match:
-                    continue
-                link  = link_match.group(1)
-                title = re.sub(r'<[^>]+>', '', link_match.group(2)).strip()
-                if len(title) < 3:
-                    continue
-
-                items.append({
-                    "source": "TDnet（適時開示）",
-                    "title": title,
-                    "badge": "開示",
-                    "badge_emoji": "🔴",
-                    "link": link,
-                    "date": date_str,
-                    "summary": "📄 適時開示PDF",
-                    "ticker_specific": True,
-                })
-                found_on_page += 1
-                if len(items) >= max_items:
-                    return items
-
-            if hit_cutoff or found_on_page == 0:
-                break
-            page += 1
-
-        except Exception:
-            break
-
-    return items
-
-
-@st.cache_data(ttl=7200)
-def ai_summarize_tdnet_pdf(pdf_url: str, title: str) -> str:
-    """
-    適時開示の内容をAIで詳細要約。
-    株探の開示HTMLページ取得 -> PDFテキスト抽出 -> タイトルのみ の順でフォールバック。
-    """
-    page_text = ""
-    source_desc = ""
-
-    # 1) 株探の開示HTMLページ（/disclosures/pdf/ -> /disclosures/ に変換）
+    url = (
+        "https://www.release.tdnet.info/inbs/I_list_001_"
+        f"{datetime.today().strftime('%Y%m%d')}.html"
+    )
+    # TDnet の検索エンドポイント（銘柄コード指定）
+    search_url = f"https://www.release.tdnet.info/inbs/I_main_00.html?target-code={code}"
     try:
-        html_url = pdf_url.replace("/disclosures/pdf/", "/disclosures/")
-        if html_url != pdf_url:
-            r = requests.get(html_url, headers={**_NEWS_HEADERS, "Referer": "https://kabutan.jp/"}, timeout=15)
-            if r.status_code == 200 and "text/html" in r.headers.get("Content-Type", ""):
-                raw = re.sub(r'<script[^>]*>.*?</script>', ' ', r.text, flags=re.DOTALL)
-                raw = re.sub(r'<style[^>]*>.*?</style>', ' ', raw, flags=re.DOTALL)
-                raw = re.sub(r'<[^>]+>', ' ', raw)
-                raw = re.sub(r'\s+', ' ', raw).strip()
-                page_text = raw[:6000]
-                source_desc = "株探開示ページ"
+        r = requests.get(search_url, headers=_NEWS_HEADERS, timeout=12)
+        if r.status_code != 200:
+            return []
+        # タイトルと PDF リンクを抽出
+        rows = re.findall(
+            r'<td[^>]*class="[^"]*kjTitle[^"]*"[^>]*>(.*?)</td>.*?'
+            r'href="([^"]+\.pdf)"',
+            r.text, re.DOTALL
+        )
+        items = []
+        for title_raw, pdf_path in rows[:max_items]:
+            title = re.sub(r"<[^>]+>", "", title_raw).strip()
+            if not title:
+                continue
+            link = f"https://www.release.tdnet.info{pdf_path}" if pdf_path.startswith("/") else pdf_path
+            items.append({
+                "source": "TDnet（適時開示）",
+                "title": title,
+                "link": link,
+                "date": "",
+                "summary": "📄 PDF",
+            })
+        return items
     except Exception:
-        pass
-
-    # 2) PDF直接取得（バイナリからテキスト部分を抽出）
-    if not page_text:
-        try:
-            r = requests.get(pdf_url, headers={**_NEWS_HEADERS, "Referer": "https://kabutan.jp/"}, timeout=20)
-            if r.status_code == 200:
-                ct = r.headers.get("Content-Type", "")
-                if "text/html" in ct:
-                    raw = re.sub(r'<[^>]+>', ' ', r.text)
-                    page_text = re.sub(r'\s+', ' ', raw).strip()[:6000]
-                    source_desc = "開示HTML"
-                elif "pdf" in ct.lower():
-                    pdf_str = r.content.decode("latin-1", errors="ignore")
-                    chunks = re.findall(r'BT\s*(.*?)\s*ET', pdf_str, re.DOTALL)
-                    parts = []
-                    for chunk in chunks:
-                        parts.extend(re.findall(r'\(([^)]{1,200})\)', chunk))
-                    page_text = " ".join(parts)[:6000]
-                    source_desc = "PDFテキスト抽出"
-        except Exception:
-            pass
-
-    if not page_text or len(page_text.strip()) < 50:
-        page_text = "（本文取得不可。タイトルから推定）"
-        source_desc = "タイトルのみ"
-
-    prompt = f"""あなたは日本株の機関投資家向けアナリストです。
-以下の適時開示情報を分析し、投資判断に役立つ詳細な要約を日本語で作成してください。
-
-【開示タイトル】{title}
-
-【開示内容】{page_text}
-
-【要約フォーマット（合計400〜500文字）】
-
-■ 開示種別: （業績修正 / 配当変更 / 決算発表 / 資本政策 / その他）
-
-■ 主要な変更点:
-  - 変更前→変更後の数値を具体的に（例: 営業利益 500億円→620億円、+24%）
-  - 配当がある場合は1株あたりの金額も記載
-  - 複数項目ある場合はすべて列挙
-
-■ 背景・理由: なぜ修正・発表したか
-
-■ 株価への影響予測:
-  - ポジティブ / ネガティブ / 中立 とその理由
-  - 市場が注目すべきポイント
-
-■ 投資家へのアドバイス: 短期・中長期の観点で
-"""
-    try:
-        comment, ai_name = generate_ai_comment(prompt)
-        return comment + "\n\n_情報源: " + source_desc + " / AI: " + ai_name + "_"
-    except Exception as e:
-        return f"要約エラー: {e}"
+        return []
 
 
-
-
-# ── ⑤ Reuters 銘柄別（Google News経由・過去90日） ────────────────
-@st.cache_data(ttl=600)
-def fetch_reuters_stock_news(company_name: str, ticker_code: str, max_items: int = 10) -> list[dict]:
-    """Reutersの銘柄関連記事をGoogle News RSS経由で取得（過去90日）"""
-    code = ticker_code.replace(".T", "")
-    en_name = _get_en_name(company_name)
-    company_short = re.sub(r'[　（）()ＨＤホールディングス\s]', '', company_name)
-
-    queries = []
-    if en_name:
-        queries.append(f"{en_name} site:reuters.com")
-        queries.append(f"{en_name} Reuters")
-    queries.append(f"{company_short} ロイター")
-    queries.append(f"{code} Reuters")
-
-    all_items = []
-    seen = set()
-    for q in queries:
-        for it in _fetch_google_news_rss(q, "Reuters", max_items * 2, days=90):
-            k = it["title"][:40]
-            if k not in seen:
-                seen.add(k)
-                all_items.append({
-                    "source": "Reuters JP",
-                    "title": it["title"],
-                    "link": it["link"],
-                    "date": it["date"],
-                    "summary": "",
-                    "ticker_specific": True,
-                })
-        if len(all_items) >= max_items:
-            break
-    return all_items[:max_items]
-
-
-# ── ⑥ 日経新聞 マーケット RSS（全体・Tab3用）───────────────────────
+# ── ⑤ 日経新聞 マーケット RSS ───────────────────────────────────
 @st.cache_data(ttl=600)
 def fetch_nikkei_market_rss(max_items: int = 8) -> list[dict]:
     """日経新聞マーケットニュース RSS（全体市況）"""
@@ -753,7 +259,7 @@ def fetch_nikkei_market_rss(max_items: int = 8) -> list[dict]:
         return []
 
 
-# ── ⑦ Reuters Japan RSS（全体・Tab3用）────────────────────────────
+# ── ⑥ Reuters Japan RSS ────────────────────────────────────────
 @st.cache_data(ttl=600)
 def fetch_reuters_jp_rss(max_items: int = 8) -> list[dict]:
     """Reuters日本語マーケットニュース"""
@@ -776,72 +282,52 @@ def fetch_reuters_jp_rss(max_items: int = 8) -> list[dict]:
         return []
 
 
-# ── ⑦ ソース別並列取得 ─────────────────────────────────────────
-def fetch_news_by_source(
-    ticker_code: str,
-    company_name: str,
-    max_per_source: int = 10,
-) -> dict:
+# ── ⑦ 統合ニュース取得（銘柄別 + 全体）─────────────────────────
+def fetch_all_news(ticker_code: str, max_per_source: int = 5) -> list[dict]:
     """
-    各ソースを並列取得し、ソース名をキーにした辞書で返す。
-    {
-      "Yahoo!Finance JP": [...],
-      "株探(Kabutan)":    [...],
-      "TDnet（適時開示）": [...],
-      "日経新聞":          [...],
-      "CNBC":             [...],
-      "Reuters JP":       [...],
-    }
-    全体ニュース（日経・CNBC・Reuters）は銘柄名・コードを含む記事のみ残す。
+    全ニュースソースを並列取得してまとめる。
+    返り値: [{source, title, link, date, summary}, ...]
     """
     import concurrent.futures
     code = ticker_code.replace(".T", "")
 
-    # 銘柄マッチキーワード
-    company_short = re.sub(r"[　ＨＤ（）()ホールディングス]", "", company_name)[:6]
-    keywords = {code, company_name, company_short,
-                company_name[:4], company_name.replace("ＨＤ", "").strip()}
-    keywords = {k for k in keywords if len(k) >= 2}
-
     tasks = {
-        "Yahoo!Finance JP":  lambda: fetch_yahoo_jp_news(code, max_per_source),
-        "株探(Kabutan)":     lambda: fetch_kabutan_news(code, max_per_source),
-        "TDnet（適時開示）": lambda: fetch_tdnet_news(code, max_items=30, months=3),
-        "日経新聞":          lambda: fetch_nikkei_stock_news(company_name, code, max_per_source),
-        "CNBC":              lambda: fetch_cnbc_news(company_name, code, max_per_source),
-        "Reuters JP":        lambda: fetch_reuters_stock_news(company_name, code, max_per_source),
+        "yahoo_jp":  lambda: fetch_yahoo_jp_news(code, max_per_source),
+        "kabutan":   lambda: fetch_kabutan_news(code, max_per_source),
+        "minkabu":   lambda: fetch_minkabu_news(code, max_per_source),
+        "tdnet":     lambda: fetch_tdnet_news(code, max_per_source),
+        "nikkei":    lambda: fetch_nikkei_market_rss(max_per_source),
+        "reuters":   lambda: fetch_reuters_jp_rss(max_per_source),
     }
 
-    results_by_source = {k: [] for k in tasks}
-
+    all_items = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
         futures = {ex.submit(fn): key for key, fn in tasks.items()}
         for future in concurrent.futures.as_completed(futures):
-            key = futures[future]
             try:
-                items = future.result()
-                results_by_source[key] = items
+                all_items.extend(future.result())
             except Exception:
-                results_by_source[key] = []
+                pass
 
-    return results_by_source
+    # 重複除去（タイトルが完全一致するもの）
+    seen, unique = set(), []
+    for item in all_items:
+        if item["title"] not in seen:
+            seen.add(item["title"])
+            unique.append(item)
+
+    return unique
 
 
 # ── ⑧ AI によるニュース要約・センチメント ───────────────────────
-def ai_news_summary(news_items, company_name: str, ticker: str) -> str:
-    """
-    ニュース一覧をAIで日本語要約・センチメント分析。
-    news_items: list[dict] または list[str]（見出し文字列）を受け付ける。
-    """
+def ai_news_summary(news_items: list[dict], company_name: str, ticker: str) -> str:
+    """ニュース一覧をAIで日本語要約・センチメント分析"""
     if not news_items:
         return "ニュースが取得できませんでした。"
 
-    if isinstance(news_items[0], str):
-        headlines = "\n".join(news_items[:20])
-    else:
-        headlines = "\n".join(
-            f"[{it['source']}] {it['title']}" for it in news_items[:20]
-        )
+    headlines = "\n".join(
+        f"[{it['source']}] {it['title']}" for it in news_items[:15]
+    )
     prompt = f"""
 以下は日本株「{company_name}（{ticker}）」に関する最新ニュース・適時開示の見出しです。
 
@@ -857,7 +343,167 @@ def ai_news_summary(news_items, company_name: str, ticker: str) -> str:
         return f"{comment}\n\n_AI: {ai_name}_"
     except Exception as e:
         return f"AI分析エラー: {e}"
+# ================================================================
+# 🔄 セクターローテーション分析モジュール
+# ================================================================
 
+@st.cache_data(ttl=1800)
+def get_sector_performance(ticker_name_map: dict, period_days: int = 20) -> pd.DataFrame:
+    from datetime import timedelta
+    end_date   = datetime.today()
+    start_date = end_date - timedelta(days=period_days + 10)
+
+    sector_returns = {}
+    for ticker, (name, sector) in ticker_name_map.items():
+        try:
+            df = yf.download(ticker, start=start_date, end=end_date, progress=False)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.droplevel(1)
+            if df.empty or len(df) < 2:
+                continue
+            close = df["Close"].dropna()
+            ret = (close.iloc[-1] - close.iloc[0]) / close.iloc[0] * 100
+            if sector not in sector_returns:
+                sector_returns[sector] = []
+            sector_returns[sector].append(float(ret))
+        except Exception:
+            continue
+
+    rows = []
+    for sector, rets in sector_returns.items():
+        rows.append({
+            "業種": sector,
+            "平均リターン(%)": np.mean(rets),
+            "中央値リターン(%)": np.median(rets),
+            "銘柄数": len(rets),
+            "上昇銘柄数": sum(1 for r in rets if r > 0),
+            "下落銘柄数": sum(1 for r in rets if r < 0),
+        })
+
+    df_result = pd.DataFrame(rows).sort_values("平均リターン(%)", ascending=False).reset_index(drop=True)
+    df_result["騰落率(%)"] = df_result["平均リターン(%)"].round(2)
+    df_result["上昇率(%)"] = (df_result["上昇銘柄数"] / df_result["銘柄数"] * 100).round(1)
+    return df_result
+
+
+@st.cache_data(ttl=1800)
+def get_sector_timeseries(ticker_name_map: dict, days: int = 60) -> pd.DataFrame:
+    from datetime import timedelta
+    end_date   = datetime.today()
+    start_date = end_date - timedelta(days=days + 5)
+
+    sector_price_data = {}
+    for ticker, (name, sector) in ticker_name_map.items():
+        try:
+            df = yf.download(ticker, start=start_date, end=end_date, progress=False)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.droplevel(1)
+            if df.empty or len(df) < 5:
+                continue
+            close = df["Close"].dropna()
+            norm  = close / close.iloc[0] * 100
+            if sector not in sector_price_data:
+                sector_price_data[sector] = []
+            sector_price_data[sector].append(norm)
+        except Exception:
+            continue
+
+    sector_avg = {}
+    for sector, series_list in sector_price_data.items():
+        combined = pd.concat(series_list, axis=1)
+        sector_avg[sector] = combined.mean(axis=1)
+
+    df_ts = pd.DataFrame(sector_avg)
+    df_ts.index = pd.to_datetime(df_ts.index)
+    return df_ts.sort_index()
+
+
+def plot_sector_bar(df_sector: pd.DataFrame, title: str) -> plt.Figure:
+    df_sorted = df_sector.sort_values("平均リターン(%)", ascending=True)
+    colors = ["#d32f2f" if v < 0 else "#388e3c" for v in df_sorted["平均リターン(%)"]]
+
+    fig, ax = plt.subplots(figsize=(10, max(5, len(df_sorted) * 0.45)))
+    bars = ax.barh(df_sorted["業種"], df_sorted["平均リターン(%)"], color=colors, edgecolor="none")
+
+    for bar, val in zip(bars, df_sorted["平均リターン(%)"]):
+        xpos = bar.get_width() + (0.05 if val >= 0 else -0.05)
+        ha   = "left" if val >= 0 else "right"
+        ax.text(xpos, bar.get_y() + bar.get_height() / 2,
+                f"{val:+.2f}%", va="center", ha=ha, fontsize=8)
+
+    ax.axvline(0, color="black", linewidth=0.8)
+    ax.set_title(title, fontsize=13, fontweight="bold")
+    ax.set_xlabel("平均リターン (%)")
+    ax.tick_params(axis="y", labelsize=9)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    green_patch = mpatches.Patch(color="#388e3c", label="買われている（上昇）")
+    red_patch   = mpatches.Patch(color="#d32f2f", label="売られている（下落）")
+    ax.legend(handles=[green_patch, red_patch], loc="lower right", fontsize=8)
+    plt.tight_layout()
+    return fig
+
+
+def plot_sector_timeseries(df_ts: pd.DataFrame, top_sectors: list, bottom_sectors: list) -> plt.Figure:
+    fig, axes = plt.subplots(1, 2, figsize=(16, 5))
+
+    ax = axes[0]
+    cmap = plt.cm.get_cmap("Greens", len(top_sectors) + 2)
+    for i, sec in enumerate(top_sectors):
+        if sec in df_ts.columns:
+            series = df_ts[sec].dropna()
+            ax.plot(series.index, series - 100, label=sec, color=cmap(i + 2), linewidth=1.8)
+    ax.axhline(0, color="gray", linewidth=0.7, linestyle="--")
+    ax.set_title("📈 買われているセクター（累積リターン）", fontsize=11, fontweight="bold")
+    ax.set_ylabel("累積リターン (%)")
+    ax.legend(fontsize=8, loc="upper left")
+    ax.tick_params(axis="x", rotation=30)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    ax = axes[1]
+    cmap2 = plt.cm.get_cmap("Reds", len(bottom_sectors) + 2)
+    for i, sec in enumerate(bottom_sectors):
+        if sec in df_ts.columns:
+            series = df_ts[sec].dropna()
+            ax.plot(series.index, series - 100, label=sec, color=cmap2(i + 2), linewidth=1.8)
+    ax.axhline(0, color="gray", linewidth=0.7, linestyle="--")
+    ax.set_title("📉 売られているセクター（累積リターン）", fontsize=11, fontweight="bold")
+    ax.set_ylabel("累積リターン (%)")
+    ax.legend(fontsize=8, loc="upper left")
+    ax.tick_params(axis="x", rotation=30)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    plt.tight_layout()
+    return fig
+
+
+def plot_sector_heatmap(df_multi: pd.DataFrame) -> plt.Figure:
+    df_heat = df_multi.set_index("業種")[["1週間", "1ヶ月", "3ヶ月"]]
+    df_heat = df_heat.sort_values("1ヶ月", ascending=False)
+    vmax = max(abs(df_heat.values.max()), abs(df_heat.values.min()), 3)
+
+    fig, ax = plt.subplots(figsize=(9, max(6, len(df_heat) * 0.42)))
+    im = ax.imshow(df_heat.values, cmap="RdYlGn", aspect="auto", vmin=-vmax, vmax=vmax)
+
+    ax.set_xticks(range(len(df_heat.columns)))
+    ax.set_xticklabels(df_heat.columns, fontsize=10)
+    ax.set_yticks(range(len(df_heat.index)))
+    ax.set_yticklabels(df_heat.index, fontsize=9)
+
+    for i in range(len(df_heat.index)):
+        for j in range(len(df_heat.columns)):
+            val = df_heat.values[i, j]
+            color = "white" if abs(val) > vmax * 0.6 else "black"
+            ax.text(j, i, f"{val:+.1f}%", ha="center", va="center",
+                    fontsize=8, color=color, fontweight="bold")
+
+    plt.colorbar(im, ax=ax, label="リターン (%)", shrink=0.8)
+    ax.set_title("セクター別リターン ヒートマップ（期間比較）", fontsize=12, fontweight="bold", pad=12)
+    plt.tight_layout()
+    return fig
 
 # ================================================================
 # サイドバー
@@ -873,8 +519,8 @@ with st.sidebar:
     news_max_per_source = st.slider("各ソースの最大取得件数", 3, 10, 5)
     show_news_sources = st.multiselect(
         "表示するニュースソース",
-        ["Yahoo!Finance JP", "株探(Kabutan)", "TDnet（適時開示）", "日経新聞", "CNBC", "Reuters JP"],
-        default=["Yahoo!Finance JP", "株探(Kabutan)", "TDnet（適時開示）", "日経新聞", "CNBC", "Reuters JP"],
+        ["Yahoo!Finance JP", "株探(Kabutan)", "みんかぶ", "TDnet（適時開示）", "日経新聞", "Reuters JP"],
+        default=["Yahoo!Finance JP", "株探(Kabutan)", "TDnet（適時開示）", "日経新聞", "Reuters JP"],
     )
     st.divider()
     st.caption("データソース: Yahoo Finance, TDnet, 株探, みんかぶ, 日経, Reuters")
@@ -1130,8 +776,9 @@ def get_benchmark(start, end):
 # ================================================================
 # メインタブ
 # ================================================================
-tab_analysis, tab_news, tab_market_news = st.tabs([
+tab_analysis, tab_sector, tab_news, tab_market_news = st.tabs([
     "📊 パフォーマンス分析",
+    "🔄 セクターローテーション",
     "📰 銘柄別ニュース",
     "🌐 市場全体ニュース",
 ])
@@ -1235,180 +882,217 @@ with tab_analysis:
         except Exception as e:
             st.warning(f"AI APIエラー: {e}")
 
-# ─── Tab2: 銘柄別ニュース（ソース別独立表示）────────────────────
-with tab_news:
-    st.subheader("📰 銘柄別ニュース")
+# ─── Tab2: セクターローテーション ──────────────────────────────
+with tab_sector:
+    st.subheader("🔄 セクターローテーション分析")
+    st.caption("各業種に属する銘柄の平均リターンを集計し、資金が流入・流出しているセクターを可視化します。")
 
-    # ── session_state 初期化 ──────────────────────────────────────
-    # ニュースデータとAI要約結果をページ再レンダリング後も保持する
-    if "news_by_src" not in st.session_state:
-        st.session_state.news_by_src = {}
-    if "news_ticker" not in st.session_state:
-        st.session_state.news_ticker = ""
-    if "tdnet_summaries" not in st.session_state:
-        st.session_state.tdnet_summaries = {}   # key: "{ticker}_{idx}" -> summary str
-    if "sentiment_result" not in st.session_state:
-        st.session_state.sentiment_result = {}  # key: ticker -> summary str
+    col_ctrl1, col_ctrl2, col_ctrl3 = st.columns([2, 2, 3])
+    with col_ctrl1:
+        rotation_period = st.selectbox(
+            "分析期間",
+            options=[5, 10, 20, 60, 90],
+            index=2,
+            format_func=lambda x: {5: "1週間(5日)", 10: "2週間(10日)",
+                                    20: "1ヶ月(20日)", 60: "3ヶ月(60日)",
+                                    90: "約半年(90日)"}[x],
+        )
+    with col_ctrl2:
+        top_bottom_n = st.slider("上位・下位 表示セクター数", 3, 8, 5)
+    with col_ctrl3:
+        run_rotation = st.button("▶ セクターローテーション分析を実行", type="primary")
+
+    st.divider()
+
+    if run_rotation:
+        with st.spinner(f"全銘柄の株価データを取得中（{len(ticker_name_map)}銘柄）..."):
+            df_sector = get_sector_performance(ticker_name_map, period_days=rotation_period)
+
+        if df_sector.empty:
+            st.error("データの取得に失敗しました。しばらくしてから再試行してください。")
+        else:
+            top_sec    = df_sector.iloc[0]
+            bottom_sec = df_sector.iloc[-1]
+            rising     = (df_sector["平均リターン(%)"] > 0).sum()
+            falling    = (df_sector["平均リターン(%)"] < 0).sum()
+
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("📈 最強セクター",  top_sec["業種"],    f"{top_sec['騰落率(%)']:+.2f}%")
+            k2.metric("📉 最弱セクター",  bottom_sec["業種"], f"{bottom_sec['騰落率(%)']:+.2f}%")
+            k3.metric("🟢 上昇セクター数", f"{rising} 業種")
+            k4.metric("🔴 下落セクター数", f"{falling} 業種")
+
+            st.divider()
+
+            period_label = {5: "1週間", 10: "2週間", 20: "1ヶ月", 60: "3ヶ月", 90: "約半年"}[rotation_period]
+            fig_bar = plot_sector_bar(
+                df_sector,
+                title=f"セクター別平均リターン（{period_label}）― 買われ🟢 / 売られ🔴",
+            )
+            st.pyplot(fig_bar)
+            plt.close(fig_bar)
+
+            st.divider()
+            st.subheader("📈 買われセクター vs 📉 売られセクター の値動き比較")
+            top_sectors    = df_sector.head(top_bottom_n)["業種"].tolist()
+            bottom_sectors = df_sector.tail(top_bottom_n)["業種"].tolist()
+
+            with st.spinner("時系列データ取得中..."):
+                df_ts = get_sector_timeseries(ticker_name_map, days=max(rotation_period + 10, 30))
+
+            if not df_ts.empty:
+                fig_ts = plot_sector_timeseries(df_ts, top_sectors, bottom_sectors)
+                st.pyplot(fig_ts)
+                plt.close(fig_ts)
+
+            st.divider()
+            st.subheader("🌡️ セクター別ヒートマップ（期間比較）")
+            with st.spinner("複数期間データを取得中..."):
+                df_1w = get_sector_performance(ticker_name_map, period_days=5)
+                df_1m = get_sector_performance(ticker_name_map, period_days=20)
+                df_3m = get_sector_performance(ticker_name_map, period_days=60)
+
+            df_heat_base = df_1m[["業種"]].copy()
+            df_heat_base = df_heat_base.merge(
+                df_1w[["業種", "平均リターン(%)"]].rename(columns={"平均リターン(%)": "1週間"}), on="業種", how="left"
+            ).merge(
+                df_1m[["業種", "平均リターン(%)"]].rename(columns={"平均リターン(%)": "1ヶ月"}), on="業種", how="left"
+            ).merge(
+                df_3m[["業種", "平均リターン(%)"]].rename(columns={"平均リターン(%)": "3ヶ月"}), on="業種", how="left"
+            )
+
+            fig_heat = plot_sector_heatmap(df_heat_base)
+            st.pyplot(fig_heat)
+            plt.close(fig_heat)
+
+            st.divider()
+            st.subheader("📋 セクター別詳細データ")
+            df_display = df_sector[["業種", "平均リターン(%)", "中央値リターン(%)",
+                                     "銘柄数", "上昇銘柄数", "下落銘柄数", "上昇率(%)"]].copy()
+
+            def color_return(val):
+                if isinstance(val, float):
+                    if val > 2:   return "background-color: rgba(56,142,60,0.45); color: white; font-weight:bold"
+                    elif val > 0: return "color: #388e3c; font-weight:bold"
+                    elif val < -2: return "background-color: rgba(211,47,47,0.45); color: white; font-weight:bold"
+                    elif val < 0: return "color: #d32f2f; font-weight:bold"
+                return ""
+
+            styled = df_display.style.format({
+                "平均リターン(%)": "{:+.2f}",
+                "中央値リターン(%)": "{:+.2f}",
+                "上昇率(%)": "{:.1f}",
+            }).applymap(color_return, subset=["平均リターン(%)", "中央値リターン(%)"])
+            st.dataframe(styled, use_container_width=True, height=500)
+
+            st.divider()
+            st.subheader("🤖 AIによるセクターローテーション解説")
+            top5_str    = df_sector.head(5)[["業種", "騰落率(%)"]].to_string(index=False)
+            bottom5_str = df_sector.tail(5)[["業種", "騰落率(%)"]].to_string(index=False)
+            prompt_rotation = f"""
+あなたは日本株の機関投資家向けストラテジストです。
+以下は直近{period_label}のJPX上場主要銘柄のセクター別平均リターンです。
+
+【買われているセクター（上位5）】
+{top5_str}
+
+【売られているセクター（下位5）】
+{bottom5_str}
+
+以下の観点で400文字以内で分析してください：
+1. 現在のセクターローテーションの特徴（どんな相場環境を示唆するか）
+2. 買われているセクターの背景・理由（マクロ要因・テーマ）
+3. 売られているセクターの背景・理由
+4. 投資家へのアドバイス（注目セクター・リスク）
+"""
+            with st.spinner("AI分析中..."):
+                try:
+                    comment, ai_name = generate_ai_comment(prompt_rotation)
+                    st.info(f"{comment}\n\n_AI: {ai_name}_")
+                except Exception as e:
+                    st.warning(f"AI APIエラー: {e}")
+
+    else:
+        st.info(
+            "「▶ セクターローテーション分析を実行」ボタンを押すと分析が始まります。\n\n"
+            "**表示されるグラフ:**\n"
+            "- 🟢🔴 セクター別平均リターン棒グラフ（買われ・売られ色分け）\n"
+            "- 📈📉 上位・下位セクターの累積リターン時系列グラフ\n"
+            "- 🌡️ 1週間 / 1ヶ月 / 3ヶ月 ヒートマップ（期間比較）\n"
+            "- 📋 セクター別詳細テーブル（上昇銘柄数・上昇率など）\n"
+            "- 🤖 AIによるローテーション解説とアドバイス"
+        )
+        st.caption("⚠️ 全銘柄データ取得のため、初回実行には数十秒かかる場合があります。結果は30分キャッシュされます。")
+        
+# ─── Tab2: 銘柄別ニュース ────────────────────────────────────────
+with tab_news:
+    st.subheader("📰 銘柄別ニュース・適時開示")
 
     # 銘柄選択
     ticker_options = {f"{name}（{t}）": t for t, (name, _) in ticker_name_map.items()}
-    default_idx = list(ticker_options.keys()).index("トヨタ（7203.T）") if "トヨタ（7203.T）" in ticker_options else 0
-    selected_label  = st.selectbox("銘柄を選択", list(ticker_options.keys()), index=default_idx)
+    selected_label = st.selectbox("銘柄を選択", list(ticker_options.keys()),
+                                  index=list(ticker_options.keys()).index("トヨタ（7203.T）") if "トヨタ（7203.T）" in ticker_options else 0)
     selected_ticker = ticker_options[selected_label]
     selected_name   = ticker_name_map[selected_ticker][0]
-    selected_code   = selected_ticker.replace(".T", "")
-
-    # 銘柄が変わったらキャッシュをリセット
-    if st.session_state.news_ticker != selected_ticker:
-        st.session_state.news_by_src = {}
-        st.session_state.tdnet_summaries = {}
-        st.session_state.sentiment_result = {}
-        st.session_state.news_ticker = selected_ticker
 
     col_btn1, col_btn2 = st.columns([1, 4])
     with col_btn1:
         run_news = st.button("▶ ニュースを取得", type="primary")
     with col_btn2:
-        run_ai = st.checkbox("🤖 AIによる総合センチメント分析", value=True)
+        run_ai   = st.checkbox("🤖 AIによる要約・センチメント分析も行う", value=True)
 
-    # ── ソース設定 ─────────────────────────────────────────────────
-    SOURCE_CFG = {
-        "Yahoo!Finance JP":  {"icon": "🟦", "label": "Yahoo!ファイナンス",  "desc": "銘柄RSS"},
-        "株探(Kabutan)":     {"icon": "🟩", "label": "株探",               "desc": "銘柄専用ページ"},
-        "TDnet（適時開示）": {"icon": "🔴", "label": "TDnet 適時開示",     "desc": "過去3ヶ月"},
-        "日経新聞":          {"icon": "⬛", "label": "日経新聞",           "desc": "銘柄言及のみ"},
-        "CNBC":              {"icon": "🟪", "label": "CNBC",               "desc": "英語・銘柄言及"},
-        "Reuters JP":        {"icon": "🟫", "label": "Reuters",            "desc": "銘柄言及のみ"},
-    }
-
-    # ── ニュース取得（ボタン押下時のみ実行、結果はsession_stateへ）─
     if run_news:
-        with st.spinner(f"{selected_name}（{selected_ticker}）のニュースを全ソースから並列取得中..."):
-            st.session_state.news_by_src = fetch_news_by_source(
-                selected_ticker, selected_name, news_max_per_source
-            )
-        st.session_state.tdnet_summaries = {}   # 銘柄再取得したら要約リセット
-        st.session_state.sentiment_result = {}
+        with st.spinner(f"{selected_name} のニュースを全ソースから取得中..."):
+            all_news = fetch_all_news(selected_ticker, news_max_per_source)
 
-    # ── 取得済みデータがあれば常に表示 ───────────────────────────
-    news_by_src = st.session_state.news_by_src
-    if not news_by_src:
-        st.info("「▶ ニュースを取得」ボタンを押してください")
-    else:
-        total = sum(len(v) for v in news_by_src.values())
-        st.caption(f"取得完了 — 合計 {total} 件")
+        # フィルタリング（サイドバーで選択したソースのみ）
+        filtered = [n for n in all_news if n["source"] in show_news_sources] if show_news_sources else all_news
 
-        # ── サマリーバー ─────────────────────────────────────────
-        cols_hdr = st.columns(len(SOURCE_CFG))
-        for i, (src_key, cfg) in enumerate(SOURCE_CFG.items()):
-            cnt = len(news_by_src.get(src_key, []))
-            cols_hdr[i].metric(
-                f"{cfg['icon']} {cfg['label']}",
-                f"{cnt} 件",
-                help=cfg["desc"],
-            )
+        if not filtered:
+            st.warning("ニュースが取得できませんでした（ソース設定を確認してください）")
+        else:
+            # ソース別に色分け表示
+            source_colors = {
+                "Yahoo!Finance JP":  "🟦",
+                "株探(Kabutan)":     "🟩",
+                "みんかぶ":          "🟨",
+                "TDnet（適時開示）": "🟥",
+                "日経新聞":          "⬛",
+                "Reuters JP":        "🟫",
+            }
 
-        st.divider()
+            # ソース別集計
+            from collections import Counter
+            src_counts = Counter(n["source"] for n in filtered)
+            cols_stat  = st.columns(len(src_counts))
+            for i, (src, cnt) in enumerate(src_counts.items()):
+                icon = source_colors.get(src, "⚪")
+                cols_stat[i].metric(f"{icon} {src}", f"{cnt}件")
 
-        # ── ソースごとに独立セクション表示 ────────────────────────
-        for src_key, cfg in SOURCE_CFG.items():
-            items = news_by_src.get(src_key, [])
-            icon  = cfg["icon"]
-            label = cfg["label"]
-
-            with st.expander(
-                f"{icon} **{label}** — {len(items)} 件  `{cfg['desc']}`",
-                expanded=(len(items) > 0),
-            ):
-                if not items:
-                    st.caption("記事が取得できませんでした")
-                    if src_key == "TDnet（適時開示）":
-                        st.caption("※ 適時開示は決算期（3・6・9・12月）前後に集中します")
-                    elif src_key in ("日経新聞", "CNBC", "Reuters JP"):
-                        st.caption(f"※ {selected_name} に言及する記事が直近ありませんでした")
-                    continue
-
-                for idx_item, item in enumerate(items):
-                    title       = item["title"]
-                    link        = item.get("link", "")
-                    date        = item.get("date", "")
-                    badge_emoji = item.get("badge_emoji", "")
-                    badge_text  = item.get("badge", "")
-
-                    col_t, col_d = st.columns([5, 1])
-                    with col_t:
-                        if src_key == "TDnet（適時開示）":
-                            # タイトル＋PDFリンク
-                            if link:
-                                st.markdown(f"🔴 [{title} 📄]({link})")
-                            else:
-                                st.markdown(f"🔴 {title} 📄")
-
-                            # AI要約ボタン
-                            summary_key = f"{selected_code}_{idx_item}"
-                            btn_key     = f"btn_tdnet_{summary_key}"
-
-                            if st.button("🤖 AIで要約", key=btn_key):
-                                with st.spinner("PDF内容を取得・要約中..."):
-                                    result = ai_summarize_tdnet_pdf(link, title)
-                                # session_state に保存 → ボタン再押しでも消えない
-                                st.session_state.tdnet_summaries[summary_key] = result
-
-                            # 要約結果を表示（session_stateから読む）
-                            if summary_key in st.session_state.tdnet_summaries:
-                                st.info(st.session_state.tdnet_summaries[summary_key])
-
-                        elif src_key == "株探(Kabutan)":
-                            prefix = f"{badge_emoji}{badge_text} " if badge_text else ""
-                            if link:
-                                st.markdown(f"{prefix}[{title}]({link})")
-                            else:
-                                st.markdown(f"{prefix}{title}")
-
-                            # 株探 AI要約ボタン
-                            summary_key = f"kabutan_{selected_code}_{idx_item}"
-                            btn_key     = f"btn_kabutan_{summary_key}"
-                            if st.button("🤖 AIで要約", key=btn_key):
-                                with st.spinner("記事内容を取得・要約中..."):
-                                    result = ai_summarize_tdnet_pdf(link, title)
-                                st.session_state.tdnet_summaries[summary_key] = result
-                            if summary_key in st.session_state.tdnet_summaries:
-                                st.info(st.session_state.tdnet_summaries[summary_key])
-
-                        else:
-                            prefix = f"{badge_emoji}{badge_text} " if badge_text else ""
-                            if link:
-                                st.markdown(f"{prefix}[{title}]({link})")
-                            else:
-                                st.markdown(f"{prefix}{title}")
-
-                    with col_d:
-                        if date:
-                            date_short = date[:10] if len(date) >= 10 else date
-                            st.caption(date_short)
-
-                    if src_key != "TDnet（適時開示）":
-                        st.markdown("---")
-
-        # ── AI 総合センチメント ───────────────────────────────────
-        if run_ai:
             st.divider()
-            st.subheader(f"🤖 {selected_name} AI センチメント分析")
 
-            # 既にsession_stateに結果があればそのまま表示
-            if selected_ticker in st.session_state.sentiment_result:
-                st.info(st.session_state.sentiment_result[selected_ticker])
-            elif total > 0:
-                all_headlines = [
-                    f"[{src}] {it['title']}"
-                    for src, its in news_by_src.items()
-                    for it in its
-                ]
+            # ニュース一覧表示
+            for item in filtered:
+                icon = source_colors.get(item["source"], "⚪")
+                with st.expander(f"{icon} [{item['source']}] {item['title'][:60]}{'…' if len(item['title'])>60 else ''}"):
+                    c1, c2 = st.columns([3, 1])
+                    with c1:
+                        st.markdown(f"**{item['title']}**")
+                        if item.get("summary"):
+                            st.caption(item["summary"])
+                    with c2:
+                        if item.get("date"):
+                            st.caption(f"📅 {item['date']}")
+                        if item.get("link"):
+                            st.markdown(f"[🔗 記事を開く]({item['link']})")
+
+            # AI 分析
+            if run_ai:
+                st.divider()
+                st.subheader("🤖 AI ニュース分析（センチメント）")
                 with st.spinner("AI分析中..."):
-                    ai_result = ai_news_summary(all_headlines, selected_name, selected_ticker)
-                st.session_state.sentiment_result[selected_ticker] = ai_result
+                    ai_result = ai_news_summary(filtered, selected_name, selected_ticker)
                 st.info(ai_result)
-
 
 # ─── Tab3: 市場全体ニュース ──────────────────────────────────────
 with tab_market_news:
