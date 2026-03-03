@@ -550,36 +550,59 @@ def get_price_volume_scatter(ticker_name_map: dict, days: int = 20) -> pd.DataFr
     return pd.DataFrame(results)
 
 
-def plot_pv_scatter(df: pd.DataFrame) -> plt.Figure:
-    sectors = df["業種"].unique()
-    cmap    = plt.cm.get_cmap("tab20", len(sectors))
-    color_map = {s: cmap(i) for i, s in enumerate(sectors)}
-    fig, ax = plt.subplots(figsize=(12, 8))
-    for sector in sectors:
-        sub = df[df["業種"] == sector]
-        ax.scatter(sub["出来高変化率(%)"], sub["株価騰落率(%)"],
-                   label=sector, color=color_map[sector], alpha=0.75, s=60, edgecolors="none")
-    ax.axhline(0, color="gray", linewidth=0.8, linestyle="--")
-    ax.axvline(0, color="gray", linewidth=0.8, linestyle="--")
-    xlim = ax.get_xlim()
-    ylim = ax.get_ylim()
-    ax.text(xlim[1]*0.6, ylim[1]*0.85, "株高+出来高増\n（本命上昇）",
-            fontsize=8, color="#388e3c", fontweight="bold")
-    ax.text(xlim[0]*0.6, ylim[1]*0.85, "株高+出来高減\n（戻り弱い）",
-            fontsize=8, color="#f57c00", fontweight="bold")
-    ax.text(xlim[1]*0.6, ylim[0]*0.85, "株安+出来高増\n（売り圧力）",
-            fontsize=8, color="#d32f2f", fontweight="bold")
-    ax.text(xlim[0]*0.6, ylim[0]*0.85, "株安+出来高減\n（静かな下落）",
-            fontsize=8, color="#9e9e9e", fontweight="bold")
-    ax.set_xlabel("出来高変化率 (%)", fontsize=10)
-    ax.set_ylabel("株価騰落率 (%)", fontsize=10)
-    ax.set_title("Price x Volume マップ（セクター別）", fontsize=13, fontweight="bold")
-    ax.legend(loc="upper left", bbox_to_anchor=(1, 1), fontsize=7, ncol=1)
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    plt.tight_layout()
-    return fig
+def plot_pv_scatter(df: pd.DataFrame) -> None:
+    """Price × Volume 散布図（Plotly・ホバーで銘柄名表示）"""
+    import plotly.express as px
 
+    fig = px.scatter(
+        df,
+        x="出来高変化率(%)",
+        y="株価騰落率(%)",
+        color="業種",
+        hover_name="企業名",
+        hover_data={
+            "業種": True,
+            "株価騰落率(%)": ":.2f",
+            "出来高変化率(%)": ":.2f",
+        },
+        title="Price x Volume マップ（セクター別）― ホバーで銘柄名表示",
+        height=600,
+    )
+
+    # 象限ライン
+    fig.add_hline(y=0, line_dash="dash", line_color="gray", line_width=1)
+    fig.add_vline(x=0, line_dash="dash", line_color="gray", line_width=1)
+
+    # 象限ラベル
+    x_max = df["出来高変化率(%)"].max()
+    x_min = df["出来高変化率(%)"].min()
+    y_max = df["株価騰落率(%)"].max()
+    y_min = df["株価騰落率(%)"].min()
+
+    annotations = [
+        dict(x=x_max * 0.7, y=y_max * 0.85, text="株高+出来高増<br>（本命上昇）",
+             showarrow=False, font=dict(color="#388e3c", size=11)),
+        dict(x=x_min * 0.7, y=y_max * 0.85, text="株高+出来高減<br>（戻り弱い）",
+             showarrow=False, font=dict(color="#f57c00", size=11)),
+        dict(x=x_max * 0.7, y=y_min * 0.85, text="株安+出来高増<br>（売り圧力）",
+             showarrow=False, font=dict(color="#d32f2f", size=11)),
+        dict(x=x_min * 0.7, y=y_min * 0.85, text="株安+出来高減<br>（静かな下落）",
+             showarrow=False, font=dict(color="#9e9e9e", size=11)),
+    ]
+    fig.update_layout(annotations=annotations)
+
+    fig.update_layout(
+        xaxis_title="出来高変化率 (%)",
+        yaxis_title="株価騰落率 (%)",
+        legend=dict(
+            orientation="v",
+            x=1.02, y=1,
+            font=dict(size=10),
+        ),
+        margin=dict(r=150),
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
 
 # ================================================================
 # 📊 価格パターン系モジュール
@@ -1420,9 +1443,7 @@ with tab_volume:
             df_pv = get_price_volume_scatter(ticker_name_map, days=pv_days)
 
         if not df_pv.empty:
-            fig_pv = plot_pv_scatter(df_pv)
-            st.pyplot(fig_pv)
-            plt.close(fig_pv)
+            plot_pv_scatter(df_pv)
 
             q1 = df_pv[(df_pv["株価騰落率(%)"] > 0) & (df_pv["出来高変化率(%)"] > 0)]
             q1_top = q1.nlargest(5, "株価騰落率(%)")[["企業名", "業種", "株価騰落率(%)", "出来高変化率(%)"]].to_string(index=False)
