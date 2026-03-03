@@ -66,18 +66,17 @@ def generate_ai_comment(prompt: str) -> tuple[str, str]:
     try:
         response = gemini_model.generate_content(prompt)
         return response.text, "Gemini"
-def generate_ai_comment(prompt: str) -> tuple[str, str]:
-    try:
-        response = gemini_model.generate_content(prompt)
-        return response.text, "Gemini"
+		def generate_ai_comment(prompt: str) -> tuple[str, str]:
+    		try:
+        		response = gemini_model.generate_content(prompt)
+        		return response.text, "Gemini"
 
-    except Exception as e:
-        print("Gemini Error:", e)
+ 		   except Exception as e:
+       		 print("Gemini Error:", e)
 
-        if groq_client is None:
+ 		       if groq_client is None:
             return f"Geminiエラー: {e}", "Error"
-
-        try:
+	        try:
             chat = groq_client.chat.completions.create(
                 model=GROQ_MODEL,
                 messages=[{"role": "user", "content": prompt}],
