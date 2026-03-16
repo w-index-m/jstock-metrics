@@ -6,3 +6,6 @@ numpy
 matplotlib
 python-dateutil
 groq
+pdfplumber
+beautifulsoup4
+feedparser
