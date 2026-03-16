@@ -12,6 +12,16 @@ import requests
 import xml.etree.ElementTree as ET
 import re
 from io import StringIO
+import io
+import datetime as dt
+from bs4 import BeautifulSoup
+import feedparser
+
+try:
+    import pdfplumber
+    PDFPLUMBER_AVAILABLE = True
+except ImportError:
+    PDFPLUMBER_AVAILABLE = False
 
 # -----------------------------
 # フォント設定（日本語対応）
@@ -1156,47 +1166,6 @@ def get_benchmark(start, end):
 # メインタブ
 # ================================================================
 
-# ── タブ直前リンクバー ────────────────────────────────────────────
-st.markdown(
-    """
-    <div style="
-        background: linear-gradient(135deg, #e8eaf6 0%, #e8f5e9 100%);
-        border: 1px solid #c5cae9;
-        border-radius: 10px;
-        padding: 10px 16px;
-        margin-bottom: 12px;
-        display: flex;
-        align-items: center;
-        gap: 14px;
-        flex-wrap: wrap;
-    ">
-        <span style="font-weight:700;font-size:13px;color:#3949ab;white-space:nowrap;">
-            🔗 関連ダッシュボード
-        </span>
-        <a href="https://usstock-metrics.streamlit.app/" target="_blank" rel="noopener noreferrer" style="
-            display:inline-flex;align-items:center;gap:6px;
-            background:linear-gradient(135deg,#1565c0,#1976d2);
-            color:#fff;padding:7px 16px;border-radius:7px;text-decoration:none;
-            font-size:13px;font-weight:700;
-            box-shadow:0 2px 8px rgba(21,101,192,0.35);
-            white-space:nowrap;
-        ">🇺🇸&nbsp;USStockMetrics</a>
-        <a href="https://windex.streamlit.app/" target="_blank" rel="noopener noreferrer" style="
-            display:inline-flex;align-items:center;gap:6px;
-            background:linear-gradient(135deg,#2e7d32,#43a047);
-            color:#fff;padding:7px 16px;border-radius:7px;text-decoration:none;
-            font-size:13px;font-weight:700;
-            box-shadow:0 2px 8px rgba(46,125,50,0.35);
-            white-space:nowrap;
-        ">📊&nbsp;Market Dashboard</a>
-        <span style="font-size:11px;color:#888;">
-            各ダッシュボードで詳細な銘柄分析・指標をご覧いただけます
-        </span>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
 tab_analysis, tab_sector, tab_volume, tab_price, tab_unique, tab_news, tab_market_news = st.tabs([
     "📊 パフォーマンス分析",
     "🔄 セクターローテーション",
@@ -1902,3 +1871,300 @@ with tab_market_news:
                 except Exception as e:
                     st.warning(f"AI APIエラー: {e}")
                     
+
+# ================================================================
+# TDnet自動解析（決算・適時開示）
+# ================================================================
+
+TDNET_LIST_URL = "https://www.release.tdnet.info/inbs/I_list_001_{yyyymmdd}.html"
+TDNET_BASE     = "https://www.release.tdnet.info"
+MAX_PDF_CHARS  = 12000
+TDNET_UA       = "Mozilla/5.0 (JStockMetrics/1.0)"
+
+KESSAN_KEYWORDS = [
+    "決算", "業績", "配当", "増益", "減益", "黒字", "赤字",
+    "上方修正", "下方修正", "業績修正", "予想修正", "経常利益",
+    "営業利益", "純利益", "売上", "収益", "通期", "四半期",
+    "第1四半期", "第2四半期", "第3四半期", "中間", "年度",
+]
+
+def _is_kessan(item: dict) -> bool:
+    text = ((item.get("title") or "") + " " + (item.get("around") or "")).lower()
+    return any(kw.lower() in text for kw in KESSAN_KEYWORDS)
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _fetch_tdnet_html(yyyymmdd: str) -> str:
+    url = TDNET_LIST_URL.format(yyyymmdd=yyyymmdd)
+    r = requests.get(url, timeout=20, headers={"User-Agent": TDNET_UA})
+    r.raise_for_status()
+    r.encoding = r.apparent_encoding
+    return r.text
+
+def _extract_tdnet_items(html_content: str) -> list:
+    soup = BeautifulSoup(html_content, "html.parser")
+    items = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        if not href or ".pdf" not in href.lower():
+            continue
+        if href.startswith("http"):
+            pdf_url = href
+        elif href.startswith("//"):
+            pdf_url = "https:" + href
+        elif href.startswith("/"):
+            pdf_url = TDNET_BASE + href
+        else:
+            pdf_url = TDNET_BASE + "/inbs/" + href
+        title = a.get_text(strip=True) or "（タイトル不明）"
+        parent_text = ""
+        if a.parent:
+            parent_text = a.parent.get_text(" ", strip=True)
+            if a.parent.parent:
+                parent_text += " " + a.parent.parent.get_text(" ", strip=True)
+        around = (parent_text + " " + title).strip()
+        code = None
+        m = re.search(r"\b(\d{4})\b", around)
+        if m:
+            code = m.group(1)
+        time_str = None
+        m2 = re.search(r"\b([0-2]?\d:[0-5]\d)\b", around)
+        if m2:
+            time_str = m2.group(1)
+        items.append({
+            "title": title, "pdf_url": pdf_url,
+            "code": code, "time": time_str, "around": around[:200],
+        })
+    return list({it["pdf_url"]: it for it in items}.values())
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_tdnet_items_jstock(yyyymmdd: str) -> list:
+    """RSS優先、失敗時はHTMLスクレイピング"""
+    rss_url = "https://webapi.yanoshin.jp/webapi/tdnet/list/recent.rss"
+    try:
+        import urllib.request
+        req = urllib.request.Request(rss_url, headers={"User-Agent": TDNET_UA})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            feed_data = resp.read()
+        feed = feedparser.parse(feed_data)
+        target_date = dt.datetime.strptime(yyyymmdd, "%Y%m%d").date()
+        items = []
+        for entry in feed.entries:
+            pub_date = None
+            if hasattr(entry, "published_parsed"):
+                pub_date = dt.datetime(*entry.published_parsed[:6]).date()
+            if pub_date and pub_date != target_date:
+                continue
+            title = entry.get("title", "")
+            link  = entry.get("link", "")
+            pdf_url = link if ".pdf" in link.lower() else ""
+            if not pdf_url:
+                desc = entry.get("description", "") or entry.get("summary", "")
+                soup = BeautifulSoup(desc, "html.parser")
+                for a in soup.find_all("a", href=True):
+                    if ".pdf" in a["href"].lower():
+                        pdf_url = a["href"]
+                        break
+            if not pdf_url:
+                continue
+            code = None
+            m = re.search(r"\b(\d{4})\b", title)
+            if m:
+                code = m.group(1)
+            time_str = None
+            if pub_date and hasattr(entry, "published_parsed"):
+                time_str = dt.datetime(*entry.published_parsed[:6]).strftime("%H:%M")
+            items.append({
+                "title": title, "pdf_url": pdf_url,
+                "code": code, "time": time_str, "around": title,
+            })
+        if items:
+            return items
+    except Exception:
+        pass
+    try:
+        html = _fetch_tdnet_html(yyyymmdd)
+        return _extract_tdnet_items(html)
+    except Exception:
+        return []
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _download_pdf(pdf_url: str) -> bytes:
+    r = requests.get(pdf_url, timeout=20, headers={"User-Agent": TDNET_UA})
+    r.raise_for_status()
+    return r.content
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _extract_pdf_text(pdf_bytes: bytes) -> str:
+    if not PDFPLUMBER_AVAILABLE:
+        return ""
+    parts = []
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            t = page.extract_text() or ""
+            if t.strip():
+                parts.append(t)
+    return "\n".join(parts).strip()
+
+def _summarize_tdnet_pdf(pdf_text: str, title: str) -> tuple:
+    """AIでTDnet PDFを要約。Gemini→Groqフォールバック"""
+    trimmed = pdf_text[:MAX_PDF_CHARS]
+    prompt = f"""
+あなたは日本の上場企業の開示資料（TDnet）の読み取り担当です。
+以下の資料テキストから要点を抽出し、次のフォーマットでまとめてください。
+
+【出力フォーマット】
+- 概要: （増益/減益/上方修正/下方修正など）
+- 主要数値: （売上/営利/経常/純利の変化）
+- 理由: （要因を1〜3点）
+- 注意点: （特損/為替/会計変更など）
+- 株価への影響: （ポジティブ/ニュートラル/ネガティブ）
+
+【資料タイトル】
+{title}
+
+【テキスト】
+{trimmed}
+""".strip()
+    comment, ai_name = generate_ai_comment(prompt)
+    return comment, ai_name
+
+
+def render_tdnet_section():
+    """TDnet自動解析セクション"""
+    st.markdown("---")
+    st.header("📄 TDnet自動解析（決算・適時開示）")
+    st.caption("TDnetから決算・業績修正資料を自動取得し、AIで要約します。")
+
+    if not PDFPLUMBER_AVAILABLE:
+        st.warning("⚠️ pdfplumberが未インストールです。requirements.txtに `pdfplumber` を追加してください。")
+
+    # ── 設定 ──────────────────────────────────────────────────────
+    with st.expander("⚙️ TDnet設定", expanded=True):
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            import pytz
+            JST = pytz.timezone("Asia/Tokyo")
+            today_jst = dt.datetime.now(JST).date()
+            tdnet_date = st.date_input("対象日", value=today_jst, key="tdnet_date_jstock")
+        with col2:
+            tdnet_keyword = st.text_input(
+                "フィルタ（銘柄コード/会社名）", value="",
+                placeholder="例: 7203 / トヨタ", key="tdnet_kw_jstock"
+            )
+        with col3:
+            tdnet_max = st.slider("表示件数", 5, 50, 20, key="tdnet_max_jstock")
+
+    yyyymmdd = tdnet_date.strftime("%Y%m%d")
+
+    with st.spinner(f"TDnet一覧取得中...（{yyyymmdd}）"):
+        items = fetch_tdnet_items_jstock(yyyymmdd)
+
+    # 決算フィルタ
+    total_before = len(items)
+    items = [it for it in items if _is_kessan(it)]
+    st.caption(f"🔍 決算フィルタ: 全{total_before}件 → 決算関連 {len(items)}件")
+
+    # キーワードフィルタ
+    if tdnet_keyword.strip():
+        kw = tdnet_keyword.strip().lower()
+        items = [
+            it for it in items
+            if kw in (it.get("title") or "").lower()
+            or kw in (it.get("around") or "").lower()
+            or kw == (it.get("code") or "").lower()
+        ]
+        st.caption(f"🔎 キーワード「{tdnet_keyword}」: {len(items)}件")
+
+    items = items[:tdnet_max]
+    st.caption(f"📊 表示: {len(items)}件")
+
+    if not items:
+        st.info("該当する開示資料が見つかりませんでした。日付や条件を変更してください。")
+        return
+
+    # ── セッション管理 ───────────────────────────────────────────
+    if "tdnet_summaries_jstock" not in st.session_state:
+        st.session_state["tdnet_summaries_jstock"] = {}
+
+    # ── まとめて解析ボタン ───────────────────────────────────────
+    col_b1, col_b2 = st.columns([3, 1])
+    with col_b1:
+        batch_n = st.number_input(
+            "まとめて解析する件数", min_value=1,
+            max_value=max(1, len(items)), value=min(3, len(items)),
+            key="tdnet_batch_n_jstock"
+        )
+    with col_b2:
+        run_batch = st.button("🚀 まとめて解析", type="primary", key="tdnet_batch_jstock")
+
+    if run_batch:
+        target = items[:int(batch_n)]
+        prog = st.progress(0)
+        for i, it in enumerate(target, 1):
+            pdf_url = it["pdf_url"]
+            title   = it["title"]
+            with st.spinner(f"[{i}/{len(target)}] {title[:30]}..."):
+                try:
+                    pdf_bytes = _download_pdf(pdf_url)
+                    pdf_text  = _extract_pdf_text(pdf_bytes)
+                    if not pdf_text:
+                        summary, ai_name = "（PDFからテキストを抽出できませんでした）", ""
+                    else:
+                        summary, ai_name = _summarize_tdnet_pdf(pdf_text, title)
+                    st.session_state["tdnet_summaries_jstock"][pdf_url] = (summary, ai_name)
+                except Exception as e:
+                    st.session_state["tdnet_summaries_jstock"][pdf_url] = (f"エラー: {str(e)[:100]}", "")
+            prog.progress(i / len(target))
+        st.success("✅ 解析完了！")
+
+    st.divider()
+
+    # ── 個別一覧 ─────────────────────────────────────────────────
+    for idx, it in enumerate(items, 1):
+        title   = it["title"]
+        pdf_url = it["pdf_url"]
+        code    = it.get("code") or "----"
+        time_s  = it.get("time") or "--:--"
+
+        with st.container(border=True):
+            c1, c2, c3, c4 = st.columns([0.5, 5, 1, 1])
+            c1.markdown(f"**{idx}**")
+            c2.markdown(f"**{title}**  \n`{code}` {time_s}")
+            c3.markdown(
+                f'<a href="{pdf_url}" target="_blank" '
+                f'style="display:inline-block;padding:4px 10px;'
+                f'background:#f0f2f6;border-radius:4px;'
+                f'text-decoration:none;color:#262730;font-size:13px;">📄 PDF</a>',
+                unsafe_allow_html=True,
+            )
+            run_one = c4.button("🔍 解析", key=f"tdnet_one_{idx}")
+
+            # 既存の要約表示
+            if pdf_url in st.session_state["tdnet_summaries_jstock"]:
+                summary, ai_name = st.session_state["tdnet_summaries_jstock"][pdf_url]
+                st.markdown("**✅ AI要約:**")
+                st.write(summary)
+                if ai_name:
+                    st.caption(f"🤖 使用AI: {ai_name}")
+
+            # 個別解析ボタン
+            if run_one:
+                with st.spinner("PDF取得・解析中..."):
+                    try:
+                        pdf_bytes = _download_pdf(pdf_url)
+                        pdf_text  = _extract_pdf_text(pdf_bytes)
+                        if not pdf_text:
+                            summary, ai_name = "（PDFからテキストを抽出できませんでした）", ""
+                        else:
+                            summary, ai_name = _summarize_tdnet_pdf(pdf_text, title)
+                        st.session_state["tdnet_summaries_jstock"][pdf_url] = (summary, ai_name)
+                        st.success("✅ 解析完了")
+                        st.write(summary)
+                        if ai_name:
+                            st.caption(f"🤖 使用AI: {ai_name}")
+                    except Exception as e:
+                        st.error(f"❌ エラー: {e}")
+
+
+# ── TDnet セクション呼び出し ─────────────────────────────────────
+render_tdnet_section()
