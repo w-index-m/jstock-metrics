@@ -52,6 +52,47 @@ GROQ_MODEL = "llama-3.3-8b-instant"
 st.set_page_config(layout="wide", page_title="📈 日本株 分析ダッシュボード", page_icon="📈")
 st.title("📈 日本株 シャープレシオ分析 + ニュース統合")
 
+# ── 関連ダッシュボード リンクバー ────────────────────────────────
+st.markdown(
+    """
+    <div style="
+        background: linear-gradient(135deg, #e8eaf6 0%, #e8f5e9 100%);
+        border: 1px solid #c5cae9;
+        border-radius: 10px;
+        padding: 10px 16px;
+        margin-bottom: 16px;
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        flex-wrap: wrap;
+    ">
+        <span style="font-weight:700;font-size:13px;color:#3949ab;white-space:nowrap;">
+            🔗 関連ダッシュボード
+        </span>
+        <a href="https://usstock-metrics.streamlit.app/" target="_blank" rel="noopener noreferrer" style="
+            display:inline-flex;align-items:center;gap:6px;
+            background:linear-gradient(135deg,#1565c0,#1976d2);
+            color:#fff;padding:7px 16px;border-radius:7px;text-decoration:none;
+            font-size:13px;font-weight:700;
+            box-shadow:0 2px 8px rgba(21,101,192,0.35);
+            white-space:nowrap;
+        ">🇺🇸&nbsp;USStockMetrics</a>
+        <a href="https://windex.streamlit.app/" target="_blank" rel="noopener noreferrer" style="
+            display:inline-flex;align-items:center;gap:6px;
+            background:linear-gradient(135deg,#2e7d32,#43a047);
+            color:#fff;padding:7px 16px;border-radius:7px;text-decoration:none;
+            font-size:13px;font-weight:700;
+            box-shadow:0 2px 8px rgba(46,125,50,0.35);
+            white-space:nowrap;
+        ">📊&nbsp;Market Dashboard</a>
+        <span style="font-size:11px;color:#888;">
+            各ダッシュボードで詳細な銘柄分析・指標をご覧いただけます
+        </span>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
 # -----------------------------
 # AI設定（Gemini優先 / Groqフォールバック）
 # -----------------------------
@@ -1114,6 +1155,48 @@ def get_benchmark(start, end):
 # ================================================================
 # メインタブ
 # ================================================================
+
+# ── タブ直前リンクバー ────────────────────────────────────────────
+st.markdown(
+    """
+    <div style="
+        background: linear-gradient(135deg, #e8eaf6 0%, #e8f5e9 100%);
+        border: 1px solid #c5cae9;
+        border-radius: 10px;
+        padding: 10px 16px;
+        margin-bottom: 12px;
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        flex-wrap: wrap;
+    ">
+        <span style="font-weight:700;font-size:13px;color:#3949ab;white-space:nowrap;">
+            🔗 関連ダッシュボード
+        </span>
+        <a href="https://usstock-metrics.streamlit.app/" target="_blank" rel="noopener noreferrer" style="
+            display:inline-flex;align-items:center;gap:6px;
+            background:linear-gradient(135deg,#1565c0,#1976d2);
+            color:#fff;padding:7px 16px;border-radius:7px;text-decoration:none;
+            font-size:13px;font-weight:700;
+            box-shadow:0 2px 8px rgba(21,101,192,0.35);
+            white-space:nowrap;
+        ">🇺🇸&nbsp;USStockMetrics</a>
+        <a href="https://windex.streamlit.app/" target="_blank" rel="noopener noreferrer" style="
+            display:inline-flex;align-items:center;gap:6px;
+            background:linear-gradient(135deg,#2e7d32,#43a047);
+            color:#fff;padding:7px 16px;border-radius:7px;text-decoration:none;
+            font-size:13px;font-weight:700;
+            box-shadow:0 2px 8px rgba(46,125,50,0.35);
+            white-space:nowrap;
+        ">📊&nbsp;Market Dashboard</a>
+        <span style="font-size:11px;color:#888;">
+            各ダッシュボードで詳細な銘柄分析・指標をご覧いただけます
+        </span>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
 tab_analysis, tab_sector, tab_volume, tab_price, tab_unique, tab_news, tab_market_news = st.tabs([
     "📊 パフォーマンス分析",
     "🔄 セクターローテーション",
@@ -1818,3 +1901,4 @@ with tab_market_news:
                     st.info(comment)
                 except Exception as e:
                     st.warning(f"AI APIエラー: {e}")
+                    
