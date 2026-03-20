@@ -142,6 +142,40 @@ def generate_ai_comment(prompt: str) -> tuple[str, str]:
         return f"Groqも失敗: {e}", "Error"
 
 # ================================================================
+# yfinance ユーティリティ（MultiIndex対応）
+# ================================================================
+
+def _yfdownload(ticker, start=None, end=None, period=None, progress=False):
+    """
+    yfinance v0.2以降のMultiIndex列を自動フラット化して返す。
+    単一銘柄でも ('Close','7203.T') → 'Close' に変換。
+    """
+    try:
+        kwargs = dict(progress=progress, auto_adjust=True)
+        if period:
+            kwargs["period"] = period
+        else:
+            kwargs["start"] = start
+            kwargs["end"]   = end
+        df = yf.download(ticker, **kwargs)
+        if df.empty:
+            return df
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.droplevel(1)
+        df = df.loc[:, ~df.columns.duplicated()]
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def _to_series(col) -> pd.Series:
+    """DataFrame列またはSeriesを確実に1次元Seriesに変換"""
+    if isinstance(col, pd.DataFrame):
+        return col.iloc[:, 0]
+    return col
+
+
+# ================================================================
 # 📰 ニュース取得モジュール
 # ================================================================
 
@@ -371,12 +405,12 @@ def get_sector_performance(ticker_name_map: dict, period_days: int = 20) -> pd.D
     sector_returns = {}
     for ticker, (name, sector) in ticker_name_map.items():
         try:
-            df = yf.download(ticker, start=start_date, end=end_date, progress=False)
+            df = _yfdownload(ticker, start=start_date, end=end_date, progress=False)
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.droplevel(1)
             if df.empty or len(df) < 2:
                 continue
-            close = df["Close"].dropna()
+            close = _to_series(df["Close"]).dropna()
             ret = (close.iloc[-1] - close.iloc[0]) / close.iloc[0] * 100
             if sector not in sector_returns:
                 sector_returns[sector] = []
@@ -407,12 +441,12 @@ def get_sector_timeseries(ticker_name_map: dict, days: int = 60) -> pd.DataFrame
     sector_price_data = {}
     for ticker, (name, sector) in ticker_name_map.items():
         try:
-            df = yf.download(ticker, start=start_date, end=end_date, progress=False)
+            df = _yfdownload(ticker, start=start_date, end=end_date, progress=False)
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.droplevel(1)
             if df.empty or len(df) < 5:
                 continue
-            close = df["Close"].dropna()
+            close = _to_series(df["Close"]).dropna()
             norm  = close / close.iloc[0] * 100
             if sector not in sector_price_data:
                 sector_price_data[sector] = []
@@ -518,18 +552,18 @@ def get_volume_surge(ticker_name_map: dict, surge_ratio: float = 2.0,
     results = []
     for ticker, (name, sector) in ticker_name_map.items():
         try:
-            df = yf.download(ticker, start=start_date, end=end_date, progress=False)
+            df = _yfdownload(ticker, start=start_date, end=end_date, progress=False)
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.droplevel(1)
             if df.empty or len(df) < base_days:
                 continue
-            vol = df["Volume"].dropna()
+            vol = _to_series(df["Volume"]).dropna()
             recent_avg = vol.iloc[-short_days:].mean()
             base_avg   = vol.iloc[-base_days:-short_days].mean()
             if base_avg == 0:
                 continue
             ratio = recent_avg / base_avg
-            price_chg = (df["Close"].iloc[-1] - df["Close"].iloc[-short_days]) / df["Close"].iloc[-short_days] * 100
+            price_chg = (_to_series(df["Close"]).iloc[-1] - _to_series(df["Close"]).iloc[-short_days]) / _to_series(df["Close"]).iloc[-short_days] * 100
             if ratio >= surge_ratio:
                 results.append({
                     "企業名": name, "業種": sector, "ティッカー": ticker,
@@ -537,7 +571,7 @@ def get_volume_surge(ticker_name_map: dict, surge_ratio: float = 2.0,
                     "直近5日平均出来高": int(recent_avg),
                     "基準平均出来高": int(base_avg),
                     "株価変化率(5日%)": round(float(price_chg), 2),
-                    "最新株価": round(float(df["Close"].iloc[-1]), 1),
+                    "最新株価": round(float(_to_series(df["Close"]).iloc[-1]), 1),
                 })
         except Exception:
             continue
@@ -555,14 +589,14 @@ def get_vwap_deviation(ticker_name_map: dict, days: int = 20) -> pd.DataFrame:
     results = []
     for ticker, (name, sector) in ticker_name_map.items():
         try:
-            df = yf.download(ticker, start=start_date, end=end_date, progress=False)
+            df = _yfdownload(ticker, start=start_date, end=end_date, progress=False)
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.droplevel(1)
             if df.empty or len(df) < 5:
                 continue
             df = df.dropna(subset=["Close", "Volume"])
-            vwap = (df["Close"] * df["Volume"]).sum() / df["Volume"].sum()
-            current_price = float(df["Close"].iloc[-1])
+            vwap = (_to_series(df["Close"]) * _to_series(df["Volume"])).sum() / _to_series(df["Volume"]).sum()
+            current_price = float(_to_series(df["Close"]).iloc[-1])
             deviation = (current_price - float(vwap)) / float(vwap) * 100
             results.append({
                 "企業名": name, "業種": sector, "ティッカー": ticker,
@@ -586,13 +620,13 @@ def get_price_volume_scatter(ticker_name_map: dict, days: int = 20) -> pd.DataFr
     results = []
     for ticker, (name, sector) in ticker_name_map.items():
         try:
-            df = yf.download(ticker, start=start_date, end=end_date, progress=False)
+            df = _yfdownload(ticker, start=start_date, end=end_date, progress=False)
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.droplevel(1)
             if df.empty or len(df) < 5:
                 continue
-            price_chg = (df["Close"].iloc[-1] - df["Close"].iloc[0]) / df["Close"].iloc[0] * 100
-            vol_chg   = (df["Volume"].iloc[-5:].mean() - df["Volume"].iloc[:5].mean()) / (df["Volume"].iloc[:5].mean() + 1) * 100
+            price_chg = (_to_series(df["Close"]).iloc[-1] - _to_series(df["Close"]).iloc[0]) / _to_series(df["Close"]).iloc[0] * 100
+            vol_chg   = (_to_series(df["Volume"]).iloc[-5:].mean() - _to_series(df["Volume"]).iloc[:5].mean()) / (_to_series(df["Volume"]).iloc[:5].mean() + 1) * 100
             results.append({
                 "企業名": name, "業種": sector,
                 "株価騰落率(%)": round(float(price_chg), 2),
@@ -662,18 +696,18 @@ def get_52week_highlow(ticker_name_map: dict) -> pd.DataFrame:
     results = []
     for ticker, (name, sector) in ticker_name_map.items():
         try:
-            df = yf.download(ticker, start=start_date, end=end_date, progress=False)
+            df = _yfdownload(ticker, start=start_date, end=end_date, progress=False)
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.droplevel(1)
             if df.empty or len(df) < 50:
                 continue
-            high_52w = float(df["High"].max())
-            low_52w  = float(df["Low"].min())
-            current  = float(df["Close"].iloc[-1])
+            high_52w = float(_to_series(df["High"]).max())
+            low_52w  = float(_to_series(df["Low"]).min())
+            current  = float(_to_series(df["Close"]).iloc[-1])
             from_high = (current - high_52w) / high_52w * 100
             from_low  = (current - low_52w)  / low_52w  * 100
-            is_new_high = float(df["High"].iloc[-1]) >= high_52w * 0.995
-            is_new_low  = float(df["Low"].iloc[-1])  <= low_52w  * 1.005
+            is_new_high = float(_to_series(df["High"]).iloc[-1]) >= high_52w * 0.995
+            is_new_low  = float(_to_series(df["Low"]).iloc[-1])  <= low_52w  * 1.005
             results.append({
                 "企業名": name, "業種": sector,
                 "現在値": round(current, 1),
@@ -697,12 +731,12 @@ def get_ma_deviation(ticker_name_map: dict) -> pd.DataFrame:
     results = []
     for ticker, (name, sector) in ticker_name_map.items():
         try:
-            df = yf.download(ticker, start=start_date, end=end_date, progress=False)
+            df = _yfdownload(ticker, start=start_date, end=end_date, progress=False)
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.droplevel(1)
             if df.empty or len(df) < 200:
                 continue
-            close   = df["Close"].dropna()
+            close   = _to_series(df["Close"]).dropna()
             current = float(close.iloc[-1])
             ma25    = float(close.rolling(25).mean().iloc[-1])
             ma75    = float(close.rolling(75).mean().iloc[-1])
@@ -730,12 +764,12 @@ def get_cross_signals(ticker_name_map: dict, lookback_days: int = 10) -> pd.Data
     results = []
     for ticker, (name, sector) in ticker_name_map.items():
         try:
-            df = yf.download(ticker, start=start_date, end=end_date, progress=False)
+            df = _yfdownload(ticker, start=start_date, end=end_date, progress=False)
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.droplevel(1)
             if df.empty or len(df) < 75:
                 continue
-            close = df["Close"].dropna()
+            close = _to_series(df["Close"]).dropna()
             ma25  = close.rolling(25).mean()
             ma75  = close.rolling(75).mean()
             diff  = ma25 - ma75
@@ -776,12 +810,12 @@ def get_dow_of_week_pattern(ticker_name_map: dict, days: int = 180) -> pd.DataFr
     sector_dow: dict = {}
     for ticker, (name, sector) in ticker_name_map.items():
         try:
-            df = yf.download(ticker, start=start_date, end=end_date, progress=False)
+            df = _yfdownload(ticker, start=start_date, end=end_date, progress=False)
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.droplevel(1)
             if df.empty or len(df) < 20:
                 continue
-            ret = df["Close"].pct_change().dropna() * 100
+            ret = _to_series(df["Close"]).pct_change().dropna() * 100
             ret.index = pd.to_datetime(ret.index)
             for dow_num, dow_label in dow_map.items():
                 avg = float(ret[ret.index.dayofweek == dow_num].mean())
@@ -809,19 +843,19 @@ def get_correlation_divergence(ticker_name_map: dict, days: int = 60,
     from datetime import timedelta
     end_date   = datetime.today()
     start_date = end_date - timedelta(days=days + 10)
-    benchmark = yf.download("^N225", start=start_date, end=end_date, progress=False)
+    benchmark = _yfdownload("^N225", start=start_date, end=end_date, progress=False)
     if isinstance(benchmark.columns, pd.MultiIndex):
         benchmark.columns = benchmark.columns.droplevel(1)
     market_ret = benchmark["Close"].pct_change().dropna()
     results = []
     for ticker, (name, sector) in ticker_name_map.items():
         try:
-            df = yf.download(ticker, start=start_date, end=end_date, progress=False)
+            df = _yfdownload(ticker, start=start_date, end=end_date, progress=False)
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.droplevel(1)
             if df.empty or len(df) < corr_window + 5:
                 continue
-            ret = df["Close"].pct_change().dropna()
+            ret = _to_series(df["Close"]).pct_change().dropna()
             common = ret.index.intersection(market_ret.index)
             if len(common) < corr_window + 5:
                 continue
@@ -830,7 +864,7 @@ def get_correlation_divergence(ticker_name_map: dict, days: int = 60,
             corr_long   = float(r.corr(m))
             corr_recent = float(r.iloc[-corr_window:].corr(m.iloc[-corr_window:]))
             divergence  = corr_long - corr_recent
-            price_chg   = (df["Close"].iloc[-1] - df["Close"].iloc[-5]) / df["Close"].iloc[-5] * 100
+            price_chg   = (_to_series(df["Close"]).iloc[-1] - _to_series(df["Close"]).iloc[-5]) / _to_series(df["Close"]).iloc[-5] * 100
             results.append({
                 "企業名": name, "業種": sector,
                 "長期相関": round(corr_long, 3),
@@ -854,20 +888,20 @@ def get_momentum_score(ticker_name_map: dict) -> pd.DataFrame:
     results = []
     for ticker, (name, sector) in ticker_name_map.items():
         try:
-            df = yf.download(ticker, start=start_date, end=end_date, progress=False)
+            df = _yfdownload(ticker, start=start_date, end=end_date, progress=False)
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.droplevel(1)
             if df.empty or len(df) < 10:
                 continue
-            price_chg = (df["Close"].iloc[-1] - df["Close"].iloc[0]) / df["Close"].iloc[0] * 100
-            vol_chg   = (df["Volume"].iloc[-5:].mean() - df["Volume"].mean()) / (df["Volume"].mean() + 1) * 100
+            price_chg = (_to_series(df["Close"]).iloc[-1] - _to_series(df["Close"]).iloc[0]) / _to_series(df["Close"]).iloc[0] * 100
+            vol_chg   = (_to_series(df["Volume"]).iloc[-5:].mean() - _to_series(df["Volume"]).mean()) / (_to_series(df["Volume"]).mean() + 1) * 100
             score = float(price_chg) * np.log1p(max(float(vol_chg), 0) / 100 + 1)
             results.append({
                 "企業名": name, "業種": sector,
                 "モメンタムスコア": round(score, 3),
                 "株価騰落率(%)": round(float(price_chg), 2),
                 "出来高変化率(%)": round(float(vol_chg), 2),
-                "現在値": round(float(df["Close"].iloc[-1]), 1),
+                "現在値": round(float(_to_series(df["Close"]).iloc[-1]), 1),
             })
         except Exception:
             continue
@@ -1167,18 +1201,45 @@ ticker_name_map = {
 # データ取得
 # ================================================================
 @st.cache_data(ttl=3600)
+@st.cache_data(ttl=3600, show_spinner=False)
 def get_price(ticker, start, end):
-    df = yf.download(ticker, start=start, end=end, progress=False)
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.droplevel(1)
-    return df
+    try:
+        df = _yfdownload(
+            ticker,
+            start=start,
+            end=end,
+            progress=False,
+            auto_adjust=True,
+        )
+        if df.empty:
+            return pd.DataFrame()
+        # MultiIndex対応: ('Close', '7203.T') → 'Close'
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.droplevel(1)
+        # 列名の重複除去
+        df = df.loc[:, ~df.columns.duplicated()]
+        return df
+    except Exception:
+        return pd.DataFrame()
 
 @st.cache_data(ttl=3600)
 def get_benchmark(start, end):
-    df = yf.download("^N225", start=start, end=end, progress=False)
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.droplevel(1)
-    return df
+    try:
+        df = _yfdownload(
+            "^N225",
+            start=start,
+            end=end,
+            progress=False,
+            auto_adjust=True,
+        )
+        if df.empty:
+            return pd.DataFrame()
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.droplevel(1)
+        df = df.loc[:, ~df.columns.duplicated()]
+        return df
+    except Exception:
+        return pd.DataFrame()
 
 
 # ================================================================
@@ -1321,7 +1382,7 @@ else:
         if df.empty:
             continue
         # Close列を確実に1次元Seriesに変換
-        close = df["Close"]
+        close = _to_series(df["Close"])
         if isinstance(close, pd.DataFrame):
             close = close.iloc[:, 0]
         returns = close.pct_change().dropna()
