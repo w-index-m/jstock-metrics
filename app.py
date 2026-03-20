@@ -145,26 +145,29 @@ def generate_ai_comment(prompt: str) -> tuple[str, str]:
 # yfinance ユーティリティ（MultiIndex対応）
 # ================================================================
 
-def _yfdownload(ticker, start=None, end=None, period=None, progress=False):
+def _yfdownload(ticker, start=None, end=None, period=None, progress=False, **kwargs):
     """
     yfinance v0.2以降のMultiIndex列を自動フラット化して返す。
     単一銘柄でも ('Close','7203.T') → 'Close' に変換。
     """
     try:
-        kwargs = dict(progress=progress, auto_adjust=True)
+        params = dict(progress=progress, auto_adjust=True)
+        params.update(kwargs)
         if period:
-            kwargs["period"] = period
+            params["period"] = period
         else:
-            kwargs["start"] = start
-            kwargs["end"]   = end
-        df = yf.download(ticker, **kwargs)
+            params["start"] = start
+            params["end"]   = end
+        df = yf.download(ticker, **params)
         if df.empty:
             return df
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.droplevel(1)
         df = df.loc[:, ~df.columns.duplicated()]
         return df
-    except Exception:
+    except Exception as e:
+        import logging as _logging
+        _logging.getLogger(__name__).warning(f"_yfdownload({ticker}): {e}")
         return pd.DataFrame()
 
 
@@ -1203,43 +1206,11 @@ ticker_name_map = {
 @st.cache_data(ttl=3600)
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_price(ticker, start, end):
-    try:
-        df = _yfdownload(
-            ticker,
-            start=start,
-            end=end,
-            progress=False,
-            auto_adjust=True,
-        )
-        if df.empty:
-            return pd.DataFrame()
-        # MultiIndex対応: ('Close', '7203.T') → 'Close'
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.droplevel(1)
-        # 列名の重複除去
-        df = df.loc[:, ~df.columns.duplicated()]
-        return df
-    except Exception:
-        return pd.DataFrame()
+    return _yfdownload(ticker, start=start, end=end)
 
 @st.cache_data(ttl=3600)
 def get_benchmark(start, end):
-    try:
-        df = _yfdownload(
-            "^N225",
-            start=start,
-            end=end,
-            progress=False,
-            auto_adjust=True,
-        )
-        if df.empty:
-            return pd.DataFrame()
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.droplevel(1)
-        df = df.loc[:, ~df.columns.duplicated()]
-        return df
-    except Exception:
-        return pd.DataFrame()
+    return _yfdownload("^N225", start=start, end=end)
 
 
 # ================================================================
@@ -1365,7 +1336,8 @@ with st.spinner("市場データ（日経225）を取得中..."):
     benchmark = get_benchmark(start_date, end_date)
 
 if benchmark.empty:
-    st.error("市場データ取得失敗")
+    st.error("市場データ（日経225）取得失敗。しばらく待って再読み込みしてください。")
+    st.caption("yfinance のレート制限または一時的な接続エラーの可能性があります。")
 else:
     # Close列を確実に1次元Seriesに変換
     _bench_close = benchmark["Close"]
