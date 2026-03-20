@@ -1193,24 +1193,66 @@ def get_benchmark(start, end):
     return df
 
 # ================================================================
-# ページルーティング（サイドバーナビゲーション連動）
+# ページルーティング（メインエリアカードメニュー）
 # ================================================================
 
-_current_page = st.session_state.get("active_page", "analysis")
+_current_page = st.session_state.get("active_page", None)
 
-# 現在のページ名をタイトル下に表示
-_PAGE_TITLES = {
-    "analysis":    "📊 パフォーマンス分析",
-    "sector":      "🔄 セクターローテーション",
-    "volume":      "🔥 需給スクリーナー",
-    "price":       "📈 価格パターン",
-    "unique":      "💡 モメンタム・相関分析",
-    "news":        "📰 銘柄別ニュース",
-    "market_news": "🌐 市場全体ニュース",
-    "jquants":     "🏦 J-Quants 需給分析",
-}
-st.subheader(_PAGE_TITLES.get(_current_page, ""))
-st.divider()
+_NAV_CARDS = [
+    ("analysis",    "📊", "パフォーマンス分析",    "シャープレシオ・リターン・リスク分析"),
+    ("sector",      "🔄", "セクターローテーション", "業種別資金フロー・相対強度"),
+    ("volume",      "🔥", "需給スクリーナー",       "出来高急増・VWAP乖離・PV分析"),
+    ("price",       "📈", "価格パターン",            "52週高安値・移動平均・クロスシグナル"),
+    ("unique",      "💡", "モメンタム・相関分析",   "週次モメンタム・曜日パターン・日経相関"),
+    ("news",        "📰", "銘柄別ニュース",          "Yahoo・株探・みんかぶ・TDnet統合"),
+    ("market_news", "🌐", "市場全体ニュース",        "日経新聞・Reutersマーケット速報"),
+    ("jquants",     "🏦", "J-Quants 需給分析",      "投資部門別・信用残高・空売り比率"),
+]
+
+# ── メニューカード表示（未選択時）──────────────────────────────
+if _current_page is None:
+    st.markdown("### 🗂️ 分析メニュー　—　項目を選んでください")
+    st.caption("各カードをクリックすると分析ページが開きます")
+    st.divider()
+
+    # 3列グリッドでカード表示
+    cols = st.columns(3)
+    for idx, (key, icon, label, desc) in enumerate(_NAV_CARDS):
+        with cols[idx % 3]:
+            st.markdown(
+                f"""
+                <div style="
+                    border: 1px solid #d0d7de;
+                    border-radius: 12px;
+                    padding: 20px 16px 16px 16px;
+                    margin-bottom: 12px;
+                    background: linear-gradient(135deg, #f6f8fa 0%, #ffffff 100%);
+                    cursor: pointer;
+                    transition: box-shadow 0.2s;
+                ">
+                    <div style="font-size: 2rem; margin-bottom: 8px;">{icon}</div>
+                    <div style="font-weight: 700; font-size: 14px; color: #24292f; margin-bottom: 6px;">{label}</div>
+                    <div style="font-size: 12px; color: #656d76;">{desc}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            if st.button(f"▶ 開く", key=f"card_{key}", use_container_width=True):
+                st.session_state["active_page"] = key
+                st.rerun()
+
+# ── ページヘッダー（選択後）────────────────────────────────────
+else:
+    _PAGE_TITLES = {k: f"{icon} {label}" for k, icon, label, _ in _NAV_CARDS}
+    # 戻るボタン + 現在ページ名
+    col_back, col_title = st.columns([1, 8])
+    with col_back:
+        if st.button("← 戻る", key="nav_back"):
+            st.session_state["active_page"] = None
+            st.rerun()
+    with col_title:
+        st.subheader(_PAGE_TITLES.get(_current_page, ""))
+    st.divider()
 
 # ─── Tab1: パフォーマンス分析 ────────────────────────────────────
 if _current_page == "analysis":
@@ -1832,7 +1874,7 @@ if _current_page == "news":
 
                 for item in filtered:
                     icon = source_colors.get(item["source"], "⚪")
-                    with st.expander(f"{icon} [{item['source']}] {item['title'][:60]}{'...' if len(item['title'])>60 else ''}"):
+                    with st.expander(f"{icon} [{item['source']}] {item['title'][:60]}{'...' if len(item['title'])>60 else ''}", expanded=True):
                         c1, c2 = st.columns([3, 1])
                         with c1:
                             st.markdown(f"**{item['title']}**")
@@ -2114,7 +2156,7 @@ if _current_page == "jquants":
         st.stop()
 
     # ── 診断モード ────────────────────────────────────────────
-    with st.expander("🔧 API診断（動作しない場合はここを確認）", expanded=False):
+    with st.expander("🔧 API診断（動作しない場合はここを確認）", expanded=True):
         st.caption("実際のAPIレスポンスを確認してデバッグできます")
         diag_code = st.text_input("診断用銘柄コード", value="72030", key="jq_diag_code")
         if st.button("🔍 APIレスポンス確認", key="jq_diag"):
@@ -2168,7 +2210,7 @@ if _current_page == "jquants":
                 else:
                     st.caption(f"取得件数: {len(df_bars)}日分")
                     _plot_candlestick(df_bars, f"{jq_code} 株価（ローソク足）")
-                    with st.expander("生データ"):
+                    with st.expander("生データ", expanded=True):
                         st.dataframe(df_bars.tail(20), use_container_width=True)
             with col_p2:
                 with st.spinner("TOPIX取得中..."):
@@ -2239,7 +2281,7 @@ if _current_page == "jquants":
                 else:
                     st.dataframe(df_inv, use_container_width=True)
 
-                with st.expander("生データ"):
+                with st.expander("生データ", expanded=True):
                     st.dataframe(df_inv, use_container_width=True)
 
     # ── Tab3: 信用取引残高 ───────────────────────────────────────
@@ -2278,7 +2320,7 @@ if _current_page == "jquants":
                 else:
                     st.dataframe(df_mg, use_container_width=True)
 
-                with st.expander("生データ"):
+                with st.expander("生データ", expanded=True):
                     st.dataframe(df_mg, use_container_width=True)
 
     # ── Tab4: 業種別空売り比率 ───────────────────────────────────
@@ -2340,7 +2382,7 @@ if _current_page == "jquants":
                 else:
                     st.dataframe(df_sr, use_container_width=True)
 
-                with st.expander("生データ"):
+                with st.expander("生データ", expanded=True):
                     st.dataframe(df_sr, use_container_width=True)
 
     # ── Tab5: 財務情報 ───────────────────────────────────────────
@@ -2387,5 +2429,5 @@ if _current_page == "jquants":
                         except Exception as e:
                             st.warning(f"AI APIエラー: {e}")
 
-                with st.expander("全データ"):
+                with st.expander("全データ", expanded=True):
                     st.dataframe(df_fins, use_container_width=True)
