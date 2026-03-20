@@ -1306,7 +1306,11 @@ with st.spinner("市場データ（日経225）を取得中..."):
 if benchmark.empty:
     st.error("市場データ取得失敗")
 else:
-    market_returns = benchmark["Close"].pct_change().dropna()
+    # Close列を確実に1次元Seriesに変換
+    _bench_close = benchmark["Close"]
+    if isinstance(_bench_close, pd.DataFrame):
+        _bench_close = _bench_close.iloc[:, 0]
+    market_returns = _bench_close.pct_change().dropna()
     results = []
     progress    = st.progress(0)
     status_text = st.empty()
@@ -1316,15 +1320,26 @@ else:
         progress.progress((i + 1) / len(ticker_name_map))
         if df.empty:
             continue
-        returns = df["Close"].pct_change().dropna()
+        # Close列を確実に1次元Seriesに変換
+        close = df["Close"]
+        if isinstance(close, pd.DataFrame):
+            close = close.iloc[:, 0]
+        returns = close.pct_change().dropna()
         common  = returns.index.intersection(market_returns.index)
         if len(common) < 30:
             continue
-        x = returns.loc[common].values.flatten()
-        y = market_returns.loc[common].values.flatten()
+        x = np.array(returns.loc[common], dtype=float).flatten()
+        y = np.array(market_returns.loc[common], dtype=float).flatten()
+        if x.ndim != 1 or y.ndim != 1 or len(x) != len(y):
+            continue
         annual_return = x.mean() * 252
         annual_vol    = x.std() * np.sqrt(252)
-        beta   = np.cov(x, y)[0][1] / np.var(y)
+        if annual_vol == 0:
+            continue
+        try:
+            beta = np.cov(x, y)[0][1] / np.var(y)
+        except Exception:
+            beta = 0.0
         sharpe = (annual_return - risk_free_rate) / annual_vol
         results.append({
             "企業名": name, "業種": sector,
