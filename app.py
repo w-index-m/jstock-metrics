@@ -58,7 +58,7 @@ GROQ_MODEL = "llama-3.3-8b-instant"
 # -----------------------------
 # ページ設定
 # -----------------------------
-st.set_page_config(layout="wide", page_title="📈 日本株 分析ダッシュボード", page_icon="📈")
+st.set_page_config(layout="wide", page_title="📈 日本株 分析ダッシュボード", page_icon="📈", initial_sidebar_state="expanded")
 st.title("📈 日本株 シャープレシオ分析 + ニュース統合")
 
 # ── アクセス計測（1セッション1回）────────────────────────────────
@@ -914,33 +914,21 @@ with st.sidebar:
         default=["Yahoo!Finance JP", "株探(Kabutan)", "TDnet（適時開示）", "日経新聞", "Reuters JP"],
     )
     st.divider()
-
-    # ── ナビゲーションメニュー ──────────────────────────────────
-    st.header("🗂️ メニュー")
-    _NAV_ITEMS = {
-        "analysis":    "📊 パフォーマンス分析",
-        "sector":      "🔄 セクターローテーション",
-        "volume":      "🔥 需給スクリーナー",
-        "price":       "📈 価格パターン",
-        "unique":      "💡 モメンタム・相関分析",
-        "news":        "📰 銘柄別ニュース",
-        "market_news": "🌐 市場全体ニュース",
-        "jquants":     "🏦 J-Quants 需給分析",
-    }
-    if "active_page" not in st.session_state:
-        st.session_state["active_page"] = "analysis"
-
-    for _key, _label in _NAV_ITEMS.items():
-        _is_current = st.session_state["active_page"] == _key
-        if st.button(
-            _label,
-            key=f"nav_{_key}",
-            use_container_width=True,
-            type="primary" if _is_current else "secondary",
-        ):
-            st.session_state["active_page"] = _key
-            st.rerun()
-
+    st.header("🔧 需給スクリーナー設定")
+    surge_ratio = st.slider("出来高急増の閾値（倍）", 1.5, 5.0, 2.0, 0.5)
+    pv_days     = st.selectbox("Price x Volume 期間", [10, 20, 60], index=1,
+                                format_func=lambda x: f"{x}日")
+    st.divider()
+    st.header("🔄 セクター設定")
+    rotation_period = st.selectbox(
+        "セクター分析期間",
+        options=[5, 10, 20, 60, 90], index=2,
+        format_func=lambda x: {5:"1週間",10:"2週間",20:"1ヶ月",60:"3ヶ月",90:"約半年"}[x],
+    )
+    top_bottom_n = st.slider("上位・下位 表示セクター数", 3, 8, 5)
+    st.divider()
+    st.header("📈 価格パターン設定")
+    corr_window = st.slider("相関分析ウィンドウ（日）", 20, 120, 60)
     st.divider()
     st.caption("データソース: Yahoo Finance, TDnet, 株探, みんかぶ, 日経, Reuters")
 
@@ -1192,863 +1180,62 @@ def get_benchmark(start, end):
         df.columns = df.columns.droplevel(1)
     return df
 
-# ================================================================
-# ページルーティング（メインエリアカードメニュー）
-# ================================================================
-
-_current_page = st.session_state.get("active_page", None)
-
-_NAV_CARDS = [
-    ("analysis",    "📊", "パフォーマンス分析",    "シャープレシオ・リターン・リスク分析"),
-    ("sector",      "🔄", "セクターローテーション", "業種別資金フロー・相対強度"),
-    ("volume",      "🔥", "需給スクリーナー",       "出来高急増・VWAP乖離・PV分析"),
-    ("price",       "📈", "価格パターン",            "52週高安値・移動平均・クロスシグナル"),
-    ("unique",      "💡", "モメンタム・相関分析",   "週次モメンタム・曜日パターン・日経相関"),
-    ("news",        "📰", "銘柄別ニュース",          "Yahoo・株探・みんかぶ・TDnet統合"),
-    ("market_news", "🌐", "市場全体ニュース",        "日経新聞・Reutersマーケット速報"),
-    ("jquants",     "🏦", "J-Quants 需給分析",      "投資部門別・信用残高・空売り比率"),
-]
-
-# ── メニューカード表示（未選択時）──────────────────────────────
-if _current_page is None:
-    st.markdown("### 🗂️ 分析メニュー　—　項目を選んでください")
-    st.caption("各カードをクリックすると分析ページが開きます")
-    st.divider()
-
-    # 3列グリッドでカード表示
-    cols = st.columns(3)
-    for idx, (key, icon, label, desc) in enumerate(_NAV_CARDS):
-        with cols[idx % 3]:
-            st.markdown(
-                f"""
-                <div style="
-                    border: 1px solid #d0d7de;
-                    border-radius: 12px;
-                    padding: 20px 16px 16px 16px;
-                    margin-bottom: 12px;
-                    background: linear-gradient(135deg, #f6f8fa 0%, #ffffff 100%);
-                    cursor: pointer;
-                    transition: box-shadow 0.2s;
-                ">
-                    <div style="font-size: 2rem; margin-bottom: 8px;">{icon}</div>
-                    <div style="font-weight: 700; font-size: 14px; color: #24292f; margin-bottom: 6px;">{label}</div>
-                    <div style="font-size: 12px; color: #656d76;">{desc}</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-            if st.button(f"▶ 開く", key=f"card_{key}", use_container_width=True):
-                st.session_state["active_page"] = key
-                st.rerun()
-
-# ── ページヘッダー（選択後）────────────────────────────────────
-else:
-    _PAGE_TITLES = {k: f"{icon} {label}" for k, icon, label, _ in _NAV_CARDS}
-    # 戻るボタン + 現在ページ名
-    col_back, col_title = st.columns([1, 8])
-    with col_back:
-        if st.button("← 戻る", key="nav_back"):
-            st.session_state["active_page"] = None
-            st.rerun()
-    with col_title:
-        st.subheader(_PAGE_TITLES.get(_current_page, ""))
-    st.divider()
-
-# ─── Tab1: パフォーマンス分析 ────────────────────────────────────
-if _current_page == "analysis":
-        if st.button("▶ 分析実行", type="primary"):
-            end_date   = datetime.today()
-            start_date = end_date - relativedelta(years=int(years))
-
-            with st.spinner("市場データ（日経225）を取得中..."):
-                benchmark = get_benchmark(start_date, end_date)
-
-            if benchmark.empty:
-                st.error("市場データ取得失敗")
-                st.stop()
-
-            market_returns = benchmark["Close"].pct_change().dropna()
-            results = []
-            progress    = st.progress(0)
-            status_text = st.empty()
-
-            for i, (ticker, (name, sector)) in enumerate(ticker_name_map.items()):
-                status_text.text(f"取得中: {name} ({ticker})")
-                df = get_price(ticker, start_date, end_date)
-                progress.progress((i + 1) / len(ticker_name_map))
-                if df.empty:
-                    continue
-                returns = df["Close"].pct_change().dropna()
-                common  = returns.index.intersection(market_returns.index)
-                if len(common) < 30:
-                    continue
-                x = returns.loc[common].values.flatten()
-                y = market_returns.loc[common].values.flatten()
-                annual_return = x.mean() * 252
-                annual_vol    = x.std() * np.sqrt(252)
-                beta   = np.cov(x, y)[0][1] / np.var(y)
-                sharpe = (annual_return - risk_free_rate) / annual_vol
-                results.append({
-                    "企業名": name, "業種": sector,
-                    "年間平均リターン(%)": annual_return * 100,
-                    "年間リスク(%)": annual_vol * 100,
-                    "シャープレシオ": sharpe, "ベータ": beta,
-                })
-
-            progress.empty()
-            status_text.empty()
-
-            df_results = pd.DataFrame(results)
-            if df_results.empty:
-                st.error("データなし")
-                st.stop()
-
-            df_results = df_results.sort_values("シャープレシオ", ascending=False)
-
-            st.subheader("📋 分析結果一覧")
-            st.dataframe(
-                df_results.style.format({
-                    "年間平均リターン(%)": "{:.2f}",
-                    "年間リスク(%)": "{:.2f}",
-                    "シャープレシオ": "{:.2f}",
-                    "ベータ": "{:.2f}",
-                }),
-                use_container_width=True,
-            )
-
-            top_n_int  = int(top_n)
-            top_stocks = df_results.head(top_n_int)
-
-            fig1, ax1 = plt.subplots(figsize=(14, 6))
-            ax1.bar(top_stocks["企業名"], top_stocks["シャープレシオ"], color="green")
-            ax1.set_title(f"シャープレシオ 上位{top_n_int}社")
-            ax1.set_ylabel("シャープレシオ")
-            ax1.tick_params(axis="x", rotation=45)
-            plt.tight_layout()
-            st.pyplot(fig1)
-            plt.close(fig1)
-
-            fig2, ax2 = plt.subplots(figsize=(14, 6))
-            ax2.bar(top_stocks["企業名"], top_stocks["年間平均リターン(%)"], color="steelblue")
-            ax2.set_title(f"年間平均リターン(%) 上位{top_n_int}社")
-            ax2.set_ylabel("年間平均リターン(%)")
-            ax2.tick_params(axis="x", rotation=45)
-            plt.tight_layout()
-            st.pyplot(fig2)
-            plt.close(fig2)
-
-            summary = top_stocks.head(5).to_string()
-            prompt = (
-                "以下は日本株のリスク・リターン分析結果です。\n"
-                "投資家向けに簡潔に300文字以内で評価してください。\n\n"
-                f"{summary}\n"
-            )
-            try:
-                comment, ai_name = generate_ai_comment(prompt)
-                st.subheader(f"🤖 AIコメント（{ai_name}）")
-                st.write(comment)
-            except Exception as e:
-                st.warning(f"AI APIエラー: {e}")
-
-
-    # ─── Tab2: セクターローテーション ────────────────────────────────
-if _current_page == "sector":
-        st.subheader("🔄 セクターローテーション分析")
-        st.caption("各業種に属する銘柄の平均リターンを集計し、資金が流入・流出しているセクターを可視化します。")
-
-        col_ctrl1, col_ctrl2, col_ctrl3 = st.columns([2, 2, 3])
-        with col_ctrl1:
-            rotation_period = st.selectbox(
-                "分析期間",
-                options=[5, 10, 20, 60, 90],
-                index=2,
-                format_func=lambda x: {5: "1週間(5日)", 10: "2週間(10日)",
-                                        20: "1ヶ月(20日)", 60: "3ヶ月(60日)",
-                                        90: "約半年(90日)"}[x],
-            )
-        with col_ctrl2:
-            top_bottom_n = st.slider("上位・下位 表示セクター数", 3, 8, 5)
-        with col_ctrl3:
-            run_rotation = st.button("▶ セクターローテーション分析を実行", type="primary")
-
-        st.divider()
-
-        if run_rotation:
-            with st.spinner(f"全銘柄の株価データを取得中（{len(ticker_name_map)}銘柄）..."):
-                df_sector = get_sector_performance(ticker_name_map, period_days=rotation_period)
-
-            if df_sector.empty:
-                st.error("データの取得に失敗しました。しばらくしてから再試行してください。")
-            else:
-                top_sec    = df_sector.iloc[0]
-                bottom_sec = df_sector.iloc[-1]
-                rising     = (df_sector["平均リターン(%)"] > 0).sum()
-                falling    = (df_sector["平均リターン(%)"] < 0).sum()
-
-                k1, k2, k3, k4 = st.columns(4)
-                k1.metric("📈 最強セクター",  top_sec["業種"],    f"{top_sec['騰落率(%)']:+.2f}%")
-                k2.metric("📉 最弱セクター",  bottom_sec["業種"], f"{bottom_sec['騰落率(%)']:+.2f}%")
-                k3.metric("🟢 上昇セクター数", f"{rising} 業種")
-                k4.metric("🔴 下落セクター数", f"{falling} 業種")
-
-                st.divider()
-
-                period_label = {5: "1週間", 10: "2週間", 20: "1ヶ月", 60: "3ヶ月", 90: "約半年"}[rotation_period]
-                fig_bar = plot_sector_bar(
-                    df_sector,
-                    title=f"セクター別平均リターン（{period_label}） 買われ / 売られ",
-                )
-                st.pyplot(fig_bar)
-                plt.close(fig_bar)
-
-                st.divider()
-                st.subheader("📈 買われセクター vs 📉 売られセクター の値動き比較")
-                top_sectors    = df_sector.head(top_bottom_n)["業種"].tolist()
-                bottom_sectors = df_sector.tail(top_bottom_n)["業種"].tolist()
-
-                with st.spinner("時系列データ取得中..."):
-                    df_ts = get_sector_timeseries(ticker_name_map, days=max(rotation_period + 10, 30))
-
-                if not df_ts.empty:
-                    fig_ts = plot_sector_timeseries(df_ts, top_sectors, bottom_sectors)
-                    st.pyplot(fig_ts)
-                    plt.close(fig_ts)
-
-                st.divider()
-                st.subheader("🌡️ セクター別ヒートマップ（期間比較）")
-                with st.spinner("複数期間データを取得中..."):
-                    df_1w = get_sector_performance(ticker_name_map, period_days=5)
-                    df_1m = get_sector_performance(ticker_name_map, period_days=20)
-                    df_3m = get_sector_performance(ticker_name_map, period_days=60)
-
-                df_heat_base = df_1m[["業種"]].copy()
-                df_heat_base = df_heat_base.merge(
-                    df_1w[["業種", "平均リターン(%)"]].rename(columns={"平均リターン(%)": "1週間"}), on="業種", how="left"
-                ).merge(
-                    df_1m[["業種", "平均リターン(%)"]].rename(columns={"平均リターン(%)": "1ヶ月"}), on="業種", how="left"
-                ).merge(
-                    df_3m[["業種", "平均リターン(%)"]].rename(columns={"平均リターン(%)": "3ヶ月"}), on="業種", how="left"
-                )
-
-                fig_heat = plot_sector_heatmap(df_heat_base)
-                st.pyplot(fig_heat)
-                plt.close(fig_heat)
-
-                st.divider()
-                st.subheader("📋 セクター別詳細データ")
-                df_display = df_sector[["業種", "平均リターン(%)", "中央値リターン(%)",
-                                         "銘柄数", "上昇銘柄数", "下落銘柄数", "上昇率(%)"]].copy()
-
-                def color_return(val):
-                    if isinstance(val, float):
-                        if val > 2:    return "background-color: rgba(56,142,60,0.45); color: white; font-weight:bold"
-                        elif val > 0:  return "color: #388e3c; font-weight:bold"
-                        elif val < -2: return "background-color: rgba(211,47,47,0.45); color: white; font-weight:bold"
-                        elif val < 0:  return "color: #d32f2f; font-weight:bold"
-                    return ""
-
-                styled = df_display.style.format({
-                    "平均リターン(%)": "{:+.2f}",
-                    "中央値リターン(%)": "{:+.2f}",
-                    "上昇率(%)": "{:.1f}",
-                }).applymap(color_return, subset=["平均リターン(%)", "中央値リターン(%)"])
-                st.dataframe(styled, use_container_width=True, height=500)
-
-                st.divider()
-                st.subheader("🤖 AIによるセクターローテーション解説")
-                top5_str    = df_sector.head(5)[["業種", "騰落率(%)"]].to_string(index=False)
-                bottom5_str = df_sector.tail(5)[["業種", "騰落率(%)"]].to_string(index=False)
-                prompt_rotation = (
-                    "あなたは日本株の機関投資家向けストラテジストです。\n"
-                    f"以下は直近{period_label}のJPX上場主要銘柄のセクター別平均リターンです。\n\n"
-                    f"【買われているセクター上位5】\n{top5_str}\n\n"
-                    f"【売られているセクター下位5】\n{bottom5_str}\n\n"
-                    "以下の観点で400文字以内で分析してください:\n"
-                    "1. 現在のセクターローテーションの特徴\n"
-                    "2. 買われているセクターの背景・理由\n"
-                    "3. 売られているセクターの背景・理由\n"
-                    "4. 投資家へのアドバイス\n"
-                )
-                with st.spinner("AI分析中..."):
-                    try:
-                        comment, ai_name = generate_ai_comment(prompt_rotation)
-                        st.info(f"{comment}\n\n_AI: {ai_name}_")
-                    except Exception as e:
-                        st.warning(f"AI APIエラー: {e}")
-
-        else:
-            st.info(
-                "「▶ セクターローテーション分析を実行」ボタンを押すと分析が始まります。\n\n"
-                "表示されるグラフ:\n"
-                "- セクター別平均リターン棒グラフ（買われ・売られ色分け）\n"
-                "- 上位・下位セクターの累積リターン時系列グラフ\n"
-                "- 1週間 / 1ヶ月 / 3ヶ月 ヒートマップ（期間比較）\n"
-                "- セクター別詳細テーブル（上昇銘柄数・上昇率など）\n"
-                "- AIによるローテーション解説とアドバイス"
-            )
-            st.caption("全銘柄データ取得のため、初回実行には数十秒かかる場合があります。結果は30分キャッシュされます。")
-
-
-    # ─── Tab3: 需給スクリーナー ──────────────────────────────────────
-if _current_page == "volume":
-        st.subheader("🔥 需給スクリーナー（出来高ベース）")
-
-        col_v1, col_v2, col_v3 = st.columns([2, 2, 3])
-        with col_v1:
-            surge_ratio = st.slider("出来高急増の閾値（倍）", 1.5, 5.0, 2.0, 0.5)
-        with col_v2:
-            pv_days = st.selectbox("Price x Volume 期間", [10, 20, 60], index=1,
-                                    format_func=lambda x: f"{x}日")
-        with col_v3:
-            run_volume = st.button("▶ 需給分析を実行", type="primary")
-
-        st.divider()
-
-        if run_volume:
-            st.subheader(f"📊 出来高急増銘柄（過去5日平均が20日平均の{surge_ratio}倍以上）")
-            with st.spinner("出来高データ取得中..."):
-                df_surge = get_volume_surge(ticker_name_map, surge_ratio=surge_ratio)
-
-            if df_surge.empty:
-                st.info(f"現在、出来高が{surge_ratio}倍以上の銘柄は検出されませんでした。")
-            else:
-                st.success(f"🔺 {len(df_surge)} 銘柄検出")
-                def color_surge(val):
-                    if isinstance(val, float):
-                        if val >= 3:  return "background-color: #d32f2f; color: white; font-weight:bold"
-                        elif val >= 2: return "background-color: #f57c00; color: white; font-weight:bold"
-                    return ""
-                styled_surge = df_surge.style.format({
-                    "出来高倍率": "{:.2f}x",
-                    "株価変化率(5日%)": "{:+.2f}",
-                }).applymap(color_surge, subset=["出来高倍率"])
-                st.dataframe(styled_surge, use_container_width=True)
-
-                top5 = df_surge.head(5)[["企業名", "業種", "出来高倍率", "株価変化率(5日%)"]].to_string(index=False)
-                prompt_surge = (
-                    "以下は直近5日間で出来高が急増した日本株銘柄上位5社です。\n\n"
-                    f"{top5}\n\n"
-                    "投資家向けに300文字以内で分析してください:\n"
-                    "1. 機関投資家・仕手の動きと考えられるか\n"
-                    "2. 業種・テーマ的な特徴\n"
-                    "3. 注意点・リスク\n"
-                )
-                with st.spinner("AI分析中..."):
-                    try:
-                        comment, ai_name = generate_ai_comment(prompt_surge)
-                        st.info(f"🤖 **AI解説（{ai_name}）**\n\n{comment}")
-                    except Exception as e:
-                        st.warning(f"AI APIエラー: {e}")
-
-            st.divider()
-
-            st.subheader("📏 VWAP乖離率ランキング（割高・割安スクリーニング）")
-            with st.spinner("VWAPデータ計算中..."):
-                df_vwap = get_vwap_deviation(ticker_name_map)
-
-            if not df_vwap.empty:
-                col_up, col_down = st.columns(2)
-                with col_up:
-                    st.markdown("#### 🔴 割高（VWAP上方乖離 上位10）")
-                    df_over = df_vwap[df_vwap["VWAP乖離率(%)"] > 0].head(10)
-                    st.dataframe(df_over.style.format({"VWAP乖離率(%)": "{:+.2f}"}),
-                                 use_container_width=True)
-                with col_down:
-                    st.markdown("#### 🟢 割安（VWAP下方乖離 下位10）")
-                    df_under = df_vwap[df_vwap["VWAP乖離率(%)"] < 0].tail(10).sort_values("VWAP乖離率(%)")
-                    st.dataframe(df_under.style.format({"VWAP乖離率(%)": "{:+.2f}"}),
-                                 use_container_width=True)
-
-            st.divider()
-
-            st.subheader(f"🗺️ Price x Volume マップ（直近{pv_days}日）")
-            with st.spinner("散布図データ取得中..."):
-                df_pv = get_price_volume_scatter(ticker_name_map, days=pv_days)
-
-            if not df_pv.empty:
-                plot_pv_scatter(df_pv)
-
-                q1 = df_pv[(df_pv["株価騰落率(%)"] > 0) & (df_pv["出来高変化率(%)"] > 0)]
-                q1_top = q1.nlargest(5, "株価騰落率(%)")[["企業名", "業種", "株価騰落率(%)", "出来高変化率(%)"]].to_string(index=False)
-                prompt_pv = (
-                    "株価上昇かつ出来高増加の上位銘柄:\n\n"
-                    f"{q1_top}\n\n"
-                    "投資家向けに200文字以内でコメントしてください。\n"
-                )
-                with st.spinner("AI分析中..."):
-                    try:
-                        comment, ai_name = generate_ai_comment(prompt_pv)
-                        st.info(f"🤖 **本命上昇銘柄 AI解説（{ai_name}）**\n\n{comment}")
-                    except Exception as e:
-                        st.warning(f"AI APIエラー: {e}")
-        else:
-            st.info(
-                "「▶ 需給分析を実行」ボタンを押してください。\n\n"
-                "- 📊 出来高急増スクリーナー\n"
-                "- 📏 VWAP乖離ランキング\n"
-                "- 🗺️ Price x Volume マップ"
-            )
-
-
-    # ─── Tab4: 価格パターン ──────────────────────────────────────────
-if _current_page == "price":
-        st.subheader("📈 価格パターン分析")
-
-        col_p1, col_p2 = st.columns([3, 2])
-        with col_p1:
-            run_price = st.button("▶ 価格パターン分析を実行", type="primary")
-        with col_p2:
-            cross_lookback = st.slider("クロスシグナル 直近何日以内を検出？", 3, 20, 10)
-
-        st.divider()
-
-        if run_price:
-            st.subheader("🏔️ 52週高値・安値ダッシュボード")
-            with st.spinner("52週データ取得中..."):
-                df_52 = get_52week_highlow(ticker_name_map)
-
-            if not df_52.empty:
-                new_highs = df_52[df_52["新高値"] != ""]
-                new_lows  = df_52[df_52["新安値"] != ""]
-
-                col_nh, col_nl = st.columns(2)
-                with col_nh:
-                    st.metric("🔺 新高値更新銘柄", f"{len(new_highs)} 銘柄")
-                    if not new_highs.empty:
-                        st.dataframe(new_highs[["企業名", "業種", "現在値", "52週高値", "高値からの乖離(%)"]],
-                                     use_container_width=True)
-                with col_nl:
-                    st.metric("🔻 新安値更新銘柄", f"{len(new_lows)} 銘柄")
-                    if not new_lows.empty:
-                        st.dataframe(new_lows[["企業名", "業種", "現在値", "52週安値", "安値からの乖離(%)"]],
-                                     use_container_width=True)
-
-                hl_index = len(new_highs) / max(len(new_highs) + len(new_lows), 1) * 100
-                st.metric("📊 ハイローインデックス", f"{hl_index:.1f}%",
-                          help="新高値/(新高値+新安値)x100。50%超=強気市場の目安")
-                if hl_index >= 70:
-                    st.success("📈 強気市場シグナル（新高値銘柄が多数）")
-                elif hl_index <= 30:
-                    st.error("📉 弱気市場シグナル（新安値銘柄が多数）")
-                else:
-                    st.info("⚖️ 中立（方向感なし）")
-
-            st.divider()
-
-            st.subheader("📐 移動平均線乖離率ランキング")
-            with st.spinner("移動平均データ計算中..."):
-                df_ma = get_ma_deviation(ticker_name_map)
-
-            if not df_ma.empty:
-                col_ma1, col_ma2 = st.columns(2)
-                with col_ma1:
-                    st.markdown("#### 🔴 25日MA 上方乖離 上位10（買われすぎ）")
-                    st.dataframe(
-                        df_ma.head(10)[["企業名", "業種", "現在値", "25日MA乖離(%)", "75日MA乖離(%)"]].style.format({
-                            "25日MA乖離(%)": "{:+.2f}", "75日MA乖離(%)": "{:+.2f}"
-                        }), use_container_width=True
-                    )
-                with col_ma2:
-                    st.markdown("#### 🟢 25日MA 下方乖離 下位10（売られすぎ）")
-                    st.dataframe(
-                        df_ma.tail(10)[["企業名", "業種", "現在値", "25日MA乖離(%)", "75日MA乖離(%)"]].style.format({
-                            "25日MA乖離(%)": "{:+.2f}", "75日MA乖離(%)": "{:+.2f}"
-                        }), use_container_width=True
-                    )
-
-            st.divider()
-
-            st.subheader(f"🔔 ゴールデンクロス / デッドクロス（直近{cross_lookback}日以内）")
-            with st.spinner("クロスシグナル検出中..."):
-                df_cross = get_cross_signals(ticker_name_map, lookback_days=cross_lookback)
-
-            if df_cross.empty:
-                st.info(f"直近{cross_lookback}日以内にクロスシグナルは検出されませんでした。")
-            else:
-                gc = df_cross[df_cross["シグナル"].str.contains("ゴールデン")]
-                dc = df_cross[df_cross["シグナル"].str.contains("デッド")]
-                col_gc, col_dc = st.columns(2)
-                with col_gc:
-                    st.markdown(f"#### 🟡 ゴールデンクロス — {len(gc)} 銘柄")
-                    if not gc.empty:
-                        st.dataframe(gc[["企業名", "業種", "発生日", "現在値"]], use_container_width=True)
-                with col_dc:
-                    st.markdown(f"#### 💀 デッドクロス — {len(dc)} 銘柄")
-                    if not dc.empty:
-                        st.dataframe(dc[["企業名", "業種", "発生日", "現在値"]], use_container_width=True)
-
-                cross_str = df_cross.head(8)[["企業名", "業種", "シグナル", "発生日"]].to_string(index=False)
-                prompt_cross = (
-                    "直近のゴールデンクロス・デッドクロス発生銘柄:\n\n"
-                    f"{cross_str}\n\n"
-                    "投資家向けに200文字以内で注目ポイントをコメントしてください。\n"
-                )
-                with st.spinner("AI分析中..."):
-                    try:
-                        comment, ai_name = generate_ai_comment(prompt_cross)
-                        st.info(f"🤖 **AI解説（{ai_name}）**\n\n{comment}")
-                    except Exception as e:
-                        st.warning(f"AI APIエラー: {e}")
-        else:
-            st.info(
-                "「▶ 価格パターン分析を実行」ボタンを押してください。\n\n"
-                "- 🏔️ 52週高値・安値ダッシュボード + ハイローインデックス\n"
-                "- 📐 25日・75日・200日MA乖離率ランキング\n"
-                "- 🔔 ゴールデンクロス/デッドクロス 直近発生銘柄"
-            )
-
-
-    # ─── Tab5: モメンタム・相関分析 ──────────────────────────────────
-if _current_page == "unique":
-        st.subheader("💡 モメンタム・相関分析")
-
-        col_u1, col_u2 = st.columns([3, 2])
-        with col_u1:
-            run_unique = st.button("▶ モメンタム・相関分析を実行", type="primary")
-        with col_u2:
-            corr_window = st.slider("相関崩れ 直近ウィンドウ（日）", 10, 30, 20)
-
-        st.divider()
-
-        if run_unique:
-            st.subheader("🚀 週次モメンタムスコアランキング")
-            with st.spinner("モメンタムスコア計算中..."):
-                df_mom = get_momentum_score(ticker_name_map)
-
-            if not df_mom.empty:
-                col_m1, col_m2 = st.columns(2)
-                with col_m1:
-                    st.markdown("#### 📈 上位20銘柄（買いモメンタム）")
-                    st.dataframe(
-                        df_mom.head(20).style.format({
-                            "モメンタムスコア": "{:.3f}",
-                            "株価騰落率(%)": "{:+.2f}",
-                            "出来高変化率(%)": "{:+.2f}",
-                        }), use_container_width=True
-                    )
-                with col_m2:
-                    st.markdown("#### 📉 下位20銘柄（売りモメンタム）")
-                    st.dataframe(
-                        df_mom.tail(20).sort_values("モメンタムスコア").style.format({
-                            "モメンタムスコア": "{:.3f}",
-                            "株価騰落率(%)": "{:+.2f}",
-                            "出来高変化率(%)": "{:+.2f}",
-                        }), use_container_width=True
-                    )
-
-                top10 = df_mom.head(10)[["企業名", "業種", "モメンタムスコア", "株価騰落率(%)", "出来高変化率(%)"]].to_string(index=False)
-                bot10 = df_mom.tail(10)[["企業名", "業種", "モメンタムスコア", "株価騰落率(%)", "出来高変化率(%)"]].to_string(index=False)
-                prompt_mom = (
-                    "あなたは日本株ストラテジストです。\n"
-                    "以下は直近1ヶ月のモメンタムスコアランキングです。\n\n"
-                    f"【高モメンタム上位10銘柄】\n{top10}\n\n"
-                    f"【低モメンタム下位10銘柄】\n{bot10}\n\n"
-                    "週次レポートとして400文字以内で分析してください:\n"
-                    "1. 今週のモメンタム相場の特徴\n"
-                    "2. 注目銘柄とその理由\n"
-                    "3. 逆張りの観点からの注意点\n"
-                )
-                with st.spinner("AI週次レポート生成中..."):
-                    try:
-                        comment, ai_name = generate_ai_comment(prompt_mom)
-                        st.subheader(f"🤖 AI週次モメンタムレポート（{ai_name}）")
-                        st.info(comment)
-                    except Exception as e:
-                        st.warning(f"AI APIエラー: {e}")
-
-            st.divider()
-
-            st.subheader("📅 曜日別平均リターン（市場の癖）")
-            with st.spinner("曜日パターン分析中..."):
-                df_dow = get_dow_of_week_pattern(ticker_name_map)
-
-            if not df_dow.empty:
-                fig_dow = plot_dow_heatmap(df_dow)
-                st.pyplot(fig_dow)
-                plt.close(fig_dow)
-
-                stack = df_dow.stack().reset_index()
-                stack.columns = ["業種", "曜日", "平均リターン(%)"]
-                best  = stack.nlargest(3, "平均リターン(%)")
-                worst = stack.nsmallest(3, "平均リターン(%)")
-                col_b, col_w = st.columns(2)
-                with col_b:
-                    st.markdown("#### 🟢 最もリターンが高い 曜日×セクター")
-                    st.dataframe(best.style.format({"平均リターン(%)": "{:+.4f}"}), use_container_width=True)
-                with col_w:
-                    st.markdown("#### 🔴 最もリターンが低い 曜日×セクター")
-                    st.dataframe(worst.style.format({"平均リターン(%)": "{:+.4f}"}), use_container_width=True)
-
-            st.divider()
-
-            st.subheader("🔍 日経平均との相関崩れ検知（個別材料の先行シグナル）")
-            with st.spinner("相関分析中..."):
-                df_corr = get_correlation_divergence(ticker_name_map, corr_window=corr_window)
-
-            if not df_corr.empty:
-                st.caption("相関乖離度が高い = 最近、日経と独自の動きをしている銘柄（個別材料の可能性）")
-                col_div1, col_div2 = st.columns(2)
-                with col_div1:
-                    st.markdown("#### 🟡 相関崩れ上位15（独自上昇の可能性）")
-                    rising_div = df_corr[df_corr["直近5日株価変化(%)"] > 0].head(15)
-                    st.dataframe(rising_div.style.format({
-                        "長期相関": "{:.3f}", "直近相関": "{:.3f}",
-                        "相関乖離度": "{:.3f}", "直近5日株価変化(%)": "{:+.2f}"
-                    }), use_container_width=True)
-                with col_div2:
-                    st.markdown("#### 🔴 相関崩れ上位15（独自下落・要注意）")
-                    falling_div = df_corr[df_corr["直近5日株価変化(%)"] < 0].head(15)
-                    st.dataframe(falling_div.style.format({
-                        "長期相関": "{:.3f}", "直近相関": "{:.3f}",
-                        "相関乖離度": "{:.3f}", "直近5日株価変化(%)": "{:+.2f}"
-                    }), use_container_width=True)
-
-                top_div = df_corr.head(5)[["企業名", "業種", "相関乖離度", "直近5日株価変化(%)"]].to_string(index=False)
-                prompt_corr = (
-                    "以下は日経平均との相関が最近崩れている日本株銘柄上位5社です。\n\n"
-                    f"{top_div}\n\n"
-                    "投資家向けに200文字以内でコメントしてください:\n"
-                    "1. 考えられる個別材料の種類\n"
-                    "2. 投資機会またはリスク\n"
-                )
-                with st.spinner("AI分析中..."):
-                    try:
-                        comment, ai_name = generate_ai_comment(prompt_corr)
-                        st.info(f"🤖 **AI解説（{ai_name}）**\n\n{comment}")
-                    except Exception as e:
-                        st.warning(f"AI APIエラー: {e}")
-        else:
-            st.info(
-                "「▶ モメンタム・相関分析を実行」ボタンを押してください。\n\n"
-                "- 🚀 週次モメンタムスコアランキング + AI自動レポート\n"
-                "- 📅 曜日別平均リターンヒートマップ（市場の癖）\n"
-                "- 🔍 日経平均との相関崩れ検知（個別材料の先行シグナル）"
-            )
-
-
-    # ─── Tab6: 銘柄別ニュース ─────────────────────────────────────────
-if _current_page == "news":
-        st.subheader("📰 銘柄別ニュース・適時開示")
-
-        ticker_options = {f"{name}（{t}）": t for t, (name, _) in ticker_name_map.items()}
-        selected_label = st.selectbox(
-            "銘柄を選択", list(ticker_options.keys()),
-            index=list(ticker_options.keys()).index("トヨタ（7203.T）")
-            if "トヨタ（7203.T）" in ticker_options else 0
-        )
-        selected_ticker = ticker_options[selected_label]
-        selected_name   = ticker_name_map[selected_ticker][0]
-
-        col_btn1, col_btn2 = st.columns([1, 4])
-        with col_btn1:
-            run_news = st.button("▶ ニュースを取得", type="primary")
-        with col_btn2:
-            run_ai   = st.checkbox("🤖 AIによる要約・センチメント分析も行う", value=True)
-
-        if run_news:
-            with st.spinner(f"{selected_name} のニュースを全ソースから取得中..."):
-                all_news = fetch_all_news(selected_ticker, news_max_per_source)
-
-            filtered = [n for n in all_news if n["source"] in show_news_sources] if show_news_sources else all_news
-
-            if not filtered:
-                st.warning("ニュースが取得できませんでした（ソース設定を確認してください）")
-            else:
-                source_colors = {
-                    "Yahoo!Finance JP":  "🟦",
-                    "株探(Kabutan)":     "🟩",
-                    "みんかぶ":          "🟨",
-                    "TDnet（適時開示）": "🟥",
-                    "日経新聞":          "⬛",
-                    "Reuters JP":        "🟫",
-                }
-
-                from collections import Counter
-                src_counts = Counter(n["source"] for n in filtered)
-                cols_stat  = st.columns(len(src_counts))
-                for i, (src, cnt) in enumerate(src_counts.items()):
-                    icon = source_colors.get(src, "⚪")
-                    cols_stat[i].metric(f"{icon} {src}", f"{cnt}件")
-
-                st.divider()
-
-                for item in filtered:
-                    icon = source_colors.get(item["source"], "⚪")
-                    with st.expander(f"{icon} [{item['source']}] {item['title'][:60]}{'...' if len(item['title'])>60 else ''}", expanded=True):
-                        c1, c2 = st.columns([3, 1])
-                        with c1:
-                            st.markdown(f"**{item['title']}**")
-                            if item.get("summary"):
-                                st.caption(item["summary"])
-                        with c2:
-                            if item.get("date"):
-                                st.caption(f"📅 {item['date']}")
-                            if item.get("link"):
-                                st.markdown(f"[🔗 記事を開く]({item['link']})")
-
-                if run_ai:
-                    st.divider()
-                    st.subheader("🤖 AI ニュース分析（センチメント）")
-                    with st.spinner("AI分析中..."):
-                        ai_result = ai_news_summary(filtered, selected_name, selected_ticker)
-                    st.info(ai_result)
-
-
-    # ─── Tab7: 市場全体ニュース ──────────────────────────────────────
-if _current_page == "market_news":
-        st.subheader("🌐 市場全体ニュース（日経・Reuters）")
-
-        if st.button("▶ 市場ニュースを取得", type="primary"):
-            import concurrent.futures
-
-            with st.spinner("市場ニュースを取得中..."):
-                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
-                    f_nikkei  = ex.submit(fetch_nikkei_market_rss, 10)
-                    f_reuters = ex.submit(fetch_reuters_jp_rss, 10)
-                    nikkei_news  = f_nikkei.result()
-                    reuters_news = f_reuters.result()
-
-            col_n, col_r = st.columns(2)
-
-            with col_n:
-                st.markdown("### ⬛ 日経新聞 マーケットニュース")
-                if nikkei_news:
-                    for item in nikkei_news:
-                        st.markdown(f"- [{item['title']}]({item['link']})")
-                        if item.get("date"):
-                            st.caption(f"  📅 {item['date']}")
-                else:
-                    st.info("取得できませんでした（日経新聞RSSは会員制の場合があります）")
-
-            with col_r:
-                st.markdown("### 🟫 Reuters Japan ビジネスニュース")
-                if reuters_news:
-                    for item in reuters_news:
-                        st.markdown(f"- [{item['title']}]({item['link']})")
-                        if item.get("date"):
-                            st.caption(f"  📅 {item['date']}")
-                else:
-                    st.info("取得できませんでした")
-
-            all_market = nikkei_news + reuters_news
-            if all_market and st.checkbox("🤖 市場全体のAI要約を表示", value=True):
-                headlines = "\n".join(f"[{n['source']}] {n['title']}" for n in all_market[:12])
-                prompt = (
-                    "以下は本日の日本株マーケット関連ニュースです。\n\n"
-                    f"{headlines}\n\n"
-                    "投資家向けに300文字以内でまとめてください:\n"
-                    "1. 本日の市場全体のセンチメント\n"
-                    "2. 注目テーマ・セクター\n"
-                    "3. 今後の注意点\n"
-                )
-                with st.spinner("AI要約中..."):
-                    try:
-                        comment, ai_name = generate_ai_comment(prompt)
-                        st.subheader(f"🤖 市場全体AI要約（{ai_name}）")
-                        st.info(comment)
-                    except Exception as e:
-                        st.warning(f"AI APIエラー: {e}")
-                    
 
 # ================================================================
-# 🏦 J-Quants 需給分析タブ
+# J-Quants APIクライアント（V2対応）
 # ================================================================
-
-# ── J-Quants APIクライアント（V2対応）────────────────────────────
 JQUANTS_API_BASE = "https://api.jquants.com/v1"
-
-# V2 レスポンスの正式キー名マップ
 _JQ_RESPONSE_KEYS = {
-    "/equities/bars/daily":       "daily_quotes",
-    "/fins/summary":              "statements",
-    "/indices/bars/daily/topix":  "topix",
-    "/equities/investor-types":   "investor_type",
-    "/markets/margin-interest":   "margin_interest",
-    "/markets/short-ratio":       "short_ratio",
-    "/equities/master":           "info",
+    "/equities/bars/daily":      "daily_quotes",
+    "/fins/summary":             "statements",
+    "/indices/bars/daily/topix": "topix",
+    "/equities/investor-types":  "investor_type",
+    "/markets/margin-interest":  "margin_interest",
+    "/markets/short-ratio":      "short_ratio",
 }
 
-
-def _jq_headers() -> dict:
-    """J-Quants V2 APIキー認証ヘッダー"""
+def _jq_headers():
     api_key = st.secrets.get("JQUANTS_API_KEY", "")
     if not api_key:
         return {}
-    return {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
+    return {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
-
-def _jq_get(endpoint: str, params: dict = None, debug: bool = False) -> dict:
-    """
-    J-Quants V2 API GETリクエスト。
-    レスポンスキーを自動判定 + ページネーション対応。
-    debug=True でレスポンス生データを返す。
-    """
+def _jq_get(endpoint, params=None, debug=False):
     headers = _jq_headers()
     if not headers:
-        return {"error": "NO_API_KEY", "msg": "JQUANTS_API_KEY が未設定です"}
+        return {"error": "NO_API_KEY"}
     try:
-        res = requests.get(
-            f"{JQUANTS_API_BASE}{endpoint}",
-            params=params or {},
-            headers=headers,
-            timeout=20,
-        )
+        res = requests.get(f"{JQUANTS_API_BASE}{endpoint}", params=params or {}, headers=headers, timeout=20)
         if debug:
-            return {
-                "status": res.status_code,
-                "raw": res.text[:2000],
-                "json": res.json() if res.status_code == 200 else {},
-            }
+            return {"status": res.status_code, "raw": res.text[:2000], "json": res.json() if res.status_code==200 else {}}
         if res.status_code != 200:
             return {"error": res.status_code, "msg": res.text[:300]}
-
         d = res.json()
-
-        # レスポンスキーを特定（既知キー → 自動検出の順）
         known_key = _JQ_RESPONSE_KEYS.get(endpoint)
         data_key = known_key if (known_key and known_key in d) else next(
-            (k for k in d if k != "pagination_key" and isinstance(d[k], list)), None
-        )
+            (k for k in d if k != "pagination_key" and isinstance(d.get(k), list)), None)
         if not data_key:
-            return d  # キーが不明な場合はそのまま返す
-
+            return d
         all_data = list(d[data_key])
         while "pagination_key" in d:
-            p = dict(params or {})
-            p["pagination_key"] = d["pagination_key"]
-            r2 = requests.get(
-                f"{JQUANTS_API_BASE}{endpoint}",
-                params=p, headers=headers, timeout=20,
-            )
-            if r2.status_code != 200:
-                break
-            d = r2.json()
-            all_data += list(d.get(data_key, []))
-
+            p = dict(params or {}); p["pagination_key"] = d["pagination_key"]
+            r2 = requests.get(f"{JQUANTS_API_BASE}{endpoint}", params=p, headers=headers, timeout=20)
+            if r2.status_code != 200: break
+            d = r2.json(); all_data += list(d.get(data_key, []))
         return {data_key: all_data}
     except Exception as e:
         return {"error": str(e)}
 
-
-def _jq_to_df(d: dict, endpoint: str) -> pd.DataFrame:
-    """APIレスポンスをDataFrameに変換、日付列を自動検出"""
+def _jq_to_df(d, endpoint):
     if not d or "error" in d:
         return pd.DataFrame()
     known_key = _JQ_RESPONSE_KEYS.get(endpoint)
     data_key = known_key if (known_key and known_key in d) else next(
-        (k for k in d if isinstance(d[k], list)), None
-    )
+        (k for k in d if isinstance(d.get(k), list)), None)
     if not data_key or not d[data_key]:
         return pd.DataFrame()
     df = pd.DataFrame(d[data_key])
-    # 日付列を自動検出してDateに統一
-    date_col = next(
-        (c for c in df.columns if c.lower() in ["date", "publisheddate", "discloseddate"]),
-        None
-    )
+    date_col = next((c for c in df.columns if c.lower() in ["date","publisheddate","discloseddate"]), None)
     if date_col and date_col != "Date":
         df = df.rename(columns={date_col: "Date"})
     if "Date" in df.columns:
@@ -2056,378 +1243,400 @@ def _jq_to_df(d: dict, endpoint: str) -> pd.DataFrame:
         df = df.sort_values("Date")
     return df
 
-
-# ── データ取得関数群 ─────────────────────────────────────────────
+@st.cache_data(ttl=3600, show_spinner=False)
+def jq_fetch_stock_bars(code, date_from, date_to):
+    return _jq_to_df(_jq_get("/equities/bars/daily", {"code": code, "from": date_from, "to": date_to}), "/equities/bars/daily")
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def jq_fetch_stock_bars(code: str, date_from: str, date_to: str) -> pd.DataFrame:
-    """株価四本値（日次）- Freeプラン以上"""
-    d = _jq_get("/equities/bars/daily", {
-        "code": code, "from": date_from, "to": date_to
-    })
-    return _jq_to_df(d, "/equities/bars/daily")
-
+def jq_fetch_topix(date_from, date_to):
+    return _jq_to_df(_jq_get("/indices/bars/daily/topix", {"date_from": date_from, "date_to": date_to}), "/indices/bars/daily/topix")
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def jq_fetch_topix(date_from: str, date_to: str) -> pd.DataFrame:
-    """TOPIX四本値 - Lightプラン以上"""
-    d = _jq_get("/indices/bars/daily/topix", {
-        "date_from": date_from, "date_to": date_to
-    })
-    return _jq_to_df(d, "/indices/bars/daily/topix")
-
+def jq_fetch_investor_types(date_from, date_to):
+    return _jq_to_df(_jq_get("/equities/investor-types", {"from": date_from, "to": date_to}), "/equities/investor-types")
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def jq_fetch_investor_types(date_from: str, date_to: str) -> pd.DataFrame:
-    """投資部門別情報 - Lightプラン以上"""
-    d = _jq_get("/equities/investor-types", {
-        "from": date_from, "to": date_to
-    })
-    return _jq_to_df(d, "/equities/investor-types")
-
+def jq_fetch_margin(code, date_from, date_to):
+    return _jq_to_df(_jq_get("/markets/margin-interest", {"code": code, "from": date_from, "to": date_to}), "/markets/margin-interest")
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def jq_fetch_margin(code: str, date_from: str, date_to: str) -> pd.DataFrame:
-    """信用取引残高 - Standardプラン以上"""
-    d = _jq_get("/markets/margin-interest", {
-        "code": code, "from": date_from, "to": date_to
-    })
-    return _jq_to_df(d, "/markets/margin-interest")
-
+def jq_fetch_short_ratio(s33, date_from, date_to):
+    return _jq_to_df(_jq_get("/markets/short-ratio", {"s33": s33, "from": date_from, "to": date_to}), "/markets/short-ratio")
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def jq_fetch_short_ratio(s33: str, date_from: str, date_to: str) -> pd.DataFrame:
-    """業種別空売り比率 - Standardプラン以上"""
-    d = _jq_get("/markets/short-ratio", {
-        "s33": s33, "from": date_from, "to": date_to
-    })
-    return _jq_to_df(d, "/markets/short-ratio")
+def jq_fetch_fins(code):
+    return _jq_to_df(_jq_get("/fins/summary", {"code": code}), "/fins/summary")
 
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def jq_fetch_fins(code: str) -> pd.DataFrame:
-    """財務情報（決算短信）- Freeプラン以上"""
-    d = _jq_get("/fins/summary", {"code": code})
-    return _jq_to_df(d, "/fins/summary")
-
-
-# ── チャート描画ヘルパー ─────────────────────────────────────────
-
-def _plot_candlestick(df: pd.DataFrame, title: str):
-    """簡易ローソク足チャート（matplotlib）"""
+def _plot_candlestick(df, title):
     if df.empty:
-        st.warning("データなし")
-        return
+        st.warning("データなし"); return
     open_col  = next((c for c in df.columns if c.lower() in ["open","openingprice"]), None)
     high_col  = next((c for c in df.columns if c.lower() in ["high","highprice"]), None)
     low_col   = next((c for c in df.columns if c.lower() in ["low","lowprice"]), None)
     close_col = next((c for c in df.columns if c.lower() in ["close","closeprice"]), None)
     if not all([open_col, high_col, low_col, close_col]):
-        st.dataframe(df.tail(30))
-        return
-    fig, ax = plt.subplots(figsize=(12, 4))
+        st.dataframe(df.tail(20)); return
+    fig, ax = plt.subplots(figsize=(12,4))
     for _, row in df.tail(60).iterrows():
-        o, h, l, c = row[open_col], row[high_col], row[low_col], row[close_col]
-        color = "#1a7f37" if c >= o else "#d1242f"
-        ax.plot([row["Date"], row["Date"]], [l, h], color=color, linewidth=0.8)
-        ax.bar(row["Date"], abs(c - o), bottom=min(o, c),
-               color=color, alpha=0.85, width=1.2)
-    ax.set_title(title, fontsize=11)
-    ax.set_ylabel("Price")
-    ax.grid(True, alpha=0.25)
-    plt.xticks(rotation=45)
-    plt.tight_layout()
+        o,h,l,c = row[open_col],row[high_col],row[low_col],row[close_col]
+        color = "#1a7f37" if c>=o else "#d1242f"
+        ax.plot([row["Date"],row["Date"]], [l,h], color=color, linewidth=0.8)
+        ax.bar(row["Date"], abs(c-o), bottom=min(o,c), color=color, alpha=0.85, width=1.2)
+    ax.set_title(title, fontsize=11); ax.set_ylabel("Price")
+    ax.grid(True, alpha=0.25); plt.xticks(rotation=45); plt.tight_layout()
     st.pyplot(fig, clear_figure=True)
 
 
-# ── タブ本体 ─────────────────────────────────────────────────────
+# ================================================================
+# メインコンテンツ（全セクション自動実行・1ページ表示）
+# ================================================================
 
-if _current_page == "jquants":
-    st.subheader("🏦 J-Quants 需給分析")
+end_date   = datetime.today()
+start_date = end_date - relativedelta(years=int(years))
+top_n_int  = int(top_n)
 
-    # APIキー確認
-    jq_key = st.secrets.get("JQUANTS_API_KEY", "")
-    if not jq_key:
-        st.error(
-            "⚠️ J-Quants APIキーが未設定です。\n\n"
-            "Streamlit Secrets に `JQUANTS_API_KEY = 'your_key'` を追加してください。\n"
-            "APIキーは [J-Quants Webサイト](https://jpx-jquants.com/) のダッシュボードから取得できます。"
+# ─────────────────────────────────────────────────────────────────
+# § 1. パフォーマンス分析
+# ─────────────────────────────────────────────────────────────────
+st.header("📊 パフォーマンス分析")
+
+with st.spinner("市場データ（日経225）を取得中..."):
+    benchmark = get_benchmark(start_date, end_date)
+
+if benchmark.empty:
+    st.error("市場データ取得失敗")
+else:
+    market_returns = benchmark["Close"].pct_change().dropna()
+    results = []
+    progress    = st.progress(0)
+    status_text = st.empty()
+    for i, (ticker, (name, sector)) in enumerate(ticker_name_map.items()):
+        status_text.text(f"取得中: {name} ({ticker})")
+        df = get_price(ticker, start_date, end_date)
+        progress.progress((i + 1) / len(ticker_name_map))
+        if df.empty:
+            continue
+        returns = df["Close"].pct_change().dropna()
+        common  = returns.index.intersection(market_returns.index)
+        if len(common) < 30:
+            continue
+        x = returns.loc[common].values.flatten()
+        y = market_returns.loc[common].values.flatten()
+        annual_return = x.mean() * 252
+        annual_vol    = x.std() * np.sqrt(252)
+        beta   = np.cov(x, y)[0][1] / np.var(y)
+        sharpe = (annual_return - risk_free_rate) / annual_vol
+        results.append({
+            "企業名": name, "業種": sector,
+            "年間平均リターン(%)": annual_return * 100,
+            "年間リスク(%)": annual_vol * 100,
+            "シャープレシオ": sharpe, "ベータ": beta,
+        })
+    progress.empty()
+    status_text.empty()
+
+    if results:
+        df_results = pd.DataFrame(results).sort_values("シャープレシオ", ascending=False)
+        col_m1, col_m2, col_m3 = st.columns(3)
+        col_m1.metric("分析銘柄数", f"{len(df_results)}社")
+        col_m2.metric("平均シャープレシオ", f"{df_results['シャープレシオ'].mean():.2f}")
+        col_m3.metric("平均年間リターン", f"{df_results['年間平均リターン(%)'].mean():.1f}%")
+        st.subheader(f"📋 上位{top_n_int}銘柄")
+        st.dataframe(
+            df_results.head(top_n_int).style.format({
+                "年間平均リターン(%)": "{:.2f}",
+                "年間リスク(%)": "{:.2f}",
+                "シャープレシオ": "{:.2f}",
+                "ベータ": "{:.2f}",
+            }),
+            use_container_width=True,
         )
-        st.stop()
 
-    # ── 診断モード ────────────────────────────────────────────
-    with st.expander("🔧 API診断（動作しない場合はここを確認）", expanded=True):
-        st.caption("実際のAPIレスポンスを確認してデバッグできます")
-        diag_code = st.text_input("診断用銘柄コード", value="72030", key="jq_diag_code")
-        if st.button("🔍 APIレスポンス確認", key="jq_diag"):
-            st.markdown("**① 財務情報 `/fins/summary`**")
-            raw = _jq_get("/fins/summary", {"code": diag_code}, debug=True)
-            st.json(raw)
+st.divider()
 
-            st.markdown("**② 株価 `/equities/bars/daily`**")
-            from datetime import datetime as _dt
-            raw2 = _jq_get("/equities/bars/daily", {
-                "code": diag_code,
-                "from": (_dt.today().replace(day=1)).strftime("%Y%m%d"),
-                "to":   _dt.today().strftime("%Y%m%d"),
-            }, debug=True)
-            st.json(raw2)
+# ─────────────────────────────────────────────────────────────────
+# § 2. セクターローテーション
+# ─────────────────────────────────────────────────────────────────
+st.header("🔄 セクターローテーション")
+st.caption("各業種に属する銘柄の平均リターンを集計し、資金が流入・流出しているセクターを可視化します。")
 
-    # ── サイドバー設定 ──────────────────────────────────────────
-    st.sidebar.divider()
-    st.sidebar.markdown("### 🏦 J-Quants 設定")
-    jq_code_input = st.sidebar.text_input(
-        "銘柄コード（4桁）", value="7203", key="jq_code",
-        help="例: 7203（トヨタ）、6758（ソニー）、9984（ソフトバンクG）"
+with st.spinner(f"セクターデータ取得中（{len(ticker_name_map)}銘柄）..."):
+    df_sector = get_sector_performance(ticker_name_map, period_days=rotation_period)
+
+if not df_sector.empty:
+    top_sec    = df_sector.iloc[0]
+    bottom_sec = df_sector.iloc[-1]
+    rising  = (df_sector["平均リターン(%)"] > 0).sum()
+    falling = (df_sector["平均リターン(%)"] < 0).sum()
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("📈 最強セクター",  top_sec["業種"],    f"{top_sec['騰落率(%)']:+.2f}%")
+    k2.metric("📉 最弱セクター",  bottom_sec["業種"], f"{bottom_sec['騰落率(%)']:+.2f}%")
+    k3.metric("🟢 上昇セクター数", f"{rising} 業種")
+    k4.metric("🔴 下落セクター数", f"{falling} 業種")
+    period_label = {5:"1週間",10:"2週間",20:"1ヶ月",60:"3ヶ月",90:"約半年"}[rotation_period]
+    fig_bar = plot_sector_bar(df_sector, title=f"セクター別平均リターン（{period_label}）")
+    st.pyplot(fig_bar); plt.close(fig_bar)
+
+st.divider()
+
+# ─────────────────────────────────────────────────────────────────
+# § 3. 需給スクリーナー
+# ─────────────────────────────────────────────────────────────────
+st.header("🔥 需給スクリーナー")
+
+with st.spinner("出来高データ取得中..."):
+    df_surge = get_volume_surge(ticker_name_map, surge_ratio=surge_ratio)
+
+if df_surge.empty:
+    st.info(f"出来高が{surge_ratio}倍以上の銘柄は現在なし")
+else:
+    st.success(f"🔺 {len(df_surge)} 銘柄検出")
+    def color_surge(val):
+        if isinstance(val, float):
+            if val >= 3:  return "background-color: #d32f2f; color: white; font-weight:bold"
+            elif val >= 2: return "background-color: #f57c00; color: white; font-weight:bold"
+        return ""
+    st.dataframe(
+        df_surge.style.format({"出来高倍率":"{:.2f}x","株価変化率(5日%)":"{:+.2f}"})
+                      .applymap(color_surge, subset=["出来高倍率"]),
+        use_container_width=True,
     )
-    jq_code = jq_code_input.strip().zfill(4)
-    jq_period = st.sidebar.selectbox(
-        "取得期間", ["3ヶ月", "6ヶ月", "1年"], index=1, key="jq_period"
-    )
-    period_days = {"3ヶ月": 90, "6ヶ月": 180, "1年": 365}[jq_period]
-    jq_date_to   = datetime.today().strftime("%Y%m%d")
-    jq_date_from = (datetime.today() - relativedelta(days=period_days)).strftime("%Y%m%d")
 
-    # ── サブタブ ────────────────────────────────────────────────
+with st.spinner("VWAPデータ計算中..."):
+    df_vwap = get_vwap_deviation(ticker_name_map)
+
+if not df_vwap.empty:
+    col_up, col_down = st.columns(2)
+    with col_up:
+        st.markdown("#### 🔴 割高（VWAP上方乖離 上位10）")
+        st.dataframe(df_vwap[df_vwap["VWAP乖離率(%)"] > 0].head(10)
+                     .style.format({"VWAP乖離率(%)":"{:+.2f}"}), use_container_width=True)
+    with col_down:
+        st.markdown("#### 🟢 割安（VWAP下方乖離 下位10）")
+        st.dataframe(df_vwap[df_vwap["VWAP乖離率(%)"] < 0].tail(10)
+                     .sort_values("VWAP乖離率(%)")
+                     .style.format({"VWAP乖離率(%)":"{:+.2f}"}), use_container_width=True)
+
+st.divider()
+
+# ─────────────────────────────────────────────────────────────────
+# § 4. 価格パターン
+# ─────────────────────────────────────────────────────────────────
+st.header("📈 価格パターン")
+
+with st.spinner("52週高安値データ取得中..."):
+    df_52w = get_52week_highlow(ticker_name_map)
+
+if not df_52w.empty:
+    col_h, col_l = st.columns(2)
+    with col_h:
+        st.markdown("#### 🏔️ 52週高値圏（高値比-5%以内）上位20")
+        df_near_high = df_52w[df_52w["高値乖離(%)"] >= -5].sort_values("高値乖離(%)", ascending=False).head(20)
+        st.dataframe(df_near_high.style.format({"高値乖離(%)":"{:+.2f}","安値乖離(%)":"{:+.2f}","直近株価":"{:.0f}"}), use_container_width=True)
+    with col_l:
+        st.markdown("#### 🕳️ 52週安値圏（安値比+10%以内）上位20")
+        df_near_low = df_52w[df_52w["安値乖離(%)"] <= 10].sort_values("安値乖離(%)").head(20)
+        st.dataframe(df_near_low.style.format({"高値乖離(%)":"{:+.2f}","安値乖離(%)":"{:+.2f}","直近株価":"{:.0f}"}), use_container_width=True)
+
+with st.spinner("移動平均データ計算中..."):
+    try:
+        _ma_results = []
+        for ticker, (name, sector) in list(ticker_name_map.items())[:50]:  # 先頭50銘柄
+            df_tmp = get_price(ticker, start_date, end_date)
+            if df_tmp.empty or len(df_tmp) < 75:
+                continue
+            close = df_tmp["Close"]
+            ma25  = close.rolling(25).mean().iloc[-1]
+            ma75  = close.rolling(75).mean().iloc[-1]
+            last  = close.iloc[-1]
+            if pd.isna(ma25) or pd.isna(ma75) or ma25 == 0:
+                continue
+            _ma_results.append({
+                "企業名": name, "業種": sector,
+                "直近株価": last,
+                "MA25乖離(%)": (last - ma25) / ma25 * 100,
+                "MA75乖離(%)": (last - ma75) / ma75 * 100,
+            })
+        df_ma = pd.DataFrame(_ma_results)
+    except Exception:
+        df_ma = pd.DataFrame()
+
+if not df_ma.empty:
+    st.markdown("#### 📊 移動平均乖離ランキング（25日MA）")
+    col_ma1, col_ma2 = st.columns(2)
+    with col_ma1:
+        st.markdown("**🔴 上方乖離上位15（割高・過熱）**")
+        st.dataframe(df_ma.nlargest(15,"MA25乖離(%)").style.format({"MA25乖離(%)":"{:+.2f}","MA75乖離(%)":"{:+.2f}"}), use_container_width=True)
+    with col_ma2:
+        st.markdown("**🟢 下方乖離上位15（割安・反発期待）**")
+        st.dataframe(df_ma.nsmallest(15,"MA25乖離(%)").style.format({"MA25乖離(%)":"{:+.2f}","MA75乖離(%)":"{:+.2f}"}), use_container_width=True)
+
+st.divider()
+
+# ─────────────────────────────────────────────────────────────────
+# § 5. モメンタム・相関分析
+# ─────────────────────────────────────────────────────────────────
+st.header("💡 モメンタム・相関分析")
+
+with st.spinner("モメンタムスコア計算中..."):
+    df_mom = get_momentum_score(ticker_name_map)
+
+if not df_mom.empty:
+    top10  = df_mom.head(10)[["企業名","業種","モメンタムスコア"]].to_string(index=False)
+    bot10  = df_mom.tail(10)[["企業名","業種","モメンタムスコア"]].to_string(index=False)
+    col_m1, col_m2 = st.columns(2)
+    with col_m1:
+        st.markdown("#### 🚀 高モメンタム上位10")
+        st.dataframe(df_mom.head(10).style.format({"モメンタムスコア":"{:.3f}"}), use_container_width=True)
+    with col_m2:
+        st.markdown("#### 🐢 低モメンタム下位10")
+        st.dataframe(df_mom.tail(10).style.format({"モメンタムスコア":"{:.3f}"}), use_container_width=True)
+
+with st.spinner("日経平均との相関分析中..."):
+    df_corr = get_correlation_divergence(ticker_name_map, corr_window=corr_window)
+
+if not df_corr.empty:
+    st.markdown("#### 🔍 日経平均との相関崩れ検知")
+    st.caption("相関乖離度が高い = 最近、日経と独自の動きをしている銘柄（個別材料の可能性）")
+    col_div1, col_div2 = st.columns(2)
+    with col_div1:
+        st.markdown("**🟡 相関崩れ上位15（独自上昇）**")
+        rising_div = df_corr[df_corr["直近5日株価変化(%)"] > 0].head(15)
+        st.dataframe(rising_div.style.format({"長期相関":"{:.3f}","直近相関":"{:.3f}","相関乖離度":"{:.3f}","直近5日株価変化(%)":"{:+.2f}"}), use_container_width=True)
+    with col_div2:
+        st.markdown("**🔴 相関崩れ上位15（独自下落）**")
+        falling_div = df_corr[df_corr["直近5日株価変化(%)"] < 0].head(15)
+        st.dataframe(falling_div.style.format({"長期相関":"{:.3f}","直近相関":"{:.3f}","相関乖離度":"{:.3f}","直近5日株価変化(%)":"{:+.2f}"}), use_container_width=True)
+
+st.divider()
+
+# ─────────────────────────────────────────────────────────────────
+# § 6. J-Quants 需給分析
+# ─────────────────────────────────────────────────────────────────
+st.header("🏦 J-Quants 需給分析")
+
+jq_key = st.secrets.get("JQUANTS_API_KEY", "")
+if not jq_key:
+    st.warning("⚠️ J-Quants APIキー未設定（`JQUANTS_API_KEY` を Secrets に追加してください）")
+else:
+    jq_code_input = st.sidebar.text_input("🏦 J-Quants 銘柄コード", value="72030", key="jq_code")
+    jq_code  = jq_code_input.strip()
+    jq_period = st.sidebar.selectbox("J-Quants 期間", ["3ヶ月","6ヶ月","1年"], index=1, key="jq_period")
+    period_days_jq = {"3ヶ月":90,"6ヶ月":180,"1年":365}[jq_period]
+    jq_date_to   = end_date.strftime("%Y%m%d")
+    jq_date_from = (end_date - relativedelta(days=period_days_jq)).strftime("%Y%m%d")
+
     jq_t1, jq_t2, jq_t3, jq_t4, jq_t5 = st.tabs([
-        "📈 株価・TOPIX",
-        "👥 投資部門別",
-        "⚖️ 信用取引残高",
-        "📉 業種別空売り比率",
-        "📋 財務情報",
+        "📈 株価・TOPIX","👥 投資部門別","⚖️ 信用取引残高","📉 空売り比率","📋 財務情報"
     ])
-
-    # ── Tab1: 株価・TOPIX ───────────────────────────────────────
     with jq_t1:
-        st.markdown(f"#### 銘柄 {jq_code} の株価チャート（J-Quants）")
-        if st.button("▶ 株価・TOPIX取得", key="jq_run_price"):
-            col_p1, col_p2 = st.columns(2)
-            with col_p1:
-                with st.spinner(f"{jq_code} 株価取得中..."):
-                    df_bars = jq_fetch_stock_bars(jq_code, jq_date_from, jq_date_to)
-                if df_bars.empty:
-                    st.warning("株価データを取得できませんでした（銘柄コードまたはプランを確認）")
-                else:
-                    st.caption(f"取得件数: {len(df_bars)}日分")
-                    _plot_candlestick(df_bars, f"{jq_code} 株価（ローソク足）")
-                    with st.expander("生データ", expanded=True):
-                        st.dataframe(df_bars.tail(20), use_container_width=True)
-            with col_p2:
-                with st.spinner("TOPIX取得中..."):
-                    df_topix = jq_fetch_topix(jq_date_from, jq_date_to)
-                if df_topix.empty:
-                    st.warning("TOPIXデータを取得できませんでした（Lightプラン以上が必要）")
-                else:
-                    close_col = next(
-                        (c for c in df_topix.columns if c.lower() in ["close","closeprice"]), None
-                    )
-                    if close_col:
-                        fig_t, ax_t = plt.subplots(figsize=(6, 4))
-                        ax_t.plot(df_topix["Date"], df_topix[close_col],
-                                  color="#1565c0", linewidth=1.5)
-                        ax_t.fill_between(df_topix["Date"], df_topix[close_col],
-                                          df_topix[close_col].min(),
-                                          alpha=0.1, color="#1565c0")
-                        ax_t.set_title("TOPIX", fontsize=11)
-                        ax_t.set_ylabel("Index")
-                        ax_t.grid(True, alpha=0.25)
-                        plt.xticks(rotation=45)
-                        plt.tight_layout()
-                        st.pyplot(fig_t, clear_figure=True)
+        col_p1, col_p2 = st.columns(2)
+        with col_p1:
+            with st.spinner(f"{jq_code} 株価取得中..."):
+                df_bars = jq_fetch_stock_bars(jq_code, jq_date_from, jq_date_to)
+            if df_bars.empty:
+                st.warning("株価データ取得失敗（銘柄コードまたはプランを確認）")
+            else:
+                _plot_candlestick(df_bars, f"{jq_code} 株価")
+        with col_p2:
+            with st.spinner("TOPIX取得中..."):
+                df_topix = jq_fetch_topix(jq_date_from, jq_date_to)
+            if not df_topix.empty:
+                close_col = next((c for c in df_topix.columns if c.lower() in ["close","closeprice"]), None)
+                if close_col:
+                    fig_t, ax_t = plt.subplots(figsize=(6,4))
+                    ax_t.plot(df_topix["Date"], df_topix[close_col], color="#1565c0", linewidth=1.5)
+                    ax_t.fill_between(df_topix["Date"], df_topix[close_col], df_topix[close_col].min(), alpha=0.1, color="#1565c0")
+                    ax_t.set_title("TOPIX", fontsize=11)
+                    ax_t.grid(True, alpha=0.25)
+                    plt.xticks(rotation=45); plt.tight_layout()
+                    st.pyplot(fig_t, clear_figure=True)
 
-    # ── Tab2: 投資部門別 ─────────────────────────────────────────
     with jq_t2:
-        st.markdown("#### 投資部門別売買動向（外国人・個人・法人）")
-        st.caption("Lightプラン以上が必要です。週次データ（毎週第4営業日更新）")
-        if st.button("▶ 投資部門別データ取得", key="jq_run_investor"):
-            with st.spinner("投資部門別データ取得中..."):
-                df_inv = jq_fetch_investor_types(jq_date_from, jq_date_to)
-            if df_inv.empty:
-                st.warning("データを取得できませんでした")
+        st.caption("Lightプラン以上が必要")
+        with st.spinner("投資部門別データ取得中..."):
+            df_inv = jq_fetch_investor_types(jq_date_from, jq_date_to)
+        if df_inv.empty:
+            st.warning("データ取得失敗（Lightプラン以上が必要）")
+        else:
+            section_col = next((c for c in df_inv.columns if "section" in c.lower()), None)
+            buy_col  = next((c for c in df_inv.columns if "buy" in c.lower()), None)
+            sell_col = next((c for c in df_inv.columns if "sell" in c.lower()), None)
+            if section_col and buy_col and sell_col and "Date" in df_inv.columns:
+                fig_inv, ax_inv = plt.subplots(figsize=(12,5))
+                for sec, grp in df_inv.groupby(section_col):
+                    net = grp[buy_col].astype(float) - grp[sell_col].astype(float)
+                    ax_inv.plot(grp["Date"], net, label=str(sec), linewidth=1.5, marker="o", markersize=3)
+                ax_inv.axhline(0, color="gray", linestyle="--", alpha=0.5)
+                ax_inv.set_title("Investor Type Net Buy/Sell", fontsize=11)
+                ax_inv.legend(fontsize=8); ax_inv.grid(True, alpha=0.25)
+                plt.xticks(rotation=45); plt.tight_layout()
+                st.pyplot(fig_inv, clear_figure=True)
             else:
-                st.caption(f"取得件数: {len(df_inv)}件")
-                # セクション（投資家区分）の列を確認
-                section_col = next(
-                    (c for c in df_inv.columns if "section" in c.lower()), None
-                )
-                sell_col = next(
-                    (c for c in df_inv.columns if "sell" in c.lower() or "売" in c), None
-                )
-                buy_col  = next(
-                    (c for c in df_inv.columns if "buy" in c.lower() or "買" in c), None
-                )
+                st.dataframe(df_inv, use_container_width=True)
 
-                if section_col and buy_col and sell_col:
-                    # 主要部門に絞る
-                    key_sections = ["Foreigners", "Individuals", "Dealers",
-                                    "TrustBanks", "BusinessCo", "外国人", "個人", "法人"]
-                    df_key = df_inv[df_inv[section_col].isin(key_sections)] \
-                        if any(s in df_inv[section_col].values for s in key_sections) \
-                        else df_inv
-
-                    fig_inv, ax_inv = plt.subplots(figsize=(12, 5))
-                    for sec, grp in df_key.groupby(section_col):
-                        net = grp[buy_col].astype(float) - grp[sell_col].astype(float)
-                        ax_inv.plot(grp["PublishedDate"], net,
-                                    label=str(sec), linewidth=1.5, marker="o", markersize=3)
-                    ax_inv.axhline(0, color="gray", linestyle="--", alpha=0.5)
-                    ax_inv.set_title("Investor Type Net Buy/Sell (JPY Bil)", fontsize=11)
-                    ax_inv.set_ylabel("Net (Buy - Sell)")
-                    ax_inv.legend(fontsize=8, loc="upper left")
-                    ax_inv.grid(True, alpha=0.25)
-                    plt.xticks(rotation=45)
-                    plt.tight_layout()
-                    st.pyplot(fig_inv, clear_figure=True)
-                else:
-                    st.dataframe(df_inv, use_container_width=True)
-
-                with st.expander("生データ", expanded=True):
-                    st.dataframe(df_inv, use_container_width=True)
-
-    # ── Tab3: 信用取引残高 ───────────────────────────────────────
     with jq_t3:
-        st.markdown(f"#### 銘柄 {jq_code} の信用取引残高")
-        st.caption("Standardプラン以上が必要です。週次データ")
-        if st.button("▶ 信用残高取得", key="jq_run_margin"):
-            with st.spinner("信用取引残高取得中..."):
-                df_mg = jq_fetch_margin(jq_code, jq_date_from, jq_date_to)
-            if df_mg.empty:
-                st.warning("データを取得できませんでした（銘柄コードまたはプランを確認）")
+        st.caption("Standardプラン以上が必要")
+        with st.spinner("信用取引残高取得中..."):
+            df_mg = jq_fetch_margin(jq_code, jq_date_from, jq_date_to)
+        if df_mg.empty:
+            st.warning("データ取得失敗")
+        else:
+            buy_bal  = next((c for c in df_mg.columns if "longmargin" in c.lower()), None)
+            sell_bal = next((c for c in df_mg.columns if "shortmargin" in c.lower()), None)
+            if buy_bal and sell_bal and "Date" in df_mg.columns:
+                fig_mg, ax_mg = plt.subplots(figsize=(12,4))
+                ax_mg.plot(df_mg["Date"], df_mg[buy_bal].astype(float), label="Long", color="#1a7f37", linewidth=1.8)
+                ax_mg.plot(df_mg["Date"], df_mg[sell_bal].astype(float), label="Short", color="#d1242f", linewidth=1.8)
+                ax_mg.set_title(f"{jq_code} Margin Balance", fontsize=11)
+                ax_mg.legend(); ax_mg.grid(True, alpha=0.25)
+                plt.xticks(rotation=45); plt.tight_layout()
+                st.pyplot(fig_mg, clear_figure=True)
+                ratio = df_mg[buy_bal].astype(float) / (df_mg[sell_bal].astype(float) + 1e-8)
+                st.metric("最新 信用倍率", f"{ratio.iloc[-1]:.2f}倍",
+                          delta=f"{ratio.iloc[-1]-ratio.iloc[-2]:+.2f}" if len(ratio)>1 else None)
             else:
-                st.caption(f"取得件数: {len(df_mg)}件")
-                buy_bal  = next((c for c in df_mg.columns if "longmargin" in c.lower() or "信用買" in c), None)
-                sell_bal = next((c for c in df_mg.columns if "shortmargin" in c.lower() or "信用売" in c), None)
+                st.dataframe(df_mg, use_container_width=True)
 
-                if buy_bal and sell_bal:
-                    fig_mg, ax_mg = plt.subplots(figsize=(12, 4))
-                    ax_mg.plot(df_mg["Date"], df_mg[buy_bal].astype(float),
-                               label="Margin Long (Buy)", color="#1a7f37", linewidth=1.8)
-                    ax_mg.plot(df_mg["Date"], df_mg[sell_bal].astype(float),
-                               label="Margin Short (Sell)", color="#d1242f", linewidth=1.8)
-                    ax_mg.set_title(f"{jq_code} Margin Balance", fontsize=11)
-                    ax_mg.set_ylabel("Shares")
-                    ax_mg.legend()
-                    ax_mg.grid(True, alpha=0.25)
-                    plt.xticks(rotation=45)
-                    plt.tight_layout()
-                    st.pyplot(fig_mg, clear_figure=True)
-
-                    # 信用倍率
-                    ratio = df_mg[buy_bal].astype(float) / (df_mg[sell_bal].astype(float) + 1e-8)
-                    st.metric("最新 信用倍率（買/売）",
-                              f"{ratio.iloc[-1]:.2f}倍",
-                              delta=f"{ratio.iloc[-1] - ratio.iloc[-2]:+.2f}" if len(ratio) > 1 else None)
-                else:
-                    st.dataframe(df_mg, use_container_width=True)
-
-                with st.expander("生データ", expanded=True):
-                    st.dataframe(df_mg, use_container_width=True)
-
-    # ── Tab4: 業種別空売り比率 ───────────────────────────────────
     with jq_t4:
-        st.markdown("#### 業種別空売り比率")
-        st.caption("Standardプラン以上が必要です。33業種コードで取得")
-
+        st.caption("Standardプラン以上が必要")
         S33_OPTIONS = {
-            "0050 水産・農林": "0050", "1050 鉱業": "1050",
-            "2050 建設": "2050",       "3050 食料品": "3050",
-            "3100 繊維": "3100",       "3150 パルプ・紙": "3150",
-            "3200 化学": "3200",       "3250 医薬品": "3250",
-            "3300 石油": "3300",       "3350 ゴム": "3350",
-            "3400 ガラス・土石": "3400","3450 鉄鋼": "3450",
-            "3500 非鉄": "3500",       "3550 金属製品": "3550",
-            "3600 機械": "3600",       "3650 電気機器": "3650",
-            "3700 輸送用機器": "3700", "3750 精密機器": "3750",
-            "3800 その他製品": "3800", "4050 電気・ガス": "4050",
-            "5050 陸運": "5050",       "5100 海運": "5100",
-            "5150 空運": "5150",       "5200 倉庫・運輸": "5200",
-            "5250 情報・通信": "5250", "6050 卸売": "6050",
-            "6100 小売": "6100",       "7050 銀行": "7050",
-            "7100 証券": "7100",       "7150 保険": "7150",
-            "7200 その他金融": "7200", "8050 不動産": "8050",
-            "9050 サービス": "9050",
+            "3650 電気機器":"3650","3700 輸送用機器":"3700","5250 情報・通信":"5250",
+            "7050 銀行":"7050","3200 化学":"3200","3600 機械":"3600",
+            "6100 小売":"6100","8050 不動産":"8050","9050 サービス":"9050",
         }
-        selected_s33_label = st.selectbox(
-            "業種コード", list(S33_OPTIONS.keys()), index=22, key="jq_s33"
-        )
+        selected_s33_label = st.selectbox("業種コード", list(S33_OPTIONS.keys()), key="jq_s33_auto")
         selected_s33 = S33_OPTIONS[selected_s33_label]
+        with st.spinner("業種別空売り比率取得中..."):
+            df_sr = jq_fetch_short_ratio(selected_s33, jq_date_from, jq_date_to)
+        if df_sr.empty:
+            st.warning("データ取得失敗")
+        else:
+            ratio_col = next((c for c in df_sr.columns if "ratio" in c.lower()), None)
+            if ratio_col and "Date" in df_sr.columns:
+                fig_sr, ax_sr = plt.subplots(figsize=(12,4))
+                ax_sr.plot(df_sr["Date"], df_sr[ratio_col].astype(float)*100, color="#7b1fa2", linewidth=1.8)
+                ax_sr.fill_between(df_sr["Date"], df_sr[ratio_col].astype(float)*100, alpha=0.15, color="#7b1fa2")
+                ax_sr.set_title(f"Short Ratio - {selected_s33_label} (%)", fontsize=11)
+                ax_sr.grid(True, alpha=0.25); plt.xticks(rotation=45); plt.tight_layout()
+                st.pyplot(fig_sr, clear_figure=True)
+                latest = float(df_sr[ratio_col].iloc[-1])*100
+                avg    = float(df_sr[ratio_col].mean())*100
+                c1, c2 = st.columns(2)
+                c1.metric("最新空売り比率", f"{latest:.1f}%")
+                c2.metric("期間平均", f"{avg:.1f}%", delta=f"{latest-avg:+.1f}%")
 
-        if st.button("▶ 空売り比率取得", key="jq_run_short"):
-            with st.spinner("業種別空売り比率取得中..."):
-                df_sr = jq_fetch_short_ratio(selected_s33, jq_date_from, jq_date_to)
-            if df_sr.empty:
-                st.warning("データを取得できませんでした")
-            else:
-                ratio_col = next(
-                    (c for c in df_sr.columns if "ratio" in c.lower() or "比率" in c), None
-                )
-                if ratio_col:
-                    fig_sr, ax_sr = plt.subplots(figsize=(12, 4))
-                    ax_sr.plot(df_sr["Date"], df_sr[ratio_col].astype(float) * 100,
-                               color="#7b1fa2", linewidth=1.8)
-                    ax_sr.fill_between(df_sr["Date"], df_sr[ratio_col].astype(float) * 100,
-                                       alpha=0.15, color="#7b1fa2")
-                    ax_sr.set_title(f"Short Selling Ratio - {selected_s33_label} (%)", fontsize=11)
-                    ax_sr.set_ylabel("Short Ratio (%)")
-                    ax_sr.grid(True, alpha=0.25)
-                    plt.xticks(rotation=45)
-                    plt.tight_layout()
-                    st.pyplot(fig_sr, clear_figure=True)
-                    latest = float(df_sr[ratio_col].iloc[-1]) * 100
-                    avg    = float(df_sr[ratio_col].mean()) * 100
-                    col_s1, col_s2 = st.columns(2)
-                    col_s1.metric("最新空売り比率", f"{latest:.1f}%")
-                    col_s2.metric("期間平均", f"{avg:.1f}%",
-                                  delta=f"{latest - avg:+.1f}%")
-                else:
-                    st.dataframe(df_sr, use_container_width=True)
-
-                with st.expander("生データ", expanded=True):
-                    st.dataframe(df_sr, use_container_width=True)
-
-    # ── Tab5: 財務情報 ───────────────────────────────────────────
     with jq_t5:
-        st.markdown(f"#### 銘柄 {jq_code} の財務情報（決算短信）")
         st.caption("Freeプラン以上で利用可能")
-        if st.button("▶ 財務情報取得", key="jq_run_fins"):
-            with st.spinner("財務情報取得中..."):
-                df_fins = jq_fetch_fins(jq_code)
-            if df_fins.empty:
-                st.warning("財務データを取得できませんでした")
-            else:
-                st.caption(f"取得件数: {len(df_fins)}件")
+        with st.spinner("財務情報取得中..."):
+            df_fins = jq_fetch_fins(jq_code)
+        if df_fins.empty:
+            st.warning("財務データ取得失敗")
+        else:
+            key_cols = [c for c in df_fins.columns if any(k in c.lower() for k in
+                ["date","period","sales","profit","income","eps","revenue","operating","net","equity"])]
+            st.dataframe(df_fins[key_cols].tail(8) if key_cols else df_fins.tail(8),
+                         use_container_width=True)
 
-                # 主要財務指標の表示
-                key_cols = [c for c in df_fins.columns if any(k in c.lower() for k in [
-                    "date", "period", "sales", "profit", "income", "eps",
-                    "revenue", "operating", "net", "equity", "asset",
-                    "roe", "roa", "per", "pbr",
-                ])]
-                if key_cols:
-                    st.dataframe(
-                        df_fins[key_cols].tail(8),
-                        use_container_width=True
-                    )
-                else:
-                    st.dataframe(df_fins.tail(8), use_container_width=True)
-
-                # AI財務コメント
-                if st.checkbox("🤖 AIによる財務分析", value=False, key="jq_ai_fins"):
-                    fins_str = df_fins.tail(4).to_string(index=False)
-                    prompt_fins = (
-                        f"以下は銘柄コード {jq_code} の直近4四半期の財務情報です。\n\n"
-                        f"{fins_str}\n\n"
-                        "投資家向けに300文字以内で財務状況を分析してください:\n"
-                        "1. 売上・利益のトレンド\n"
-                        "2. 財務健全性\n"
-                        "3. 注目すべき変化点\n"
-                    )
-                    with st.spinner("AI財務分析中..."):
-                        try:
-                            comment, ai_name = generate_ai_comment(prompt_fins)
-                            st.info(f"🤖 **AI財務分析（{ai_name}）**\n\n{comment}")
-                        except Exception as e:
-                            st.warning(f"AI APIエラー: {e}")
-
-                with st.expander("全データ", expanded=True):
-                    st.dataframe(df_fins, use_container_width=True)
+st.divider()
+st.caption("データソース: Yahoo Finance / J-Quants / TDnet / 株探 / みんかぶ / 日経 / Reuters | 投資判断は自己責任で")
