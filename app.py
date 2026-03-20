@@ -13,6 +13,15 @@ import xml.etree.ElementTree as ET
 import re
 from io import StringIO
 
+# ── アクセス解析モジュール ────────────────────────────────────────
+try:
+    from analytics import track_pageview
+    ANALYTICS_AVAILABLE = True
+except ImportError:
+    ANALYTICS_AVAILABLE = False
+    def track_pageview(*a, **kw):
+        pass
+
 # -----------------------------
 # フォント設定（日本語対応）
 # -----------------------------
@@ -51,6 +60,9 @@ GROQ_MODEL = "llama-3.3-8b-instant"
 # -----------------------------
 st.set_page_config(layout="wide", page_title="📈 日本株 分析ダッシュボード", page_icon="📈")
 st.title("📈 日本株 シャープレシオ分析 + ニュース統合")
+
+# ── アクセス計測（1セッション1回）────────────────────────────────
+track_pageview("jstock")
 
 # ── 関連ダッシュボード リンクバー ────────────────────────────────
 st.markdown(
