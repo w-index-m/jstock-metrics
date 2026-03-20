@@ -12,16 +12,6 @@ import requests
 import xml.etree.ElementTree as ET
 import re
 from io import StringIO
-import io
-import datetime as dt
-from bs4 import BeautifulSoup
-import feedparser
-
-try:
-    import pdfplumber
-    PDFPLUMBER_AVAILABLE = True
-except ImportError:
-    PDFPLUMBER_AVAILABLE = False
 
 # -----------------------------
 # フォント設定（日本語対応）
@@ -1166,7 +1156,7 @@ def get_benchmark(start, end):
 # メインタブ
 # ================================================================
 
-tab_analysis, tab_sector, tab_volume, tab_price, tab_unique, tab_news, tab_market_news = st.tabs([
+tab_analysis, tab_sector, tab_volume, tab_price, tab_unique, tab_news, tab_market_news, tab_jquants = st.tabs([
     "📊 パフォーマンス分析",
     "🔄 セクターローテーション",
     "🔥 需給スクリーナー",
@@ -1174,6 +1164,7 @@ tab_analysis, tab_sector, tab_volume, tab_price, tab_unique, tab_news, tab_marke
     "💡 モメンタム・相関分析",
     "📰 銘柄別ニュース",
     "🌐 市場全体ニュース",
+    "🏦 J-Quants 需給分析",
 ])
 
 # ─── Tab1: パフォーマンス分析 ────────────────────────────────────
@@ -1873,298 +1864,447 @@ with tab_market_news:
                     
 
 # ================================================================
-# TDnet自動解析（決算・適時開示）
+# 🏦 J-Quants 需給分析タブ
 # ================================================================
 
-TDNET_LIST_URL = "https://www.release.tdnet.info/inbs/I_list_001_{yyyymmdd}.html"
-TDNET_BASE     = "https://www.release.tdnet.info"
-MAX_PDF_CHARS  = 12000
-TDNET_UA       = "Mozilla/5.0 (JStockMetrics/1.0)"
-
-KESSAN_KEYWORDS = [
-    "決算", "業績", "配当", "増益", "減益", "黒字", "赤字",
-    "上方修正", "下方修正", "業績修正", "予想修正", "経常利益",
-    "営業利益", "純利益", "売上", "収益", "通期", "四半期",
-    "第1四半期", "第2四半期", "第3四半期", "中間", "年度",
-]
-
-def _is_kessan(item: dict) -> bool:
-    text = ((item.get("title") or "") + " " + (item.get("around") or "")).lower()
-    return any(kw.lower() in text for kw in KESSAN_KEYWORDS)
-
-@st.cache_data(ttl=600, show_spinner=False)
-def _fetch_tdnet_html(yyyymmdd: str) -> str:
-    url = TDNET_LIST_URL.format(yyyymmdd=yyyymmdd)
-    r = requests.get(url, timeout=20, headers={"User-Agent": TDNET_UA})
-    r.raise_for_status()
-    r.encoding = r.apparent_encoding
-    return r.text
-
-def _extract_tdnet_items(html_content: str) -> list:
-    soup = BeautifulSoup(html_content, "html.parser")
-    items = []
-    for a in soup.find_all("a", href=True):
-        href = a["href"].strip()
-        if not href or ".pdf" not in href.lower():
-            continue
-        if href.startswith("http"):
-            pdf_url = href
-        elif href.startswith("//"):
-            pdf_url = "https:" + href
-        elif href.startswith("/"):
-            pdf_url = TDNET_BASE + href
-        else:
-            pdf_url = TDNET_BASE + "/inbs/" + href
-        title = a.get_text(strip=True) or "（タイトル不明）"
-        parent_text = ""
-        if a.parent:
-            parent_text = a.parent.get_text(" ", strip=True)
-            if a.parent.parent:
-                parent_text += " " + a.parent.parent.get_text(" ", strip=True)
-        around = (parent_text + " " + title).strip()
-        code = None
-        m = re.search(r"\b(\d{4})\b", around)
-        if m:
-            code = m.group(1)
-        time_str = None
-        m2 = re.search(r"\b([0-2]?\d:[0-5]\d)\b", around)
-        if m2:
-            time_str = m2.group(1)
-        items.append({
-            "title": title, "pdf_url": pdf_url,
-            "code": code, "time": time_str, "around": around[:200],
-        })
-    return list({it["pdf_url"]: it for it in items}.values())
-
-@st.cache_data(ttl=600, show_spinner=False)
-def fetch_tdnet_items_jstock(yyyymmdd: str) -> list:
-    """RSS優先、失敗時はHTMLスクレイピング"""
-    rss_url = "https://webapi.yanoshin.jp/webapi/tdnet/list/recent.rss"
-    try:
-        import urllib.request
-        req = urllib.request.Request(rss_url, headers={"User-Agent": TDNET_UA})
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            feed_data = resp.read()
-        feed = feedparser.parse(feed_data)
-        target_date = dt.datetime.strptime(yyyymmdd, "%Y%m%d").date()
-        items = []
-        for entry in feed.entries:
-            pub_date = None
-            if hasattr(entry, "published_parsed"):
-                pub_date = dt.datetime(*entry.published_parsed[:6]).date()
-            if pub_date and pub_date != target_date:
-                continue
-            title = entry.get("title", "")
-            link  = entry.get("link", "")
-            pdf_url = link if ".pdf" in link.lower() else ""
-            if not pdf_url:
-                desc = entry.get("description", "") or entry.get("summary", "")
-                soup = BeautifulSoup(desc, "html.parser")
-                for a in soup.find_all("a", href=True):
-                    if ".pdf" in a["href"].lower():
-                        pdf_url = a["href"]
-                        break
-            if not pdf_url:
-                continue
-            code = None
-            m = re.search(r"\b(\d{4})\b", title)
-            if m:
-                code = m.group(1)
-            time_str = None
-            if pub_date and hasattr(entry, "published_parsed"):
-                time_str = dt.datetime(*entry.published_parsed[:6]).strftime("%H:%M")
-            items.append({
-                "title": title, "pdf_url": pdf_url,
-                "code": code, "time": time_str, "around": title,
-            })
-        if items:
-            return items
-    except Exception:
-        pass
-    try:
-        html = _fetch_tdnet_html(yyyymmdd)
-        return _extract_tdnet_items(html)
-    except Exception:
-        return []
+# ── J-Quants APIクライアント ─────────────────────────────────────
+JQUANTS_API_BASE = "https://api.jquants.com/v1"
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def _download_pdf(pdf_url: str) -> bytes:
-    r = requests.get(pdf_url, timeout=20, headers={"User-Agent": TDNET_UA})
-    r.raise_for_status()
-    return r.content
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def _extract_pdf_text(pdf_bytes: bytes) -> str:
-    if not PDFPLUMBER_AVAILABLE:
-        return ""
-    parts = []
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for page in pdf.pages:
-            t = page.extract_text() or ""
-            if t.strip():
-                parts.append(t)
-    return "\n".join(parts).strip()
-
-def _summarize_tdnet_pdf(pdf_text: str, title: str) -> tuple:
-    """AIでTDnet PDFを要約。Gemini→Groqフォールバック"""
-    trimmed = pdf_text[:MAX_PDF_CHARS]
-    prompt = f"""
-あなたは日本の上場企業の開示資料（TDnet）の読み取り担当です。
-以下の資料テキストから要点を抽出し、次のフォーマットでまとめてください。
-
-【出力フォーマット】
-- 概要: （増益/減益/上方修正/下方修正など）
-- 主要数値: （売上/営利/経常/純利の変化）
-- 理由: （要因を1〜3点）
-- 注意点: （特損/為替/会計変更など）
-- 株価への影響: （ポジティブ/ニュートラル/ネガティブ）
-
-【資料タイトル】
-{title}
-
-【テキスト】
-{trimmed}
-""".strip()
-    comment, ai_name = generate_ai_comment(prompt)
-    return comment, ai_name
+def _jq_headers() -> dict:
+    """J-Quants APIキーからAuthヘッダーを生成"""
+    api_key = st.secrets.get("JQUANTS_API_KEY", "")
+    if not api_key:
+        return {}
+    return {"Authorization": f"Bearer {api_key}"}
 
 
-def render_tdnet_section():
-    """TDnet自動解析セクション"""
-    st.markdown("---")
-    st.header("📄 TDnet自動解析（決算・適時開示）")
-    st.caption("TDnetから決算・業績修正資料を自動取得し、AIで要約します。")
-
-    if not PDFPLUMBER_AVAILABLE:
-        st.warning("⚠️ pdfplumberが未インストールです。requirements.txtに `pdfplumber` を追加してください。")
-
-    # ── 設定 ──────────────────────────────────────────────────────
-    with st.expander("⚙️ TDnet設定", expanded=True):
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            import pytz
-            JST = pytz.timezone("Asia/Tokyo")
-            today_jst = dt.datetime.now(JST).date()
-            tdnet_date = st.date_input("対象日", value=today_jst, key="tdnet_date_jstock")
-        with col2:
-            tdnet_keyword = st.text_input(
-                "フィルタ（銘柄コード/会社名）", value="",
-                placeholder="例: 7203 / トヨタ", key="tdnet_kw_jstock"
-            )
-        with col3:
-            tdnet_max = st.slider("表示件数", 5, 50, 20, key="tdnet_max_jstock")
-
-    yyyymmdd = tdnet_date.strftime("%Y%m%d")
-
-    with st.spinner(f"TDnet一覧取得中...（{yyyymmdd}）"):
-        items = fetch_tdnet_items_jstock(yyyymmdd)
-
-    # 決算フィルタ
-    total_before = len(items)
-    items = [it for it in items if _is_kessan(it)]
-    st.caption(f"🔍 決算フィルタ: 全{total_before}件 → 決算関連 {len(items)}件")
-
-    # キーワードフィルタ
-    if tdnet_keyword.strip():
-        kw = tdnet_keyword.strip().lower()
-        items = [
-            it for it in items
-            if kw in (it.get("title") or "").lower()
-            or kw in (it.get("around") or "").lower()
-            or kw == (it.get("code") or "").lower()
-        ]
-        st.caption(f"🔎 キーワード「{tdnet_keyword}」: {len(items)}件")
-
-    items = items[:tdnet_max]
-    st.caption(f"📊 表示: {len(items)}件")
-
-    if not items:
-        st.info("該当する開示資料が見つかりませんでした。日付や条件を変更してください。")
-        return
-
-    # ── セッション管理 ───────────────────────────────────────────
-    if "tdnet_summaries_jstock" not in st.session_state:
-        st.session_state["tdnet_summaries_jstock"] = {}
-
-    # ── まとめて解析ボタン ───────────────────────────────────────
-    col_b1, col_b2 = st.columns([3, 1])
-    with col_b1:
-        batch_n = st.number_input(
-            "まとめて解析する件数", min_value=1,
-            max_value=max(1, len(items)), value=min(3, len(items)),
-            key="tdnet_batch_n_jstock"
+def _jq_get(endpoint: str, params: dict = None) -> dict | None:
+    """J-Quants API GETリクエスト（ページネーション対応）"""
+    headers = _jq_headers()
+    if not headers:
+        return None
+    try:
+        res = requests.get(
+            f"{JQUANTS_API_BASE}{endpoint}",
+            params=params or {},
+            headers=headers,
+            timeout=15,
         )
-    with col_b2:
-        run_batch = st.button("🚀 まとめて解析", type="primary", key="tdnet_batch_jstock")
-
-    if run_batch:
-        target = items[:int(batch_n)]
-        prog = st.progress(0)
-        for i, it in enumerate(target, 1):
-            pdf_url = it["pdf_url"]
-            title   = it["title"]
-            with st.spinner(f"[{i}/{len(target)}] {title[:30]}..."):
-                try:
-                    pdf_bytes = _download_pdf(pdf_url)
-                    pdf_text  = _extract_pdf_text(pdf_bytes)
-                    if not pdf_text:
-                        summary, ai_name = "（PDFからテキストを抽出できませんでした）", ""
-                    else:
-                        summary, ai_name = _summarize_tdnet_pdf(pdf_text, title)
-                    st.session_state["tdnet_summaries_jstock"][pdf_url] = (summary, ai_name)
-                except Exception as e:
-                    st.session_state["tdnet_summaries_jstock"][pdf_url] = (f"エラー: {str(e)[:100]}", "")
-            prog.progress(i / len(target))
-        st.success("✅ 解析完了！")
-
-    st.divider()
-
-    # ── 個別一覧 ─────────────────────────────────────────────────
-    for idx, it in enumerate(items, 1):
-        title   = it["title"]
-        pdf_url = it["pdf_url"]
-        code    = it.get("code") or "----"
-        time_s  = it.get("time") or "--:--"
-
-        with st.container(border=True):
-            c1, c2, c3, c4 = st.columns([0.5, 5, 1, 1])
-            c1.markdown(f"**{idx}**")
-            c2.markdown(f"**{title}**  \n`{code}` {time_s}")
-            c3.markdown(
-                f'<a href="{pdf_url}" target="_blank" '
-                f'style="display:inline-block;padding:4px 10px;'
-                f'background:#f0f2f6;border-radius:4px;'
-                f'text-decoration:none;color:#262730;font-size:13px;">📄 PDF</a>',
-                unsafe_allow_html=True,
-            )
-            run_one = c4.button("🔍 解析", key=f"tdnet_one_{idx}")
-
-            # 既存の要約表示
-            if pdf_url in st.session_state["tdnet_summaries_jstock"]:
-                summary, ai_name = st.session_state["tdnet_summaries_jstock"][pdf_url]
-                st.markdown("**✅ AI要約:**")
-                st.write(summary)
-                if ai_name:
-                    st.caption(f"🤖 使用AI: {ai_name}")
-
-            # 個別解析ボタン
-            if run_one:
-                with st.spinner("PDF取得・解析中..."):
-                    try:
-                        pdf_bytes = _download_pdf(pdf_url)
-                        pdf_text  = _extract_pdf_text(pdf_bytes)
-                        if not pdf_text:
-                            summary, ai_name = "（PDFからテキストを抽出できませんでした）", ""
-                        else:
-                            summary, ai_name = _summarize_tdnet_pdf(pdf_text, title)
-                        st.session_state["tdnet_summaries_jstock"][pdf_url] = (summary, ai_name)
-                        st.success("✅ 解析完了")
-                        st.write(summary)
-                        if ai_name:
-                            st.caption(f"🤖 使用AI: {ai_name}")
-                    except Exception as e:
-                        st.error(f"❌ エラー: {e}")
+        if res.status_code == 200:
+            d = res.json()
+            # ページネーション
+            data_key = [k for k in d if k != "pagination_key"]
+            if not data_key:
+                return d
+            key = data_key[0]
+            all_data = d[key]
+            while "pagination_key" in d:
+                p = dict(params or {})
+                p["pagination_key"] = d["pagination_key"]
+                res2 = requests.get(
+                    f"{JQUANTS_API_BASE}{endpoint}",
+                    params=p, headers=headers, timeout=15
+                )
+                if res2.status_code != 200:
+                    break
+                d = res2.json()
+                all_data += d.get(key, [])
+            return {key: all_data}
+        else:
+            return {"error": res.status_code, "msg": res.text[:200]}
+    except Exception as e:
+        return {"error": str(e)}
 
 
-# ── TDnet セクション呼び出し ─────────────────────────────────────
-render_tdnet_section()
+# ── データ取得関数群 ─────────────────────────────────────────────
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def jq_fetch_stock_bars(code: str, date_from: str, date_to: str) -> pd.DataFrame:
+    """株価四本値（日次）"""
+    d = _jq_get("/equities/bars/daily", {
+        "code": code, "from": date_from, "to": date_to
+    })
+    if not d or "error" in d:
+        return pd.DataFrame()
+    df = pd.DataFrame(d.get("daily_quotes", d.get("data", [])))
+    if df.empty:
+        return df
+    df["Date"] = pd.to_datetime(df.get("Date", df.get("date", "")))
+    return df.sort_values("Date")
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def jq_fetch_topix(date_from: str, date_to: str) -> pd.DataFrame:
+    """TOPIX四本値"""
+    d = _jq_get("/indices/bars/daily/topix", {
+        "date_from": date_from, "date_to": date_to
+    })
+    if not d or "error" in d:
+        return pd.DataFrame()
+    df = pd.DataFrame(d.get("indices", d.get("data", [])))
+    if df.empty:
+        return df
+    df["Date"] = pd.to_datetime(df.get("Date", df.get("date", "")))
+    return df.sort_values("Date")
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def jq_fetch_investor_types(date_from: str, date_to: str) -> pd.DataFrame:
+    """投資部門別情報"""
+    d = _jq_get("/equities/investor-types", {
+        "from": date_from, "to": date_to
+    })
+    if not d or "error" in d:
+        return pd.DataFrame()
+    df = pd.DataFrame(d.get("investor_types", d.get("data", [])))
+    if df.empty:
+        return df
+    df["PublishedDate"] = pd.to_datetime(
+        df.get("PublishedDate", df.get("published_date", ""))
+    )
+    return df.sort_values("PublishedDate")
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def jq_fetch_margin(code: str, date_from: str, date_to: str) -> pd.DataFrame:
+    """信用取引残高"""
+    d = _jq_get("/markets/margin-interest", {
+        "code": code, "from": date_from, "to": date_to
+    })
+    if not d or "error" in d:
+        return pd.DataFrame()
+    df = pd.DataFrame(d.get("margin_interest", d.get("data", [])))
+    if df.empty:
+        return df
+    df["Date"] = pd.to_datetime(df.get("Date", df.get("date", "")))
+    return df.sort_values("Date")
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def jq_fetch_short_ratio(s33: str, date_from: str, date_to: str) -> pd.DataFrame:
+    """業種別空売り比率"""
+    d = _jq_get("/markets/short-ratio", {
+        "s33": s33, "from": date_from, "to": date_to
+    })
+    if not d or "error" in d:
+        return pd.DataFrame()
+    df = pd.DataFrame(d.get("short_ratio", d.get("data", [])))
+    if df.empty:
+        return df
+    df["Date"] = pd.to_datetime(df.get("Date", df.get("date", "")))
+    return df.sort_values("Date")
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def jq_fetch_fins(code: str) -> pd.DataFrame:
+    """財務情報（決算短信）"""
+    d = _jq_get("/fins/summary", {"code": code})
+    if not d or "error" in d:
+        return pd.DataFrame()
+    df = pd.DataFrame(d.get("statements", d.get("data", [])))
+    return df
+
+
+# ── チャート描画ヘルパー ─────────────────────────────────────────
+
+def _plot_candlestick(df: pd.DataFrame, title: str):
+    """簡易ローソク足チャート（matplotlib）"""
+    if df.empty:
+        st.warning("データなし")
+        return
+    open_col  = next((c for c in df.columns if c.lower() in ["open","openingprice"]), None)
+    high_col  = next((c for c in df.columns if c.lower() in ["high","highprice"]), None)
+    low_col   = next((c for c in df.columns if c.lower() in ["low","lowprice"]), None)
+    close_col = next((c for c in df.columns if c.lower() in ["close","closeprice"]), None)
+    if not all([open_col, high_col, low_col, close_col]):
+        st.dataframe(df.tail(30))
+        return
+    fig, ax = plt.subplots(figsize=(12, 4))
+    for _, row in df.tail(60).iterrows():
+        o, h, l, c = row[open_col], row[high_col], row[low_col], row[close_col]
+        color = "#1a7f37" if c >= o else "#d1242f"
+        ax.plot([row["Date"], row["Date"]], [l, h], color=color, linewidth=0.8)
+        ax.bar(row["Date"], abs(c - o), bottom=min(o, c),
+               color=color, alpha=0.85, width=1.2)
+    ax.set_title(title, fontsize=11)
+    ax.set_ylabel("Price")
+    ax.grid(True, alpha=0.25)
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    st.pyplot(fig, clear_figure=True)
+
+
+# ── タブ本体 ─────────────────────────────────────────────────────
+
+with tab_jquants:
+    st.subheader("🏦 J-Quants 需給分析")
+
+    # APIキー確認
+    jq_key = st.secrets.get("JQUANTS_API_KEY", "")
+    if not jq_key:
+        st.error(
+            "⚠️ J-Quants APIキーが未設定です。\n\n"
+            "Streamlit Secrets に `JQUANTS_API_KEY = 'your_key'` を追加してください。\n"
+            "APIキーは [J-Quants Webサイト](https://jpx-jquants.com/) のダッシュボードから取得できます。"
+        )
+        st.stop()
+
+    # ── サイドバー設定 ──────────────────────────────────────────
+    st.sidebar.divider()
+    st.sidebar.markdown("### 🏦 J-Quants 設定")
+    jq_code_input = st.sidebar.text_input(
+        "銘柄コード（4桁）", value="7203", key="jq_code",
+        help="例: 7203（トヨタ）、6758（ソニー）、9984（ソフトバンクG）"
+    )
+    jq_code = jq_code_input.strip().zfill(4)
+    jq_period = st.sidebar.selectbox(
+        "取得期間", ["3ヶ月", "6ヶ月", "1年"], index=1, key="jq_period"
+    )
+    period_days = {"3ヶ月": 90, "6ヶ月": 180, "1年": 365}[jq_period]
+    jq_date_to   = datetime.today().strftime("%Y%m%d")
+    jq_date_from = (datetime.today() - relativedelta(days=period_days)).strftime("%Y%m%d")
+
+    # ── サブタブ ────────────────────────────────────────────────
+    jq_t1, jq_t2, jq_t3, jq_t4, jq_t5 = st.tabs([
+        "📈 株価・TOPIX",
+        "👥 投資部門別",
+        "⚖️ 信用取引残高",
+        "📉 業種別空売り比率",
+        "📋 財務情報",
+    ])
+
+    # ── Tab1: 株価・TOPIX ───────────────────────────────────────
+    with jq_t1:
+        st.markdown(f"#### 銘柄 {jq_code} の株価チャート（J-Quants）")
+        if st.button("▶ 株価・TOPIX取得", key="jq_run_price"):
+            col_p1, col_p2 = st.columns(2)
+            with col_p1:
+                with st.spinner(f"{jq_code} 株価取得中..."):
+                    df_bars = jq_fetch_stock_bars(jq_code, jq_date_from, jq_date_to)
+                if df_bars.empty:
+                    st.warning("株価データを取得できませんでした（銘柄コードまたはプランを確認）")
+                else:
+                    st.caption(f"取得件数: {len(df_bars)}日分")
+                    _plot_candlestick(df_bars, f"{jq_code} 株価（ローソク足）")
+                    with st.expander("生データ"):
+                        st.dataframe(df_bars.tail(20), use_container_width=True)
+            with col_p2:
+                with st.spinner("TOPIX取得中..."):
+                    df_topix = jq_fetch_topix(jq_date_from, jq_date_to)
+                if df_topix.empty:
+                    st.warning("TOPIXデータを取得できませんでした（Lightプラン以上が必要）")
+                else:
+                    close_col = next(
+                        (c for c in df_topix.columns if c.lower() in ["close","closeprice"]), None
+                    )
+                    if close_col:
+                        fig_t, ax_t = plt.subplots(figsize=(6, 4))
+                        ax_t.plot(df_topix["Date"], df_topix[close_col],
+                                  color="#1565c0", linewidth=1.5)
+                        ax_t.fill_between(df_topix["Date"], df_topix[close_col],
+                                          df_topix[close_col].min(),
+                                          alpha=0.1, color="#1565c0")
+                        ax_t.set_title("TOPIX", fontsize=11)
+                        ax_t.set_ylabel("Index")
+                        ax_t.grid(True, alpha=0.25)
+                        plt.xticks(rotation=45)
+                        plt.tight_layout()
+                        st.pyplot(fig_t, clear_figure=True)
+
+    # ── Tab2: 投資部門別 ─────────────────────────────────────────
+    with jq_t2:
+        st.markdown("#### 投資部門別売買動向（外国人・個人・法人）")
+        st.caption("Lightプラン以上が必要です。週次データ（毎週第4営業日更新）")
+        if st.button("▶ 投資部門別データ取得", key="jq_run_investor"):
+            with st.spinner("投資部門別データ取得中..."):
+                df_inv = jq_fetch_investor_types(jq_date_from, jq_date_to)
+            if df_inv.empty:
+                st.warning("データを取得できませんでした")
+            else:
+                st.caption(f"取得件数: {len(df_inv)}件")
+                # セクション（投資家区分）の列を確認
+                section_col = next(
+                    (c for c in df_inv.columns if "section" in c.lower()), None
+                )
+                sell_col = next(
+                    (c for c in df_inv.columns if "sell" in c.lower() or "売" in c), None
+                )
+                buy_col  = next(
+                    (c for c in df_inv.columns if "buy" in c.lower() or "買" in c), None
+                )
+
+                if section_col and buy_col and sell_col:
+                    # 主要部門に絞る
+                    key_sections = ["Foreigners", "Individuals", "Dealers",
+                                    "TrustBanks", "BusinessCo", "外国人", "個人", "法人"]
+                    df_key = df_inv[df_inv[section_col].isin(key_sections)] \
+                        if any(s in df_inv[section_col].values for s in key_sections) \
+                        else df_inv
+
+                    fig_inv, ax_inv = plt.subplots(figsize=(12, 5))
+                    for sec, grp in df_key.groupby(section_col):
+                        net = grp[buy_col].astype(float) - grp[sell_col].astype(float)
+                        ax_inv.plot(grp["PublishedDate"], net,
+                                    label=str(sec), linewidth=1.5, marker="o", markersize=3)
+                    ax_inv.axhline(0, color="gray", linestyle="--", alpha=0.5)
+                    ax_inv.set_title("Investor Type Net Buy/Sell (JPY Bil)", fontsize=11)
+                    ax_inv.set_ylabel("Net (Buy - Sell)")
+                    ax_inv.legend(fontsize=8, loc="upper left")
+                    ax_inv.grid(True, alpha=0.25)
+                    plt.xticks(rotation=45)
+                    plt.tight_layout()
+                    st.pyplot(fig_inv, clear_figure=True)
+                else:
+                    st.dataframe(df_inv, use_container_width=True)
+
+                with st.expander("生データ"):
+                    st.dataframe(df_inv, use_container_width=True)
+
+    # ── Tab3: 信用取引残高 ───────────────────────────────────────
+    with jq_t3:
+        st.markdown(f"#### 銘柄 {jq_code} の信用取引残高")
+        st.caption("Standardプラン以上が必要です。週次データ")
+        if st.button("▶ 信用残高取得", key="jq_run_margin"):
+            with st.spinner("信用取引残高取得中..."):
+                df_mg = jq_fetch_margin(jq_code, jq_date_from, jq_date_to)
+            if df_mg.empty:
+                st.warning("データを取得できませんでした（銘柄コードまたはプランを確認）")
+            else:
+                st.caption(f"取得件数: {len(df_mg)}件")
+                buy_bal  = next((c for c in df_mg.columns if "longmargin" in c.lower() or "信用買" in c), None)
+                sell_bal = next((c for c in df_mg.columns if "shortmargin" in c.lower() or "信用売" in c), None)
+
+                if buy_bal and sell_bal:
+                    fig_mg, ax_mg = plt.subplots(figsize=(12, 4))
+                    ax_mg.plot(df_mg["Date"], df_mg[buy_bal].astype(float),
+                               label="Margin Long (Buy)", color="#1a7f37", linewidth=1.8)
+                    ax_mg.plot(df_mg["Date"], df_mg[sell_bal].astype(float),
+                               label="Margin Short (Sell)", color="#d1242f", linewidth=1.8)
+                    ax_mg.set_title(f"{jq_code} Margin Balance", fontsize=11)
+                    ax_mg.set_ylabel("Shares")
+                    ax_mg.legend()
+                    ax_mg.grid(True, alpha=0.25)
+                    plt.xticks(rotation=45)
+                    plt.tight_layout()
+                    st.pyplot(fig_mg, clear_figure=True)
+
+                    # 信用倍率
+                    ratio = df_mg[buy_bal].astype(float) / (df_mg[sell_bal].astype(float) + 1e-8)
+                    st.metric("最新 信用倍率（買/売）",
+                              f"{ratio.iloc[-1]:.2f}倍",
+                              delta=f"{ratio.iloc[-1] - ratio.iloc[-2]:+.2f}" if len(ratio) > 1 else None)
+                else:
+                    st.dataframe(df_mg, use_container_width=True)
+
+                with st.expander("生データ"):
+                    st.dataframe(df_mg, use_container_width=True)
+
+    # ── Tab4: 業種別空売り比率 ───────────────────────────────────
+    with jq_t4:
+        st.markdown("#### 業種別空売り比率")
+        st.caption("Standardプラン以上が必要です。33業種コードで取得")
+
+        S33_OPTIONS = {
+            "0050 水産・農林": "0050", "1050 鉱業": "1050",
+            "2050 建設": "2050",       "3050 食料品": "3050",
+            "3100 繊維": "3100",       "3150 パルプ・紙": "3150",
+            "3200 化学": "3200",       "3250 医薬品": "3250",
+            "3300 石油": "3300",       "3350 ゴム": "3350",
+            "3400 ガラス・土石": "3400","3450 鉄鋼": "3450",
+            "3500 非鉄": "3500",       "3550 金属製品": "3550",
+            "3600 機械": "3600",       "3650 電気機器": "3650",
+            "3700 輸送用機器": "3700", "3750 精密機器": "3750",
+            "3800 その他製品": "3800", "4050 電気・ガス": "4050",
+            "5050 陸運": "5050",       "5100 海運": "5100",
+            "5150 空運": "5150",       "5200 倉庫・運輸": "5200",
+            "5250 情報・通信": "5250", "6050 卸売": "6050",
+            "6100 小売": "6100",       "7050 銀行": "7050",
+            "7100 証券": "7100",       "7150 保険": "7150",
+            "7200 その他金融": "7200", "8050 不動産": "8050",
+            "9050 サービス": "9050",
+        }
+        selected_s33_label = st.selectbox(
+            "業種コード", list(S33_OPTIONS.keys()), index=22, key="jq_s33"
+        )
+        selected_s33 = S33_OPTIONS[selected_s33_label]
+
+        if st.button("▶ 空売り比率取得", key="jq_run_short"):
+            with st.spinner("業種別空売り比率取得中..."):
+                df_sr = jq_fetch_short_ratio(selected_s33, jq_date_from, jq_date_to)
+            if df_sr.empty:
+                st.warning("データを取得できませんでした")
+            else:
+                ratio_col = next(
+                    (c for c in df_sr.columns if "ratio" in c.lower() or "比率" in c), None
+                )
+                if ratio_col:
+                    fig_sr, ax_sr = plt.subplots(figsize=(12, 4))
+                    ax_sr.plot(df_sr["Date"], df_sr[ratio_col].astype(float) * 100,
+                               color="#7b1fa2", linewidth=1.8)
+                    ax_sr.fill_between(df_sr["Date"], df_sr[ratio_col].astype(float) * 100,
+                                       alpha=0.15, color="#7b1fa2")
+                    ax_sr.set_title(f"Short Selling Ratio - {selected_s33_label} (%)", fontsize=11)
+                    ax_sr.set_ylabel("Short Ratio (%)")
+                    ax_sr.grid(True, alpha=0.25)
+                    plt.xticks(rotation=45)
+                    plt.tight_layout()
+                    st.pyplot(fig_sr, clear_figure=True)
+                    latest = float(df_sr[ratio_col].iloc[-1]) * 100
+                    avg    = float(df_sr[ratio_col].mean()) * 100
+                    col_s1, col_s2 = st.columns(2)
+                    col_s1.metric("最新空売り比率", f"{latest:.1f}%")
+                    col_s2.metric("期間平均", f"{avg:.1f}%",
+                                  delta=f"{latest - avg:+.1f}%")
+                else:
+                    st.dataframe(df_sr, use_container_width=True)
+
+                with st.expander("生データ"):
+                    st.dataframe(df_sr, use_container_width=True)
+
+    # ── Tab5: 財務情報 ───────────────────────────────────────────
+    with jq_t5:
+        st.markdown(f"#### 銘柄 {jq_code} の財務情報（決算短信）")
+        st.caption("Freeプラン以上で利用可能")
+        if st.button("▶ 財務情報取得", key="jq_run_fins"):
+            with st.spinner("財務情報取得中..."):
+                df_fins = jq_fetch_fins(jq_code)
+            if df_fins.empty:
+                st.warning("財務データを取得できませんでした")
+            else:
+                st.caption(f"取得件数: {len(df_fins)}件")
+
+                # 主要財務指標の表示
+                key_cols = [c for c in df_fins.columns if any(k in c.lower() for k in [
+                    "date", "period", "sales", "profit", "income", "eps",
+                    "revenue", "operating", "net", "equity", "asset",
+                    "roe", "roa", "per", "pbr",
+                ])]
+                if key_cols:
+                    st.dataframe(
+                        df_fins[key_cols].tail(8),
+                        use_container_width=True
+                    )
+                else:
+                    st.dataframe(df_fins.tail(8), use_container_width=True)
+
+                # AI財務コメント
+                if st.checkbox("🤖 AIによる財務分析", value=False, key="jq_ai_fins"):
+                    fins_str = df_fins.tail(4).to_string(index=False)
+                    prompt_fins = (
+                        f"以下は銘柄コード {jq_code} の直近4四半期の財務情報です。\n\n"
+                        f"{fins_str}\n\n"
+                        "投資家向けに300文字以内で財務状況を分析してください:\n"
+                        "1. 売上・利益のトレンド\n"
+                        "2. 財務健全性\n"
+                        "3. 注目すべき変化点\n"
+                    )
+                    with st.spinner("AI財務分析中..."):
+                        try:
+                            comment, ai_name = generate_ai_comment(prompt_fins)
+                            st.info(f"🤖 **AI財務分析（{ai_name}）**\n\n{comment}")
+                        except Exception as e:
+                            st.warning(f"AI APIエラー: {e}")
+
+                with st.expander("全データ"):
+                    st.dataframe(df_fins, use_container_width=True)
