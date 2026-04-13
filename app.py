@@ -1170,17 +1170,25 @@ ticker_name_map = {
 # ================================================================
 @st.cache_data(ttl=3600)
 def get_price(ticker, start, end):
-    df = yf.download(ticker, start=start, end=end, progress=False)
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.droplevel(1)
-    return df
+    try:
+        df = yf.download(ticker, start=start, end=end, progress=False, threads=False)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.droplevel(1)
+        return df
+    except Exception as e:
+        print(f"get_price error ({ticker}): {e}")
+        return pd.DataFrame()
 
 @st.cache_data(ttl=3600)
 def get_benchmark(start, end):
-    df = yf.download("^N225", start=start, end=end, progress=False)
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.droplevel(1)
-    return df
+    try:
+        df = yf.download("^N225", start=start, end=end, progress=False, threads=False)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.droplevel(1)
+        return df
+    except Exception as e:
+        print(f"get_benchmark error: {e}")
+        return pd.DataFrame()
 
 
 # ================================================================
