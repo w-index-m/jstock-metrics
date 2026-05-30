@@ -1375,6 +1375,281 @@ if True:  # 自動実行
             st.warning(f"AI APIエラー: {e}")
 
 
+# ─────────────────────────────────────────────────────────────────
+st.header("🎯 アルファ・ベータ分析")
+st.divider()
+st.caption(
+    "**α（アルファ）**= 市場平均を超えた銘柄固有の超過リターン。"
+    "**β（ベータ）**= 市場との連動性。"
+    "理想は「高α × 低β」＝市場に左右されず独自に稼ぐ銘柄。"
+)
+
+# df_results が存在するときのみ表示
+try:
+    _ab_ok = not df_results.empty
+except Exception:
+    _ab_ok = False
+
+if not _ab_ok:
+    st.info("パフォーマンス分析を先に実行してください（上のセクションで自動実行されます）")
+else:
+    # ── アルファ計算 ───────────────────────────────────────────────
+    # 市場年間リターン（日経225）
+    _bench_close2 = _to_series(benchmark["Close"])
+    _market_annual = float(
+        (_bench_close2.iloc[-1] - _bench_close2.iloc[0]) / _bench_close2.iloc[0]
+    )
+    df_ab = df_results.copy()
+    # α = 年間リターン - β × 市場年間リターン
+    df_ab["アルファ(%)"] = (
+        df_ab["年間平均リターン(%)"] / 100
+        - df_ab["ベータ"] * _market_annual
+    ) * 100
+    df_ab["アルファ(%)"] = df_ab["アルファ(%)"].round(2)
+
+    # ── メトリクス ────────────────────────────────────────────────
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("高アルファ銘柄数（α>0）",
+              f"{(df_ab['アルファ(%)'] > 0).sum()}社")
+    m2.metric("平均アルファ",
+              f"{df_ab['アルファ(%)'].mean():.2f}%")
+    m3.metric("最大アルファ",
+              f"{df_ab['アルファ(%)'].max():.2f}%",
+              df_ab.loc[df_ab['アルファ(%)'].idxmax(), '企業名'])
+    m4.metric("低β高α銘柄数（β<1 & α>0）",
+              f"{((df_ab['ベータ'] < 1) & (df_ab['アルファ(%)'] > 0)).sum()}社")
+
+    st.divider()
+
+    ab_t1, ab_t2, ab_t3 = st.tabs([
+        "🏆 高アルファランキング",
+        "🔵 α vs β 散布図",
+        "💎 低β・高α スクリーナー",
+    ])
+
+    # ── Tab1: 高アルファランキング ───────────────────────────────
+    with ab_t1:
+        st.markdown("#### 🏆 アルファランキング（市場超過リターン上位）")
+        st.caption("αが高い = 日経平均の動きに関係なく独自に上昇している銘柄")
+
+        top_alpha = df_ab.sort_values("アルファ(%)", ascending=False).head(30)
+        bot_alpha = df_ab.sort_values("アルファ(%)", ascending=True).head(10)
+
+        col_a1, col_a2 = st.columns([2, 1])
+        with col_a1:
+            st.markdown("**上位30銘柄（高アルファ）**")
+            def _color_alpha(val):
+                if isinstance(val, float):
+                    if val > 5:  return "background:#1a7f37;color:white;font-weight:bold"
+                    elif val > 0: return "color:#1a7f37;font-weight:bold"
+                    elif val < 0: return "color:#d1242f"
+                return ""
+            st.dataframe(
+                top_alpha[["企業名","業種","アルファ(%)","ベータ",
+                            "年間平均リターン(%)","シャープレシオ"]]
+                .style
+                .format({"アルファ(%)":"{:+.2f}","ベータ":"{:.2f}",
+                         "年間平均リターン(%)":"{:.2f}","シャープレシオ":"{:.2f}"})
+                .map(_color_alpha, subset=["アルファ(%)"]),
+                use_container_width=True, hide_index=True
+            )
+        with col_a2:
+            st.markdown("**下位10銘柄（低アルファ・市場負け）**")
+            st.dataframe(
+                bot_alpha[["企業名","業種","アルファ(%)","ベータ"]]
+                .style
+                .format({"アルファ(%)":"{:+.2f}","ベータ":"{:.2f}"})
+                .map(_color_alpha, subset=["アルファ(%)"]),
+                use_container_width=True, hide_index=True
+            )
+
+        # アルファ棒グラフ
+        fig_alpha, ax_alpha = plt.subplots(figsize=(14, 6))
+        top20 = df_ab.sort_values("アルファ(%)", ascending=False).head(20)
+        colors_a = ["#1a7f37" if v >= 0 else "#d1242f" for v in top20["アルファ(%)"]]
+        ax_alpha.bar(top20["企業名"], top20["アルファ(%)"],
+                     color=colors_a, alpha=0.85)
+        ax_alpha.axhline(0, color="black", linewidth=0.8)
+        ax_alpha.set_title("アルファ上位20銘柄（年間・市場超過リターン）",
+                            fontsize=12, fontweight="bold")
+        ax_alpha.set_ylabel("アルファ (%)")
+        ax_alpha.tick_params(axis="x", rotation=45, labelsize=9)
+        ax_alpha.grid(True, axis="y", alpha=0.3)
+        plt.tight_layout()
+        st.pyplot(fig_alpha, clear_figure=True)
+
+    # ── Tab2: α vs β 散布図 ─────────────────────────────────────
+    with ab_t2:
+        st.markdown("#### 🔵 アルファ vs ベータ 散布図（全銘柄）")
+        st.caption(
+            "**右上**（高β・高α）= 積極的成長株 | "
+            "**左上**（低β・高α）= 理想的な優良株 | "
+            "**右下**（高β・低α）= 市場連動だが割高 | "
+            "**左下**（低β・低α）= 市場負け・ディフェンシブ"
+        )
+
+        sectors_ab = df_ab["業種"].unique()
+        cmap_ab = plt.cm.get_cmap("tab20", len(sectors_ab))
+        sec_color_ab = {s: cmap_ab(i) for i, s in enumerate(sectors_ab)}
+
+        fig_ab, ax_ab = plt.subplots(figsize=(14, 9))
+
+        for sec in sectors_ab:
+            sub = df_ab[df_ab["業種"] == sec]
+            ax_ab.scatter(
+                sub["ベータ"], sub["アルファ(%)"],
+                label=sec, color=sec_color_ab[sec],
+                s=70, alpha=0.8, zorder=3
+            )
+            # 注目銘柄にラベル
+            for _, row in sub.iterrows():
+                if row["アルファ(%)"] > df_ab["アルファ(%)"].quantile(0.85) or \
+                   row["アルファ(%)"] < df_ab["アルファ(%)"].quantile(0.10):
+                    ax_ab.annotate(
+                        row["企業名"],
+                        (row["ベータ"], row["アルファ(%)"]),
+                        fontsize=7, alpha=0.9,
+                        xytext=(4, 4), textcoords="offset points",
+                    )
+
+        # 軸線
+        ax_ab.axhline(0, color="gray", linewidth=0.8, linestyle="--", zorder=2)
+        ax_ab.axvline(1, color="orange", linewidth=1.0,
+                      linestyle="--", alpha=0.6, zorder=2, label="β=1（市場平均）")
+
+        # 象限ラベル
+        x_lim = ax_ab.get_xlim()
+        y_lim = ax_ab.get_ylim()
+        ax_ab.text(0.3, df_ab["アルファ(%)"].max() * 0.8,
+                   "低β・高α\n💎 理想優良株",
+                   color="#1a7f37", fontsize=10, fontweight="bold", ha="center",
+                   bbox=dict(boxstyle="round,pad=0.3", facecolor="#e8f5e9", alpha=0.8))
+        ax_ab.text(1.5, df_ab["アルファ(%)"].max() * 0.8,
+                   "高β・高α\n🚀 積極成長株",
+                   color="#1565c0", fontsize=10, fontweight="bold", ha="center",
+                   bbox=dict(boxstyle="round,pad=0.3", facecolor="#e3f2fd", alpha=0.8))
+        ax_ab.text(0.3, df_ab["アルファ(%)"].min() * 0.8,
+                   "低β・低α\n😴 市場負け",
+                   color="#9e9e9e", fontsize=10, fontweight="bold", ha="center",
+                   bbox=dict(boxstyle="round,pad=0.3", facecolor="#f5f5f5", alpha=0.8))
+        ax_ab.text(1.5, df_ab["アルファ(%)"].min() * 0.8,
+                   "高β・低α\n⚠️ 市場連動・割高",
+                   color="#d1242f", fontsize=10, fontweight="bold", ha="center",
+                   bbox=dict(boxstyle="round,pad=0.3", facecolor="#ffebee", alpha=0.8))
+
+        ax_ab.set_xlabel("ベータ（β）― 市場連動性", fontsize=12)
+        ax_ab.set_ylabel("アルファ（α）(%) ― 市場超過リターン", fontsize=12)
+        ax_ab.set_title("アルファ vs ベータ 分析マップ", fontsize=13, fontweight="bold")
+        ax_ab.legend(bbox_to_anchor=(1.01, 1), loc="upper left",
+                     fontsize=8, framealpha=0.9, ncol=1)
+        ax_ab.grid(True, alpha=0.2, zorder=1)
+        ax_ab.spines["top"].set_visible(False)
+        ax_ab.spines["right"].set_visible(False)
+        plt.tight_layout()
+        st.pyplot(fig_ab, clear_figure=True)
+
+    # ── Tab3: 低β・高α スクリーナー ────────────────────────────
+    with ab_t3:
+        st.markdown("#### 💎 低ベータ・高アルファ スクリーナー")
+        st.caption("市場リスクを抑えながら超過リターンを稼いでいる銘柄を抽出")
+
+        col_s1, col_s2, col_s3 = st.columns(3)
+        with col_s1:
+            beta_max  = st.slider("最大β（低いほど市場影響小）",
+                                  0.3, 2.0, 1.0, 0.1, key="ab_beta_max")
+        with col_s2:
+            alpha_min = st.slider("最小α（%）（高いほど超過収益大）",
+                                  -10.0, 30.0, 0.0, 0.5, key="ab_alpha_min")
+        with col_s3:
+            sharpe_min = st.slider("最小シャープレシオ",
+                                   0.0, 3.0, 0.5, 0.1, key="ab_sharpe_min")
+
+        df_screen = df_ab[
+            (df_ab["ベータ"] <= beta_max) &
+            (df_ab["アルファ(%)"] >= alpha_min) &
+            (df_ab["シャープレシオ"] >= sharpe_min)
+        ].sort_values("アルファ(%)", ascending=False)
+
+        st.markdown(f"**{len(df_screen)}銘柄が条件を満たしています**"
+                    f"（β≤{beta_max} & α≥{alpha_min}% & SR≥{sharpe_min}）")
+
+        if df_screen.empty:
+            st.info("条件を緩めてみてください")
+        else:
+            # スコア計算（α/β比）
+            df_screen = df_screen.copy()
+            df_screen["α/β比"] = (
+                df_screen["アルファ(%)"] / (df_screen["ベータ"].abs() + 0.01)
+            ).round(2)
+
+            disp_cols = ["企業名", "業種", "アルファ(%)", "ベータ",
+                         "α/β比", "シャープレシオ", "年間平均リターン(%)", "年間リスク(%)"]
+
+            def _color_score(val):
+                if isinstance(val, float):
+                    if val > 10: return "background:#1a7f37;color:white;font-weight:bold"
+                    elif val > 5: return "color:#1a7f37;font-weight:bold"
+                    elif val > 0: return "color:#388e3c"
+                return ""
+
+            st.dataframe(
+                df_screen[disp_cols].style
+                .format({
+                    "アルファ(%)": "{:+.2f}",
+                    "ベータ": "{:.2f}",
+                    "α/β比": "{:.2f}",
+                    "シャープレシオ": "{:.2f}",
+                    "年間平均リターン(%)": "{:.2f}",
+                    "年間リスク(%)": "{:.2f}",
+                })
+                .map(_color_score, subset=["α/β比"]),
+                use_container_width=True, hide_index=True
+            )
+
+            # CSVダウンロード
+            csv_ab = df_screen[disp_cols].to_csv(index=False, encoding="utf-8-sig")
+            st.download_button(
+                "⬇️ スクリーニング結果をCSVダウンロード",
+                data=csv_ab,
+                file_name=f"alpha_beta_screen_{datetime.today().strftime('%Y%m%d')}.csv",
+                mime="text/csv",
+                key="ab_dl"
+            )
+
+            # バブルチャート（サイズ=シャープレシオ）
+            fig_sc, ax_sc = plt.subplots(figsize=(12, 7))
+            sc = ax_sc.scatter(
+                df_screen["ベータ"],
+                df_screen["アルファ(%)"],
+                s=df_screen["シャープレシオ"].clip(lower=0.1) * 200,
+                c=df_screen["α/β比"],
+                cmap="YlGn",
+                alpha=0.8, edgecolors="gray", linewidth=0.5, zorder=3
+            )
+            for _, row in df_screen.head(20).iterrows():
+                ax_sc.annotate(
+                    row["企業名"],
+                    (row["ベータ"], row["アルファ(%)"]),
+                    fontsize=8,
+                    xytext=(5, 5), textcoords="offset points",
+                )
+            plt.colorbar(sc, ax=ax_sc, label="α/β比")
+            ax_sc.axhline(0, color="gray", linewidth=0.8, linestyle="--")
+            ax_sc.axvline(1, color="orange", linewidth=0.8,
+                          linestyle="--", alpha=0.6)
+            ax_sc.set_xlabel("ベータ（β）", fontsize=12)
+            ax_sc.set_ylabel("アルファ（α）(%)", fontsize=12)
+            ax_sc.set_title(
+                "低β・高α スクリーニング結果\n（バブルサイズ = シャープレシオ、色 = α/β比）",
+                fontsize=12, fontweight="bold"
+            )
+            ax_sc.grid(True, alpha=0.2)
+            ax_sc.spines["top"].set_visible(False)
+            ax_sc.spines["right"].set_visible(False)
+            plt.tight_layout()
+            st.pyplot(fig_sc, clear_figure=True)
+
+
 # ─── Tab2: セクターローテーション ────────────────────────────────
 
 # ─────────────────────────────────────────────────────────────────
