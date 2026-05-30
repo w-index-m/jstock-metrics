@@ -1214,6 +1214,12 @@ def get_benchmark(start, end):
 # メインタブ
 # ================================================================
 
+# ================================================================
+# デフォルトパラメータで事前計算（自動実行用）
+# ================================================================
+end_date   = datetime.today()
+start_date = end_date - relativedelta(years=3)  # デフォルト3年
+
 tab_analysis, tab_sector, tab_volume, tab_price, tab_unique, tab_news, tab_market_news, tab_jquants = st.tabs([
     "📊 パフォーマンス分析",
     "🔄 セクターローテーション",
