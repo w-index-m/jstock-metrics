@@ -1313,11 +1313,16 @@ if True:  # 自動実行
             except Exception:
                 beta = 0.0
             sharpe = (annual_return - risk_free_rate) / annual_vol
+            # α = 銘柄年間リターン - β × 市場年間リターン
+            market_annual_ret = float(y.mean() * 252)
+            alpha = (annual_return - beta * market_annual_ret) * 100
             results.append({
                 "企業名": name, "業種": sector,
                 "年間平均リターン(%)": annual_return * 100,
                 "年間リスク(%)": annual_vol * 100,
-                "シャープレシオ": sharpe, "ベータ": beta,
+                "シャープレシオ": sharpe,
+                "ベータ": beta,
+                "アルファ(%)": round(alpha, 2),
             })
 
         progress.empty()
@@ -1330,13 +1335,22 @@ if True:  # 自動実行
             df_results = df_results.sort_values("シャープレシオ", ascending=False)
 
             st.subheader("📋 分析結果一覧")
+
+            def _color_alpha_cell(val):
+                if isinstance(val, float):
+                    if val > 5:  return "color:#1a7f37;font-weight:bold"
+                    elif val > 0: return "color:#388e3c"
+                    elif val < 0: return "color:#d1242f"
+                return ""
+
             st.dataframe(
                 df_results.style.format({
                     "年間平均リターン(%)": "{:.2f}",
                     "年間リスク(%)": "{:.2f}",
                     "シャープレシオ": "{:.2f}",
                     "ベータ": "{:.2f}",
-                }),
+                    "アルファ(%)": "{:+.2f}",
+                }).map(_color_alpha_cell, subset=["アルファ(%)"]),
                 use_container_width=True,
             )
 
@@ -1393,19 +1407,19 @@ except Exception:
 if not _ab_ok:
     st.info("パフォーマンス分析を先に実行してください（上のセクションで自動実行されます）")
 else:
-    # ── アルファ計算 ───────────────────────────────────────────────
-    # 市場年間リターン（日経225）
-    _bench_close2 = _to_series(benchmark["Close"])
-    _market_annual = float(
-        (_bench_close2.iloc[-1] - _bench_close2.iloc[0]) / _bench_close2.iloc[0]
-    )
+    # ── アルファ計算（df_resultsに既に含まれている）────────────────
     df_ab = df_results.copy()
-    # α = 年間リターン - β × 市場年間リターン
-    df_ab["アルファ(%)"] = (
-        df_ab["年間平均リターン(%)"] / 100
-        - df_ab["ベータ"] * _market_annual
-    ) * 100
-    df_ab["アルファ(%)"] = df_ab["アルファ(%)"].round(2)
+    # アルファ列が無い場合のみ計算（念のため）
+    if "アルファ(%)" not in df_ab.columns:
+        _bench_close2 = _to_series(benchmark["Close"])
+        _market_annual = float(
+            (_bench_close2.iloc[-1] - _bench_close2.iloc[0]) / _bench_close2.iloc[0]
+        )
+        df_ab["アルファ(%)"] = (
+            df_ab["年間平均リターン(%)"] / 100
+            - df_ab["ベータ"] * _market_annual
+        ) * 100
+        df_ab["アルファ(%)"] = df_ab["アルファ(%)"].round(2)
 
     # ── メトリクス ────────────────────────────────────────────────
     m1, m2, m3, m4 = st.columns(4)
