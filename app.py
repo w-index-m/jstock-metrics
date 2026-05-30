@@ -44,7 +44,7 @@ plt.rcParams["axes.unicode_minus"] = False
 # 定数
 # -----------------------------
 GEMINI_MODEL = "gemini-2.5-pro"
-GROQ_MODEL = "llama-3.3-8b-instant"
+GROQ_MODEL = "llama-3.1-8b-instant"
 
 # -----------------------------
 # ページ設定
@@ -504,18 +504,20 @@ def plot_sector_bar(df_sector: pd.DataFrame, title: str) -> plt.Figure:
 
 
 def plot_sector_timeseries(df_ts: pd.DataFrame, top_sectors: list, bottom_sectors: list) -> plt.Figure:
-    fig, axes = plt.subplots(1, 2, figsize=(16, 5))
+    fig, axes = plt.subplots(1, 2, figsize=(20, 7))
     ax = axes[0]
     cmap = plt.cm.get_cmap("Greens", len(top_sectors) + 2)
     for i, sec in enumerate(top_sectors):
         if sec in df_ts.columns:
             series = df_ts[sec].dropna()
-            ax.plot(series.index, series - 100, label=sec, color=cmap(i + 2), linewidth=1.8)
+            ax.plot(series.index, series - 100, label=sec, color=cmap(i + 2), linewidth=2.2)
     ax.axhline(0, color="gray", linewidth=0.7, linestyle="--")
-    ax.set_title("買われているセクター（累積リターン）", fontsize=11, fontweight="bold")
-    ax.set_ylabel("累積リターン (%)")
-    ax.legend(fontsize=8, loc="upper left")
-    ax.tick_params(axis="x", rotation=30)
+    ax.set_title("買われているセクター（累積リターン）", fontsize=14, fontweight="bold", pad=12)
+    ax.set_ylabel("累積リターン (%)", fontsize=12)
+    ax.legend(fontsize=12, loc="upper left", framealpha=0.9,
+              bbox_to_anchor=(0, 1), borderaxespad=0)
+    ax.tick_params(axis="x", rotation=30, labelsize=11)
+    ax.tick_params(axis="y", labelsize=11)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
     ax = axes[1]
@@ -523,15 +525,17 @@ def plot_sector_timeseries(df_ts: pd.DataFrame, top_sectors: list, bottom_sector
     for i, sec in enumerate(bottom_sectors):
         if sec in df_ts.columns:
             series = df_ts[sec].dropna()
-            ax.plot(series.index, series - 100, label=sec, color=cmap2(i + 2), linewidth=1.8)
+            ax.plot(series.index, series - 100, label=sec, color=cmap2(i + 2), linewidth=2.2)
     ax.axhline(0, color="gray", linewidth=0.7, linestyle="--")
-    ax.set_title("売られているセクター（累積リターン）", fontsize=11, fontweight="bold")
-    ax.set_ylabel("累積リターン (%)")
-    ax.legend(fontsize=8, loc="upper left")
-    ax.tick_params(axis="x", rotation=30)
+    ax.set_title("売られているセクター（累積リターン）", fontsize=14, fontweight="bold", pad=12)
+    ax.set_ylabel("累積リターン (%)", fontsize=12)
+    ax.legend(fontsize=12, loc="upper left", framealpha=0.9,
+              bbox_to_anchor=(0, 1), borderaxespad=0)
+    ax.tick_params(axis="x", rotation=30, labelsize=11)
+    ax.tick_params(axis="y", labelsize=11)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
-    plt.tight_layout()
+    plt.tight_layout(pad=2.0)
     return fig
 
 
@@ -539,21 +543,39 @@ def plot_sector_heatmap(df_multi: pd.DataFrame) -> plt.Figure:
     df_heat = df_multi.set_index("業種")[["1週間", "1ヶ月", "3ヶ月"]]
     df_heat = df_heat.sort_values("1ヶ月", ascending=False)
     vmax = max(abs(df_heat.values.max()), abs(df_heat.values.min()), 3)
-    fig, ax = plt.subplots(figsize=(9, max(6, len(df_heat) * 0.42)))
+    fig, ax = plt.subplots(figsize=(10, max(7, len(df_heat) * 0.48)))
     im = ax.imshow(df_heat.values, cmap="RdYlGn", aspect="auto", vmin=-vmax, vmax=vmax)
+
+    # ── 上部ラベル（通常のxticks）
     ax.set_xticks(range(len(df_heat.columns)))
-    ax.set_xticklabels(df_heat.columns, fontsize=10)
+    ax.set_xticklabels(df_heat.columns, fontsize=12, fontweight="bold")
+    ax.tick_params(axis="x", which="both", top=False, bottom=True,
+                   labeltop=False, labelbottom=True, labelsize=12, pad=6)
+
+    # ── 下部ラベル（ax2xaxisで上部にも表示）
+    ax2 = ax.twiny()
+    ax2.set_xlim(ax.get_xlim())
+    ax2.set_xticks(range(len(df_heat.columns)))
+    ax2.set_xticklabels(df_heat.columns, fontsize=12, fontweight="bold")
+    ax2.tick_params(axis="x", which="both", top=True, bottom=False,
+                    labeltop=True, labelbottom=False, labelsize=12, pad=6)
+
+    # ── Y軸（業種名）
     ax.set_yticks(range(len(df_heat.index)))
-    ax.set_yticklabels(df_heat.index, fontsize=9)
+    ax.set_yticklabels(df_heat.index, fontsize=10)
+
+    # ── セル内テキスト
     for i in range(len(df_heat.index)):
         for j in range(len(df_heat.columns)):
             val = df_heat.values[i, j]
             color = "white" if abs(val) > vmax * 0.6 else "black"
             ax.text(j, i, f"{val:+.1f}%", ha="center", va="center",
-                    fontsize=8, color=color, fontweight="bold")
+                    fontsize=9, color=color, fontweight="bold")
+
     plt.colorbar(im, ax=ax, label="リターン (%)", shrink=0.8)
-    ax.set_title("セクター別リターン ヒートマップ（期間比較）", fontsize=12, fontweight="bold", pad=12)
-    plt.tight_layout()
+    ax.set_title("セクター別リターン ヒートマップ（期間比較）",
+                 fontsize=13, fontweight="bold", pad=36)
+    plt.tight_layout(pad=2.0)
     return fig
 
 
@@ -656,50 +678,76 @@ def get_price_volume_scatter(ticker_name_map: dict, days: int = 20) -> pd.DataFr
 
 
 def plot_pv_scatter(df: pd.DataFrame) -> None:
-    """Price x Volume 散布図（Plotly・ホバーで銘柄名表示）"""
-    import plotly.express as px
+    """Price x Volume 散布図（matplotlib・セクター別色分け）"""
+    if df.empty:
+        st.warning("データなし")
+        return
 
+    sectors = df["業種"].unique()
+    cmap = plt.cm.get_cmap("tab20", len(sectors))
+    sector_color = {sec: cmap(i) for i, sec in enumerate(sectors)}
+
+    fig, ax = plt.subplots(figsize=(14, 8))
+
+    for sec in sectors:
+        sub = df[df["業種"] == sec]
+        ax.scatter(
+            sub["出来高変化率(%)"],
+            sub["株価騰落率(%)"],
+            label=sec,
+            color=sector_color[sec],
+            s=60, alpha=0.8, zorder=3,
+        )
+        # 銘柄名ラベル（上位・下位のみ）
+        for _, row in sub.iterrows():
+            if abs(row["株価騰落率(%)"]) > df["株価騰落率(%)"].std() * 1.2 or \
+               abs(row["出来高変化率(%)"]) > df["出来高変化率(%)"].std() * 1.2:
+                ax.annotate(
+                    row["企業名"],
+                    (row["出来高変化率(%)"], row["株価騰落率(%)"]),
+                    fontsize=7, alpha=0.85,
+                    xytext=(4, 4), textcoords="offset points",
+                )
+
+    # 軸線
+    ax.axhline(0, color="gray", linewidth=0.8, linestyle="--", zorder=2)
+    ax.axvline(0, color="gray", linewidth=0.8, linestyle="--", zorder=2)
+
+    # 4象限ラベル
     x_max = df["出来高変化率(%)"].max()
     x_min = df["出来高変化率(%)"].min()
     y_max = df["株価騰落率(%)"].max()
     y_min = df["株価騰落率(%)"].min()
 
-    fig = px.scatter(
-        df,
-        x="出来高変化率(%)",
-        y="株価騰落率(%)",
-        color="業種",
-        hover_name="企業名",
-        hover_data={
-            "業種": True,
-            "株価騰落率(%)": ":.2f",
-            "出来高変化率(%)": ":.2f",
-        },
-        title="Price x Volume マップ（セクター別）― ホバーで銘柄名表示",
-        height=600,
+    ax.text(x_max * 0.65, y_max * 0.85, "株高+出来高増\n（本命上昇）",
+            color="#388e3c", fontsize=10, fontweight="bold",
+            ha="center", va="center",
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="#e8f5e9", alpha=0.7))
+    ax.text(x_min * 0.65, y_max * 0.85, "株高+出来高減\n（戻り弱い）",
+            color="#f57c00", fontsize=10, fontweight="bold",
+            ha="center", va="center",
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="#fff3e0", alpha=0.7))
+    ax.text(x_max * 0.65, y_min * 0.85, "株安+出来高増\n（売り圧力）",
+            color="#d32f2f", fontsize=10, fontweight="bold",
+            ha="center", va="center",
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="#ffebee", alpha=0.7))
+    ax.text(x_min * 0.65, y_min * 0.85, "株安+出来高減\n（静かな下落）",
+            color="#9e9e9e", fontsize=10, fontweight="bold",
+            ha="center", va="center",
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="#f5f5f5", alpha=0.7))
+
+    ax.set_xlabel("出来高変化率 (%)", fontsize=12)
+    ax.set_ylabel("株価騰落率 (%)", fontsize=12)
+    ax.set_title("Price x Volume マップ（セクター別）", fontsize=13, fontweight="bold")
+    ax.legend(
+        bbox_to_anchor=(1.01, 1), loc="upper left",
+        fontsize=9, framealpha=0.9, ncol=1,
     )
-
-    fig.add_hline(y=0, line_dash="dash", line_color="gray", line_width=1)
-    fig.add_vline(x=0, line_dash="dash", line_color="gray", line_width=1)
-
-    fig.update_layout(
-        annotations=[
-            dict(x=x_max * 0.7, y=y_max * 0.85, text="株高+出来高増<br>（本命上昇）",
-                 showarrow=False, font=dict(color="#388e3c", size=11)),
-            dict(x=x_min * 0.7, y=y_max * 0.85, text="株高+出来高減<br>（戻り弱い）",
-                 showarrow=False, font=dict(color="#f57c00", size=11)),
-            dict(x=x_max * 0.7, y=y_min * 0.85, text="株安+出来高増<br>（売り圧力）",
-                 showarrow=False, font=dict(color="#d32f2f", size=11)),
-            dict(x=x_min * 0.7, y=y_min * 0.85, text="株安+出来高減<br>（静かな下落）",
-                 showarrow=False, font=dict(color="#9e9e9e", size=11)),
-        ],
-        xaxis_title="出来高変化率 (%)",
-        yaxis_title="株価騰落率 (%)",
-        legend=dict(orientation="v", x=1.02, y=1, font=dict(size=10)),
-        margin=dict(r=150),
-    )
-
-    st.plotly_chart(fig, use_container_width=True)
+    ax.grid(True, alpha=0.2, zorder=1)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    plt.tight_layout()
+    st.pyplot(fig, clear_figure=True)
 
 
 # ================================================================
