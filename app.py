@@ -678,76 +678,113 @@ def get_price_volume_scatter(ticker_name_map: dict, days: int = 20) -> pd.DataFr
 
 
 def plot_pv_scatter(df: pd.DataFrame) -> None:
-    """Price x Volume 散布図（matplotlib・セクター別色分け）"""
+    """Price x Volume 散布図（Plotly・ホバーで銘柄名・数値表示）"""
     if df.empty:
         st.warning("データなし")
         return
 
-    sectors = df["業種"].unique()
-    cmap = plt.cm.get_cmap("tab20", len(sectors))
-    sector_color = {sec: cmap(i) for i, sec in enumerate(sectors)}
+    try:
+        import plotly.graph_objects as go
+        import plotly.express as px
 
-    fig, ax = plt.subplots(figsize=(14, 8))
+        x_max = df["出来高変化率(%)"].max()
+        x_min = df["出来高変化率(%)"].min()
+        y_max = df["株価騰落率(%)"].max()
+        y_min = df["株価騰落率(%)"].min()
 
-    for sec in sectors:
-        sub = df[df["業種"] == sec]
-        ax.scatter(
-            sub["出来高変化率(%)"],
-            sub["株価騰落率(%)"],
-            label=sec,
-            color=sector_color[sec],
-            s=60, alpha=0.8, zorder=3,
+        fig = px.scatter(
+            df,
+            x="出来高変化率(%)",
+            y="株価騰落率(%)",
+            color="業種",
+            hover_name="企業名",
+            hover_data={
+                "業種": True,
+                "株価騰落率(%)":  ":.2f",
+                "出来高変化率(%)": ":.2f",
+            },
+            title="Price x Volume マップ（セクター別）― ホバーで銘柄名・数値表示",
+            height=650,
+            color_discrete_sequence=px.colors.qualitative.Tab20,
         )
-        # 銘柄名ラベル（上位・下位のみ）
-        for _, row in sub.iterrows():
-            if abs(row["株価騰落率(%)"]) > df["株価騰落率(%)"].std() * 1.2 or \
-               abs(row["出来高変化率(%)"]) > df["出来高変化率(%)"].std() * 1.2:
-                ax.annotate(
-                    row["企業名"],
-                    (row["出来高変化率(%)"], row["株価騰落率(%)"]),
-                    fontsize=7, alpha=0.85,
-                    xytext=(4, 4), textcoords="offset points",
-                )
 
-    # 軸線
-    ax.axhline(0, color="gray", linewidth=0.8, linestyle="--", zorder=2)
-    ax.axvline(0, color="gray", linewidth=0.8, linestyle="--", zorder=2)
+        # 軸線
+        fig.add_hline(y=0, line_dash="dash", line_color="gray",
+                      line_width=1, opacity=0.6)
+        fig.add_vline(x=0, line_dash="dash", line_color="gray",
+                      line_width=1, opacity=0.6)
 
-    # 4象限ラベル
-    x_max = df["出来高変化率(%)"].max()
-    x_min = df["出来高変化率(%)"].min()
-    y_max = df["株価騰落率(%)"].max()
-    y_min = df["株価騰落率(%)"].min()
+        # 4象限ラベル
+        quad_labels = [
+            (x_max * 0.65, y_max * 0.85, "株高+出来高増<br>（本命上昇）",    "#388e3c", "rgba(232,245,233,0.85)"),
+            (x_min * 0.65, y_max * 0.85, "株高+出来高減<br>（戻り弱い）",    "#f57c00", "rgba(255,243,224,0.85)"),
+            (x_max * 0.65, y_min * 0.85, "株安+出来高増<br>（売り圧力）",    "#d32f2f", "rgba(255,235,238,0.85)"),
+            (x_min * 0.65, y_min * 0.85, "株安+出来高減<br>（静かな下落）",  "#9e9e9e", "rgba(245,245,245,0.85)"),
+        ]
+        for x, y, text, color, bgcolor in quad_labels:
+            fig.add_annotation(
+                x=x, y=y, text=text,
+                showarrow=False,
+                font=dict(color=color, size=12, family="Arial"),
+                bgcolor=bgcolor,
+                bordercolor=color,
+                borderwidth=1,
+                borderpad=6,
+            )
 
-    ax.text(x_max * 0.65, y_max * 0.85, "株高+出来高増\n（本命上昇）",
-            color="#388e3c", fontsize=10, fontweight="bold",
-            ha="center", va="center",
-            bbox=dict(boxstyle="round,pad=0.3", facecolor="#e8f5e9", alpha=0.7))
-    ax.text(x_min * 0.65, y_max * 0.85, "株高+出来高減\n（戻り弱い）",
-            color="#f57c00", fontsize=10, fontweight="bold",
-            ha="center", va="center",
-            bbox=dict(boxstyle="round,pad=0.3", facecolor="#fff3e0", alpha=0.7))
-    ax.text(x_max * 0.65, y_min * 0.85, "株安+出来高増\n（売り圧力）",
-            color="#d32f2f", fontsize=10, fontweight="bold",
-            ha="center", va="center",
-            bbox=dict(boxstyle="round,pad=0.3", facecolor="#ffebee", alpha=0.7))
-    ax.text(x_min * 0.65, y_min * 0.85, "株安+出来高減\n（静かな下落）",
-            color="#9e9e9e", fontsize=10, fontweight="bold",
-            ha="center", va="center",
-            bbox=dict(boxstyle="round,pad=0.3", facecolor="#f5f5f5", alpha=0.7))
+        fig.update_traces(
+            marker=dict(size=9, opacity=0.82, line=dict(width=0.5, color="gray")),
+            selector=dict(mode="markers"),
+        )
+        fig.update_layout(
+            xaxis_title="出来高変化率 (%)",
+            yaxis_title="株価騰落率 (%)",
+            legend=dict(
+                orientation="v", x=1.01, y=1,
+                font=dict(size=10),
+                bgcolor="rgba(255,255,255,0.9)",
+                bordercolor="lightgray", borderwidth=1,
+            ),
+            hoverlabel=dict(
+                bgcolor="white",
+                font_size=13,
+                font_family="Arial",
+            ),
+            margin=dict(r=180),
+            plot_bgcolor="white",
+            paper_bgcolor="white",
+        )
+        fig.update_xaxes(gridcolor="rgba(0,0,0,0.07)", zeroline=False)
+        fig.update_yaxes(gridcolor="rgba(0,0,0,0.07)", zeroline=False)
 
-    ax.set_xlabel("出来高変化率 (%)", fontsize=12)
-    ax.set_ylabel("株価騰落率 (%)", fontsize=12)
-    ax.set_title("Price x Volume マップ（セクター別）", fontsize=13, fontweight="bold")
-    ax.legend(
-        bbox_to_anchor=(1.01, 1), loc="upper left",
-        fontsize=9, framealpha=0.9, ncol=1,
-    )
-    ax.grid(True, alpha=0.2, zorder=1)
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    plt.tight_layout()
-    st.pyplot(fig, clear_figure=True)
+        st.plotly_chart(fig, use_container_width=True)
+
+    except ImportError:
+        # plotlyが無い場合はmatplotlibにフォールバック
+        sectors = df["業種"].unique()
+        cmap = plt.cm.get_cmap("tab20", len(sectors))
+        sector_color = {sec: cmap(i) for i, sec in enumerate(sectors)}
+        fig2, ax = plt.subplots(figsize=(14, 8))
+        for sec in sectors:
+            sub = df[df["業種"] == sec]
+            ax.scatter(sub["出来高変化率(%)"], sub["株価騰落率(%)"],
+                       label=sec, color=sector_color[sec], s=60, alpha=0.8)
+            for _, row in sub.iterrows():
+                if abs(row["株価騰落率(%)"]) > df["株価騰落率(%)"].std() * 1.2 or \
+                   abs(row["出来高変化率(%)"]) > df["出来高変化率(%)"].std() * 1.2:
+                    ax.annotate(row["企業名"],
+                                (row["出来高変化率(%)"], row["株価騰落率(%)"]),
+                                fontsize=7, alpha=0.85,
+                                xytext=(4, 4), textcoords="offset points")
+        ax.axhline(0, color="gray", linewidth=0.8, linestyle="--")
+        ax.axvline(0, color="gray", linewidth=0.8, linestyle="--")
+        ax.set_xlabel("出来高変化率 (%)", fontsize=12)
+        ax.set_ylabel("株価騰落率 (%)", fontsize=12)
+        ax.set_title("Price x Volume マップ（セクター別）", fontsize=13, fontweight="bold")
+        ax.legend(bbox_to_anchor=(1.01, 1), loc="upper left", fontsize=8)
+        ax.grid(True, alpha=0.2)
+        plt.tight_layout()
+        st.pyplot(fig2, clear_figure=True)
 
 
 # ================================================================
@@ -1456,7 +1493,7 @@ else:
             st.markdown("**上位30銘柄（高アルファ）**")
             def _color_alpha(val):
                 if isinstance(val, float):
-                    if val > 5:  return "background:#1a7f37;color:white;font-weight:bold"
+                    if val > 10: return "color:#1a7f37;font-weight:bold;font-size:14px"
                     elif val > 0: return "color:#1a7f37;font-weight:bold"
                     elif val < 0: return "color:#d1242f"
                 return ""
@@ -1603,7 +1640,7 @@ else:
 
             def _color_score(val):
                 if isinstance(val, float):
-                    if val > 10: return "background:#1a7f37;color:white;font-weight:bold"
+                    if val > 10: return "color:#1a7f37;font-weight:bold;font-size:14px"
                     elif val > 5: return "color:#1a7f37;font-weight:bold"
                     elif val > 0: return "color:#388e3c"
                 return ""
@@ -3230,7 +3267,7 @@ else:
 
             def _color_peg(val):
                 if isinstance(val, float):
-                    if val < 1.0:   return "background:#1a7f37;color:white;font-weight:bold"
+                    if val < 1.0:   return "color:#1a7f37;font-weight:bold;font-size:14px"
                     elif val < 1.5: return "color:#1a7f37;font-weight:bold"
                     elif val < 2.0: return "color:#f57c00"
                     else:           return "color:#d1242f"
