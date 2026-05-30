@@ -3025,5 +3025,459 @@ else:
             st.warning("データ取得失敗（無料枠: 1分5回・1日25回制限）")
 
 
+
+# =================================================================
+# 🔮 来期想定利益からのおすすめ銘柄スクリーニング
+# =================================================================
+
+# ─────────────────────────────────────────────────────────────────
+st.header("🔮 来期想定利益スクリーニング")
+st.caption(
+    "yfinance（forward PER・EPS予想）× J-Quants（決算短信）を組み合わせて、"
+    "**来期の利益成長が期待できる割安成長株**を抽出します。"
+)
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_forward_metrics(ticker: str) -> dict:
+    """yfinanceからforward指標を取得"""
+    try:
+        t = yf.Ticker(ticker)
+        info = t.info
+        return {
+            "ticker":            ticker,
+            "trailing_per":      info.get("trailingPE"),
+            "forward_per":       info.get("forwardPE"),
+            "trailing_eps":      info.get("trailingEps"),
+            "forward_eps":       info.get("forwardEps"),
+            "peg_ratio":         info.get("pegRatio"),
+            "revenue_growth":    info.get("revenueGrowth"),      # 売上成長率
+            "earnings_growth":   info.get("earningsGrowth"),     # 利益成長率
+            "operating_margins": info.get("operatingMargins"),   # 営業利益率
+            "profit_margins":    info.get("profitMargins"),      # 純利益率
+            "market_cap":        info.get("marketCap"),
+            "price":             info.get("currentPrice") or info.get("regularMarketPrice"),
+            "52w_high":          info.get("fiftyTwoWeekHigh"),
+            "52w_low":           info.get("fiftyTwoWeekLow"),
+        }
+    except Exception:
+        return {"ticker": ticker}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_jq_fins_summary(code: str) -> dict:
+    """J-Quantsから最新の決算短信データを取得"""
+    df = jq_fetch_fins(code)
+    if df.empty:
+        return {}
+    try:
+        latest = df.iloc[-1].to_dict()
+        prev   = df.iloc[-2].to_dict() if len(df) >= 2 else {}
+        return {"latest": latest, "prev": prev, "count": len(df)}
+    except Exception:
+        return {}
+
+
+def _safe_float(val):
+    try:
+        v = float(val)
+        return v if not (v != v) else None  # NaN check
+    except Exception:
+        return None
+
+
+# ── サイドバー設定 ──────────────────────────────────────────────
+with st.sidebar:
+    st.divider()
+    st.markdown("### 🔮 来期スクリーニング設定")
+    fwd_per_max    = st.slider("最大 Forward PER", 5, 60, 30, key="fwd_per_max")
+    fwd_eps_growth = st.slider("最小 EPS成長率(%)", -50, 100, 10, key="fwd_eps_growth")
+    fwd_peg_max    = st.slider("最大 PEGレシオ", 0.1, 5.0, 2.0, 0.1, key="fwd_peg_max")
+    fwd_op_margin  = st.slider("最小 営業利益率(%)", 0, 40, 5, key="fwd_op_margin")
+    fwd_top_n      = st.slider("表示銘柄数", 10, 50, 20, key="fwd_top_n")
+
+st.info(
+    f"📋 スクリーニング条件: "
+    f"Forward PER ≤ {fwd_per_max} | "
+    f"EPS成長率 ≥ {fwd_eps_growth}% | "
+    f"PEGレシオ ≤ {fwd_peg_max} | "
+    f"営業利益率 ≥ {fwd_op_margin}%"
+)
+
+# ── データ取得 ──────────────────────────────────────────────────
+with st.spinner(f"来期指標を取得中（{len(ticker_name_map)}銘柄）..."):
+    fwd_results = []
+    fwd_progress = st.progress(0)
+    fwd_status   = st.empty()
+
+    for idx, (ticker, (name, sector)) in enumerate(ticker_name_map.items()):
+        fwd_status.text(f"取得中: {name} ({ticker})")
+        fwd_progress.progress((idx + 1) / len(ticker_name_map))
+
+        m = fetch_forward_metrics(ticker)
+        if not m:
+            continue
+
+        trailing_per   = _safe_float(m.get("trailing_per"))
+        forward_per    = _safe_float(m.get("forward_per"))
+        trailing_eps   = _safe_float(m.get("trailing_eps"))
+        forward_eps    = _safe_float(m.get("forward_eps"))
+        peg            = _safe_float(m.get("peg_ratio"))
+        rev_growth     = _safe_float(m.get("revenue_growth"))
+        earn_growth    = _safe_float(m.get("earnings_growth"))
+        op_margin      = _safe_float(m.get("operating_margins"))
+        price          = _safe_float(m.get("price"))
+
+        # EPS成長率（yfinance）
+        if trailing_eps and forward_eps and trailing_eps != 0:
+            eps_growth_yf = (forward_eps - trailing_eps) / abs(trailing_eps) * 100
+        elif earn_growth is not None:
+            eps_growth_yf = earn_growth * 100
+        else:
+            eps_growth_yf = None
+
+        # PEG計算（なければ自前計算）
+        if peg is None and forward_per and eps_growth_yf and eps_growth_yf > 0:
+            peg = forward_per / eps_growth_yf
+
+        fwd_results.append({
+            "企業名":          name,
+            "業種":            sector,
+            "ティッカー":      ticker,
+            "現在株価":        round(price, 1) if price else None,
+            "実績PER":         round(trailing_per, 1) if trailing_per else None,
+            "予想PER":         round(forward_per, 1) if forward_per else None,
+            "実績EPS":         round(trailing_eps, 2) if trailing_eps else None,
+            "予想EPS":         round(forward_eps, 2) if forward_eps else None,
+            "EPS成長率(%)":    round(eps_growth_yf, 1) if eps_growth_yf is not None else None,
+            "売上成長率(%)":   round(rev_growth * 100, 1) if rev_growth is not None else None,
+            "営業利益率(%)":   round(op_margin * 100, 1) if op_margin is not None else None,
+            "PEGレシオ":       round(peg, 2) if peg is not None else None,
+        })
+
+    fwd_progress.empty()
+    fwd_status.empty()
+
+df_fwd = pd.DataFrame(fwd_results)
+
+if df_fwd.empty:
+    st.error("データを取得できませんでした")
+else:
+    # ── スクリーニング ────────────────────────────────────────────
+    df_screen_fwd = df_fwd.copy()
+    if "予想PER" in df_screen_fwd.columns:
+        df_screen_fwd = df_screen_fwd[
+            df_screen_fwd["予想PER"].notna() &
+            (df_screen_fwd["予想PER"] > 0) &
+            (df_screen_fwd["予想PER"] <= fwd_per_max)
+        ]
+    if "EPS成長率(%)" in df_screen_fwd.columns:
+        df_screen_fwd = df_screen_fwd[
+            df_screen_fwd["EPS成長率(%)"].notna() &
+            (df_screen_fwd["EPS成長率(%)"] >= fwd_eps_growth)
+        ]
+    if "PEGレシオ" in df_screen_fwd.columns:
+        df_screen_fwd = df_screen_fwd[
+            df_screen_fwd["PEGレシオ"].notna() &
+            (df_screen_fwd["PEGレシオ"] <= fwd_peg_max) &
+            (df_screen_fwd["PEGレシオ"] > 0)
+        ]
+    if "営業利益率(%)" in df_screen_fwd.columns:
+        df_screen_fwd = df_screen_fwd[
+            df_screen_fwd["営業利益率(%)"].notna() &
+            (df_screen_fwd["営業利益率(%)"] >= fwd_op_margin)
+        ]
+
+    # PEGレシオでソート（低いほど割安成長）
+    df_screen_fwd = df_screen_fwd.sort_values("PEGレシオ", ascending=True).reset_index(drop=True)
+
+    # ── サマリーメトリクス ────────────────────────────────────────
+    sm1, sm2, sm3, sm4 = st.columns(4)
+    sm1.metric("スクリーニング通過", f"{len(df_screen_fwd)}銘柄",
+               f"全{len(df_fwd[df_fwd['予想PER'].notna()])}銘柄中")
+    if not df_screen_fwd.empty:
+        sm2.metric("平均 予想PER",
+                   f"{df_screen_fwd['予想PER'].mean():.1f}倍")
+        sm3.metric("平均 EPS成長率",
+                   f"{df_screen_fwd['EPS成長率(%)'].mean():.1f}%")
+        sm4.metric("最小 PEGレシオ（割安）",
+                   f"{df_screen_fwd['PEGレシオ'].min():.2f}",
+                   df_screen_fwd.iloc[0]["企業名"])
+
+    st.divider()
+
+    fwd_t1, fwd_t2, fwd_t3, fwd_t4 = st.tabs([
+        "💎 割安成長株ランキング（PEG）",
+        "📊 PER比較・EPS成長",
+        "📈 チャート分析",
+        "🤖 AI銘柄コメント",
+    ])
+
+    # ── Tab1: PEGランキング ──────────────────────────────────────
+    with fwd_t1:
+        st.markdown("#### 💎 PEGレシオ順 割安成長株ランキング")
+        st.caption(
+            "PEGレシオ = 予想PER ÷ EPS成長率。**1以下が割安成長株の目安**。"
+            "低いほど「成長に対して株価が安い」銘柄。"
+        )
+
+        if df_screen_fwd.empty:
+            st.warning("条件を満たす銘柄がありません。サイドバーの条件を緩めてください。")
+        else:
+            disp_cols = ["企業名", "業種", "PEGレシオ", "予想PER", "実績PER",
+                         "EPS成長率(%)", "売上成長率(%)", "営業利益率(%)", "現在株価"]
+
+            def _color_peg(val):
+                if isinstance(val, float):
+                    if val < 1.0:   return "background:#1a7f37;color:white;font-weight:bold"
+                    elif val < 1.5: return "color:#1a7f37;font-weight:bold"
+                    elif val < 2.0: return "color:#f57c00"
+                    else:           return "color:#d1242f"
+                return ""
+
+            def _color_growth(val):
+                if isinstance(val, float):
+                    if val >= 30:   return "color:#1a7f37;font-weight:bold"
+                    elif val >= 10: return "color:#388e3c"
+                    elif val < 0:   return "color:#d1242f"
+                return ""
+
+            st.dataframe(
+                df_screen_fwd[disp_cols].head(fwd_top_n)
+                .style.format({
+                    "PEGレシオ":     "{:.2f}",
+                    "予想PER":       "{:.1f}倍",
+                    "実績PER":       "{:.1f}倍",
+                    "EPS成長率(%)":  "{:+.1f}%",
+                    "売上成長率(%)": "{:+.1f}%",
+                    "営業利益率(%)": "{:.1f}%",
+                    "現在株価":      "{:,.0f}円",
+                }, na_rep="N/A")
+                .map(_color_peg,    subset=["PEGレシオ"])
+                .map(_color_growth, subset=["EPS成長率(%)"]),
+                use_container_width=True, hide_index=True
+            )
+
+            # CSV DL
+            csv_fwd = df_screen_fwd[disp_cols].to_csv(index=False, encoding="utf-8-sig")
+            st.download_button(
+                "⬇️ スクリーニング結果CSV",
+                data=csv_fwd,
+                file_name=f"fwd_screen_{datetime.today().strftime('%Y%m%d')}.csv",
+                mime="text/csv", key="fwd_dl"
+            )
+
+    # ── Tab2: PER比較・EPS成長 ───────────────────────────────────
+    with fwd_t2:
+        st.markdown("#### 📊 実績PER vs 予想PER 比較 + EPS成長率")
+
+        if df_screen_fwd.empty:
+            st.warning("条件を満たす銘柄がありません")
+        else:
+            top20 = df_screen_fwd.head(20)
+
+            fig_per, axes_per = plt.subplots(1, 2, figsize=(16, 6))
+
+            # PER比較バー
+            ax_per = axes_per[0]
+            x_pos = np.arange(len(top20))
+            w = 0.35
+            ax_per.bar(x_pos - w/2, top20["実績PER"].fillna(0),
+                       width=w, label="実績PER", color="#90caf9", alpha=0.85)
+            ax_per.bar(x_pos + w/2, top20["予想PER"].fillna(0),
+                       width=w, label="予想PER", color="#1565c0", alpha=0.85)
+            ax_per.set_xticks(x_pos)
+            ax_per.set_xticklabels(top20["企業名"], rotation=45,
+                                   ha="right", fontsize=9)
+            ax_per.set_ylabel("PER（倍）")
+            ax_per.set_title("実績PER vs 予想PER（上位20銘柄）",
+                              fontsize=12, fontweight="bold")
+            ax_per.legend(fontsize=10)
+            ax_per.grid(True, axis="y", alpha=0.3)
+            ax_per.axhline(fwd_per_max, color="red", linestyle="--",
+                           alpha=0.5, label=f"PER上限({fwd_per_max})")
+
+            # EPS成長率バー
+            ax_eps = axes_per[1]
+            colors_eps = ["#1a7f37" if v >= 0 else "#d1242f"
+                          for v in top20["EPS成長率(%)"].fillna(0)]
+            ax_eps.bar(top20["企業名"], top20["EPS成長率(%)"].fillna(0),
+                       color=colors_eps, alpha=0.85)
+            ax_eps.axhline(0, color="black", linewidth=0.8)
+            ax_eps.axhline(fwd_eps_growth, color="orange", linestyle="--",
+                           alpha=0.6, label=f"最低成長率({fwd_eps_growth}%)")
+            ax_eps.set_xticklabels(top20["企業名"], rotation=45,
+                                   ha="right", fontsize=9)
+            ax_eps.set_ylabel("EPS成長率 (%)")
+            ax_eps.set_title("EPS成長率（予想 vs 実績）",
+                              fontsize=12, fontweight="bold")
+            ax_eps.legend(fontsize=9)
+            ax_eps.grid(True, axis="y", alpha=0.3)
+
+            plt.tight_layout()
+            st.pyplot(fig_per, clear_figure=True)
+
+            # 営業利益率ランキング
+            st.markdown("#### 🏭 営業利益率ランキング（スクリーニング通過銘柄）")
+            df_margin = df_screen_fwd.dropna(subset=["営業利益率(%)"])\
+                                     .sort_values("営業利益率(%)", ascending=False)\
+                                     .head(20)
+            fig_mg, ax_mg = plt.subplots(figsize=(12, 5))
+            colors_mg = ["#1565c0" if v >= 15 else "#42a5f5"
+                         for v in df_margin["営業利益率(%)"]]
+            ax_mg.barh(df_margin["企業名"][::-1],
+                       df_margin["営業利益率(%)"][::-1],
+                       color=colors_mg[::-1], alpha=0.85)
+            ax_mg.axvline(fwd_op_margin, color="red", linestyle="--",
+                          alpha=0.5, label=f"最低利益率({fwd_op_margin}%)")
+            ax_mg.axvline(15, color="green", linestyle=":",
+                          alpha=0.5, label="優良水準(15%)")
+            ax_mg.set_xlabel("営業利益率 (%)")
+            ax_mg.set_title("営業利益率ランキング", fontsize=12, fontweight="bold")
+            ax_mg.legend(fontsize=9)
+            ax_mg.grid(True, axis="x", alpha=0.3)
+            plt.tight_layout()
+            st.pyplot(fig_mg, clear_figure=True)
+
+    # ── Tab3: チャート分析 ───────────────────────────────────────
+    with fwd_t3:
+        st.markdown("#### 📈 PEGレシオ vs EPS成長率 散布図")
+        st.caption("右上ほど高成長・左下ほど割安。バブルサイズ = 営業利益率")
+
+        if df_screen_fwd.empty:
+            st.warning("条件を満たす銘柄がありません")
+        else:
+            df_plot = df_screen_fwd.dropna(
+                subset=["PEGレシオ", "EPS成長率(%)", "予想PER"]
+            ).head(40)
+
+            if not df_plot.empty:
+                fig_sc2, ax_sc2 = plt.subplots(figsize=(14, 8))
+                sectors_p = df_plot["業種"].unique()
+                cmap_p = plt.cm.get_cmap("tab20", len(sectors_p))
+                sec_c_p = {s: cmap_p(i) for i, s in enumerate(sectors_p)}
+
+                for sec in sectors_p:
+                    sub = df_plot[df_plot["業種"] == sec]
+                    size = (sub["営業利益率(%)"].fillna(5).clip(lower=1) * 15)
+                    ax_sc2.scatter(
+                        sub["EPS成長率(%)"],
+                        sub["予想PER"],
+                        s=size,
+                        color=sec_c_p[sec],
+                        label=sec, alpha=0.8,
+                        edgecolors="gray", linewidth=0.5, zorder=3
+                    )
+                    for _, row in sub.iterrows():
+                        ax_sc2.annotate(
+                            row["企業名"],
+                            (row["EPS成長率(%)"], row["予想PER"]),
+                            fontsize=7, alpha=0.9,
+                            xytext=(4, 4), textcoords="offset points"
+                        )
+
+                # PEG=1の等高線
+                x_range = np.linspace(
+                    df_plot["EPS成長率(%)"].min(),
+                    df_plot["EPS成長率(%)"].max(), 100
+                )
+                ax_sc2.plot(x_range, x_range * 1.0, "g--",
+                            alpha=0.5, linewidth=1.5, label="PEG=1（割安ライン）")
+                ax_sc2.plot(x_range, x_range * 2.0, "r--",
+                            alpha=0.5, linewidth=1.5, label="PEG=2（割高ライン）")
+
+                ax_sc2.set_xlabel("EPS成長率 (%)", fontsize=12)
+                ax_sc2.set_ylabel("予想PER（倍）", fontsize=12)
+                ax_sc2.set_title(
+                    "EPS成長率 vs 予想PER マップ\n"
+                    "（バブルサイズ=営業利益率 / 緑点線=PEG1 / 赤点線=PEG2）",
+                    fontsize=12, fontweight="bold"
+                )
+                ax_sc2.legend(bbox_to_anchor=(1.01, 1), loc="upper left",
+                              fontsize=8, framealpha=0.9)
+                ax_sc2.grid(True, alpha=0.2)
+                ax_sc2.spines["top"].set_visible(False)
+                ax_sc2.spines["right"].set_visible(False)
+                plt.tight_layout()
+                st.pyplot(fig_sc2, clear_figure=True)
+
+    # ── Tab4: AI銘柄コメント ─────────────────────────────────────
+    with fwd_t4:
+        st.markdown("#### 🤖 AI来期おすすめ銘柄コメント")
+        st.caption("スクリーニング通過上位銘柄をAIが総合評価します")
+
+        if df_screen_fwd.empty:
+            st.warning("条件を満たす銘柄がありません")
+        else:
+            top_ai = df_screen_fwd.head(10)
+            summary_str = top_ai[[
+                "企業名", "業種", "PEGレシオ", "予想PER",
+                "EPS成長率(%)", "売上成長率(%)", "営業利益率(%)"
+            ]].to_string(index=False)
+
+            prompt_fwd = f"""
+以下は日本株の来期想定利益スクリーニング結果（上位10銘柄）です。
+
+{summary_str}
+
+スクリーニング条件:
+- 予想PER ≤ {fwd_per_max}倍
+- EPS成長率 ≥ {fwd_eps_growth}%
+- PEGレシオ ≤ {fwd_peg_max}
+- 営業利益率 ≥ {fwd_op_margin}%
+
+投資家向けに以下の観点で分析してください（600文字以内）:
+1. 🏆 特に注目すべき銘柄とその理由（PEG・成長率・利益率の観点）
+2. 📊 業種・セクターの傾向（どの業種に割安成長株が集まっているか）
+3. ⚠️ 注意点・リスク（PERや成長率の信頼性など）
+4. 💡 総合的な投資戦略（時期・分散など）
+
+※ 投資判断は自己責任である旨を最後に一言付記してください。
+"""
+            with st.spinner("AI分析中..."):
+                try:
+                    ai_comment, ai_name = generate_ai_comment(prompt_fwd)
+                    st.info(f"🤖 **AI来期銘柄分析（{ai_name}）**\n\n{ai_comment}")
+                except Exception as e:
+                    st.warning(f"AI APIエラー: {e}")
+
+            # 個別銘柄の簡易コメント
+            st.markdown("---")
+            st.markdown("#### 📋 上位銘柄サマリー")
+            for _, row in top_ai.head(5).iterrows():
+                peg_val  = row.get("PEGレシオ", None)
+                per_val  = row.get("予想PER", None)
+                eps_val  = row.get("EPS成長率(%)", None)
+                op_val   = row.get("営業利益率(%)", None)
+
+                peg_str  = f"{peg_val:.2f}" if peg_val else "N/A"
+                per_str  = f"{per_val:.1f}倍" if per_val else "N/A"
+                eps_str  = f"{eps_val:+.1f}%" if eps_val else "N/A"
+                op_str   = f"{op_val:.1f}%" if op_val else "N/A"
+
+                # PEG評価
+                if peg_val and peg_val < 1.0:
+                    eval_icon = "💎 極めて割安"
+                    eval_color = "#1a7f37"
+                elif peg_val and peg_val < 1.5:
+                    eval_icon = "✅ 割安成長"
+                    eval_color = "#388e3c"
+                else:
+                    eval_icon = "📊 適正水準"
+                    eval_color = "#1565c0"
+
+                st.markdown(
+                    f'<div style="background:#f8f9fa;border-left:4px solid {eval_color};'
+                    f'border-radius:6px;padding:12px 16px;margin:8px 0;">'
+                    f'<b style="font-size:15px;color:{eval_color};">'
+                    f'{eval_icon} {row["企業名"]}（{row["業種"]}）</b><br>'
+                    f'<span style="font-size:13px;color:#555;">'
+                    f'PEGレシオ: <b>{peg_str}</b> | '
+                    f'予想PER: <b>{per_str}</b> | '
+                    f'EPS成長率: <b>{eps_str}</b> | '
+                    f'営業利益率: <b>{op_str}</b>'
+                    f'</span></div>',
+                    unsafe_allow_html=True
+                )
+
 st.divider()
 st.caption("データソース: Yahoo Finance / J-Quants / Finnhub / Alpha Vantage / TDnet / 株探 / みんかぶ / 日経 | 投資判断は自己責任で")
