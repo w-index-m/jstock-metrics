@@ -1314,15 +1314,17 @@ if True:  # 自動実行
                 beta = 0.0
             sharpe = (annual_return - risk_free_rate) / annual_vol
             # α = 銘柄年間リターン - β × 市場年間リターン
-            market_annual_ret = float(y.mean() * 252)
+            # yは市場リターン(日次)なので252倍で年率化
+            market_annual_ret = float(np.array(market_returns, dtype=float).mean()) * 252
             alpha = (annual_return - beta * market_annual_ret) * 100
             results.append({
-                "企業名": name, "業種": sector,
-                "年間平均リターン(%)": annual_return * 100,
-                "年間リスク(%)": annual_vol * 100,
-                "シャープレシオ": sharpe,
-                "ベータ": beta,
-                "アルファ(%)": round(alpha, 2),
+                "企業名":              name,
+                "業種":                sector,
+                "年間平均リターン(%)": round(annual_return * 100, 2),
+                "年間リスク(%)":       round(annual_vol * 100, 2),
+                "シャープレシオ":      round(sharpe, 4),
+                "ベータ":              round(beta, 4),
+                "アルファ(%)":         round(alpha, 2),
             })
 
         progress.empty()
