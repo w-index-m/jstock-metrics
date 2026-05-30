@@ -83,21 +83,6 @@ components.html(
 
 # ── 関連ダッシュボード リンクバー ────────────────────────────────
 st.markdown(
-    """<div style="background:linear-gradient(135deg,#e8eaf6 0%,#e8f5e9 100%);border:1px solid #c5cae9;
-    border-radius:10px;padding:10px 16px;margin-bottom:16px;display:flex;align-items:center;gap:14px;flex-wrap:wrap;">
-    <span style="font-weight:700;font-size:13px;color:#3949ab;white-space:nowrap;">🔗 関連ダッシュボード</span>
-    <a href="https://usstock-metrics.streamlit.app/" target="_blank" style="display:inline-flex;align-items:center;gap:6px;
-    background:linear-gradient(135deg,#1565c0,#1976d2);color:#fff;padding:7px 16px;border-radius:7px;text-decoration:none;
-    font-size:13px;font-weight:700;box-shadow:0 2px 8px rgba(21,101,192,0.35);white-space:nowrap;">🇺🇸 USStockMetrics</a>
-    <a href="https://windex.streamlit.app/" target="_blank" style="display:inline-flex;align-items:center;gap:6px;
-    background:linear-gradient(135deg,#2e7d32,#43a047);color:#fff;padding:7px 16px;border-radius:7px;text-decoration:none;
-    font-size:13px;font-weight:700;box-shadow:0 2px 8px rgba(46,125,50,0.35);white-space:nowrap;">📊 Market Dashboard</a>
-    <span style="font-size:11px;color:#888;">各ダッシュボードで詳細な銘柄分析・指標をご覧いただけます</span>
-    </div>""", unsafe_allow_html=True,
-)
-
-# ── 関連ダッシュボード リンクバー ────────────────────────────────
-st.markdown(
     """
     <div style="
         background: linear-gradient(135deg, #e8eaf6 0%, #e8f5e9 100%);
@@ -1242,108 +1227,105 @@ tab_analysis, tab_sector, tab_volume, tab_price, tab_unique, tab_news, tab_marke
 
 # ─── Tab1: パフォーマンス分析 ────────────────────────────────────
 with tab_analysis:
-    if st.button("▶ 分析実行", type="primary"):
-        end_date   = datetime.today()
-        start_date = end_date - relativedelta(years=int(years))
+    if True:  # 自動実行
 
         with st.spinner("市場データ（日経225）を取得中..."):
             benchmark = get_benchmark(start_date, end_date)
 
         if benchmark.empty:
-            st.error("市場データ取得失敗")
-            st.stop()
+            st.error("市場データ（日経225）取得失敗。しばらく待って再読み込みしてください。")
+        else:
 
-        _bench_close = _to_series(benchmark["Close"])
-        market_returns = _bench_close.pct_change().dropna()
-        results = []
-        progress    = st.progress(0)
-        status_text = st.empty()
+            _bench_close = _to_series(benchmark["Close"])
+            market_returns = _bench_close.pct_change().dropna()
+            results = []
+            progress    = st.progress(0)
+            status_text = st.empty()
 
-        for i, (ticker, (name, sector)) in enumerate(ticker_name_map.items()):
-            status_text.text(f"取得中: {name} ({ticker})")
-            df = get_price(ticker, start_date, end_date)
-            progress.progress((i + 1) / len(ticker_name_map))
-            if df.empty:
-                continue
-            close = _to_series(df["Close"])
-            returns = close.pct_change().dropna()
-            common  = returns.index.intersection(market_returns.index)
-            if len(common) < 30:
-                continue
-            x = np.array(returns.loc[common], dtype=float).flatten()
-            y = np.array(market_returns.loc[common], dtype=float).flatten()
-            if x.ndim != 1 or y.ndim != 1 or len(x) != len(y) or len(x) == 0:
-                continue
-            annual_return = x.mean() * 252
-            annual_vol    = x.std() * np.sqrt(252)
-            if annual_vol == 0:
-                continue
+            for i, (ticker, (name, sector)) in enumerate(ticker_name_map.items()):
+                status_text.text(f"取得中: {name} ({ticker})")
+                df = get_price(ticker, start_date, end_date)
+                progress.progress((i + 1) / len(ticker_name_map))
+                if df.empty:
+                    continue
+                close = _to_series(df["Close"])
+                returns = close.pct_change().dropna()
+                common  = returns.index.intersection(market_returns.index)
+                if len(common) < 30:
+                    continue
+                x = np.array(returns.loc[common], dtype=float).flatten()
+                y = np.array(market_returns.loc[common], dtype=float).flatten()
+                if x.ndim != 1 or y.ndim != 1 or len(x) != len(y) or len(x) == 0:
+                    continue
+                annual_return = x.mean() * 252
+                annual_vol    = x.std() * np.sqrt(252)
+                if annual_vol == 0:
+                    continue
+                try:
+                    beta = np.cov(x, y)[0][1] / np.var(y)
+                except Exception:
+                    beta = 0.0
+                sharpe = (annual_return - risk_free_rate) / annual_vol
+                results.append({
+                    "企業名": name, "業種": sector,
+                    "年間平均リターン(%)": annual_return * 100,
+                    "年間リスク(%)": annual_vol * 100,
+                    "シャープレシオ": sharpe, "ベータ": beta,
+                })
+
+            progress.empty()
+            status_text.empty()
+
+            df_results = pd.DataFrame(results)
+            if df_results.empty:
+                st.warning("分析データが取得できませんでした。しばらく後に再度お試しください。")
+            else:
+                df_results = df_results.sort_values("シャープレシオ", ascending=False)
+
+                st.subheader("📋 分析結果一覧")
+                st.dataframe(
+                    df_results.style.format({
+                        "年間平均リターン(%)": "{:.2f}",
+                        "年間リスク(%)": "{:.2f}",
+                        "シャープレシオ": "{:.2f}",
+                        "ベータ": "{:.2f}",
+                    }),
+                    use_container_width=True,
+                )
+
+                top_n_disp = int(top_n)
+                top_stocks = df_results.head(top_n_disp)
+
+                fig1, ax1 = plt.subplots(figsize=(14, 6))
+                ax1.bar(top_stocks["企業名"], top_stocks["シャープレシオ"], color="green")
+                ax1.set_title(f"シャープレシオ 上位{top_n_disp}社")
+                ax1.set_ylabel("シャープレシオ")
+                ax1.tick_params(axis="x", rotation=45)
+                plt.tight_layout()
+                st.pyplot(fig1)
+                plt.close(fig1)
+
+                fig2, ax2 = plt.subplots(figsize=(14, 6))
+                ax2.bar(top_stocks["企業名"], top_stocks["年間平均リターン(%)"], color="steelblue")
+                ax2.set_title(f"年間平均リターン(%) 上位{top_n_disp}社")
+            ax2.set_ylabel("年間平均リターン(%)")
+            ax2.tick_params(axis="x", rotation=45)
+            plt.tight_layout()
+            st.pyplot(fig2)
+            plt.close(fig2)
+
+            summary = top_stocks.head(5).to_string()
+            prompt = (
+                "以下は日本株のリスク・リターン分析結果です。\n"
+                "投資家向けに簡潔に300文字以内で評価してください。\n\n"
+                f"{summary}\n"
+            )
             try:
-                beta = np.cov(x, y)[0][1] / np.var(y)
-            except Exception:
-                beta = 0.0
-            sharpe = (annual_return - risk_free_rate) / annual_vol
-            results.append({
-                "企業名": name, "業種": sector,
-                "年間平均リターン(%)": annual_return * 100,
-                "年間リスク(%)": annual_vol * 100,
-                "シャープレシオ": sharpe, "ベータ": beta,
-            })
-
-        progress.empty()
-        status_text.empty()
-
-        df_results = pd.DataFrame(results)
-        if df_results.empty:
-            st.error("データなし")
-            st.stop()
-
-        df_results = df_results.sort_values("シャープレシオ", ascending=False)
-
-        st.subheader("📋 分析結果一覧")
-        st.dataframe(
-            df_results.style.format({
-                "年間平均リターン(%)": "{:.2f}",
-                "年間リスク(%)": "{:.2f}",
-                "シャープレシオ": "{:.2f}",
-                "ベータ": "{:.2f}",
-            }),
-            use_container_width=True,
-        )
-
-        top_n_int  = int(top_n)
-        top_stocks = df_results.head(top_n_int)
-
-        fig1, ax1 = plt.subplots(figsize=(14, 6))
-        ax1.bar(top_stocks["企業名"], top_stocks["シャープレシオ"], color="green")
-        ax1.set_title(f"シャープレシオ 上位{top_n_int}社")
-        ax1.set_ylabel("シャープレシオ")
-        ax1.tick_params(axis="x", rotation=45)
-        plt.tight_layout()
-        st.pyplot(fig1)
-        plt.close(fig1)
-
-        fig2, ax2 = plt.subplots(figsize=(14, 6))
-        ax2.bar(top_stocks["企業名"], top_stocks["年間平均リターン(%)"], color="steelblue")
-        ax2.set_title(f"年間平均リターン(%) 上位{top_n_int}社")
-        ax2.set_ylabel("年間平均リターン(%)")
-        ax2.tick_params(axis="x", rotation=45)
-        plt.tight_layout()
-        st.pyplot(fig2)
-        plt.close(fig2)
-
-        summary = top_stocks.head(5).to_string()
-        prompt = (
-            "以下は日本株のリスク・リターン分析結果です。\n"
-            "投資家向けに簡潔に300文字以内で評価してください。\n\n"
-            f"{summary}\n"
-        )
-        try:
-            comment, ai_name = generate_ai_comment(prompt)
-            st.subheader(f"🤖 AIコメント（{ai_name}）")
-            st.write(comment)
-        except Exception as e:
-            st.warning(f"AI APIエラー: {e}")
+                comment, ai_name = generate_ai_comment(prompt)
+                st.subheader(f"🤖 AIコメント（{ai_name}）")
+                st.write(comment)
+            except Exception as e:
+                st.warning(f"AI APIエラー: {e}")
 
 
 # ─── Tab2: セクターローテーション ────────────────────────────────
@@ -1364,7 +1346,7 @@ with tab_sector:
     with col_ctrl2:
         top_bottom_n = st.slider("上位・下位 表示セクター数", 3, 8, 5)
     with col_ctrl3:
-        run_rotation = st.button("▶ セクターローテーション分析を実行", type="primary")
+        run_rotation = True  # 自動実行
 
     st.divider()
 
@@ -1446,7 +1428,7 @@ with tab_sector:
                 "平均リターン(%)": "{:+.2f}",
                 "中央値リターン(%)": "{:+.2f}",
                 "上昇率(%)": "{:.1f}",
-            }).applymap(color_return, subset=["平均リターン(%)", "中央値リターン(%)"])
+            }).map(color_return, subset=["平均リターン(%)", "中央値リターン(%)"])
             st.dataframe(styled, use_container_width=True, height=500)
 
             st.divider()
@@ -1495,7 +1477,7 @@ with tab_volume:
         pv_days = st.selectbox("Price x Volume 期間", [10, 20, 60], index=1,
                                 format_func=lambda x: f"{x}日")
     with col_v3:
-        run_volume = st.button("▶ 需給分析を実行", type="primary")
+        run_volume = True  # 自動実行
 
     st.divider()
 
@@ -1516,7 +1498,7 @@ with tab_volume:
             styled_surge = df_surge.style.format({
                 "出来高倍率": "{:.2f}x",
                 "株価変化率(5日%)": "{:+.2f}",
-            }).applymap(color_surge, subset=["出来高倍率"])
+            }).map(color_surge, subset=["出来高倍率"])
             st.dataframe(styled_surge, use_container_width=True)
 
             top5 = df_surge.head(5)[["企業名", "業種", "出来高倍率", "株価変化率(5日%)"]].to_string(index=False)
@@ -1591,7 +1573,7 @@ with tab_price:
 
     col_p1, col_p2 = st.columns([3, 2])
     with col_p1:
-        run_price = st.button("▶ 価格パターン分析を実行", type="primary")
+        run_price = True  # 自動実行
     with col_p2:
         cross_lookback = st.slider("クロスシグナル 直近何日以内を検出？", 3, 20, 10)
 
@@ -1699,7 +1681,7 @@ with tab_unique:
 
     col_u1, col_u2 = st.columns([3, 2])
     with col_u1:
-        run_unique = st.button("▶ モメンタム・相関分析を実行", type="primary")
+        run_unique = True  # 自動実行
     with col_u2:
         corr_window = st.slider("相関崩れ 直近ウィンドウ（日）", 10, 30, 20)
 
@@ -1836,7 +1818,7 @@ with tab_news:
 
     col_btn1, col_btn2 = st.columns([1, 4])
     with col_btn1:
-        run_news = st.button("▶ ニュースを取得", type="primary")
+        run_news = True  # 自動実行
     with col_btn2:
         run_ai   = st.checkbox("🤖 AIによる要約・センチメント分析も行う", value=True)
 
@@ -1893,7 +1875,7 @@ with tab_news:
 with tab_market_news:
     st.subheader("🌐 市場全体ニュース（日経・Reuters）")
 
-    if st.button("▶ 市場ニュースを取得", type="primary"):
+    if True:  # 自動実行
         import concurrent.futures
 
         with st.spinner("市場ニュースを取得中..."):
