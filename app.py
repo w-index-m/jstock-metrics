@@ -687,6 +687,13 @@ def plot_pv_scatter(df: pd.DataFrame) -> None:
         import plotly.graph_objects as go
         import plotly.express as px
 
+        df = df.copy()
+        # 原点からの距離で外れ値上位25銘柄にフロートラベルを付与
+        df["_dist"] = np.sqrt(df["株価騰落率(%)"]**2 + df["出来高変化率(%)"]**2)
+        top_idx = df.nlargest(min(25, len(df)), "_dist").index
+        df["_label"] = ""
+        df.loc[top_idx, "_label"] = df.loc[top_idx, "企業名"]
+
         x_max = df["出来高変化率(%)"].max()
         x_min = df["出来高変化率(%)"].min()
         y_max = df["株価騰落率(%)"].max()
@@ -697,15 +704,18 @@ def plot_pv_scatter(df: pd.DataFrame) -> None:
             x="出来高変化率(%)",
             y="株価騰落率(%)",
             color="業種",
+            text="_label",
             hover_name="企業名",
             hover_data={
                 "業種": True,
                 "株価騰落率(%)":  ":.2f",
                 "出来高変化率(%)": ":.2f",
+                "_label": False,
+                "_dist": False,
             },
             title="Price x Volume マップ（セクター別）― ホバーで銘柄名・数値表示",
             height=650,
-            color_discrete_sequence=px.colors.qualitative.Tab20,
+            color_discrete_sequence=px.colors.qualitative.Light24,
         )
 
         # 軸線
@@ -734,7 +744,8 @@ def plot_pv_scatter(df: pd.DataFrame) -> None:
 
         fig.update_traces(
             marker=dict(size=9, opacity=0.82, line=dict(width=0.5, color="gray")),
-            selector=dict(mode="markers"),
+            textposition="top center",
+            textfont=dict(size=8, color="rgba(0,0,0,0.72)"),
         )
         fig.update_layout(
             xaxis_title="出来高変化率 (%)",
@@ -749,6 +760,7 @@ def plot_pv_scatter(df: pd.DataFrame) -> None:
                 bgcolor="white",
                 font_size=13,
                 font_family="Arial",
+                namelength=-1,
             ),
             margin=dict(r=180),
             plot_bgcolor="white",
@@ -3517,6 +3529,966 @@ else:
                     f'</span></div>',
                     unsafe_allow_html=True
                 )
+
+
+# =================================================================
+# 📏 サイズファクター分析  /  💰 バリューファクター分析
+# =================================================================
+
+from datetime import timedelta as _fac_td
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_factor_metrics(ticker_name_map: dict) -> pd.DataFrame:
+    """時価総額・PBR・PER等のファクターデータを並列取得"""
+    import concurrent.futures as _cfe
+
+    def _get(item):
+        ticker, (name, sector) = item
+        try:
+            info = yf.Ticker(ticker).info
+            return {
+                "企業名": name, "業種": sector, "ティッカー": ticker,
+                "時価総額":      info.get("marketCap"),
+                "PBR":           info.get("priceToBook"),
+                "PER":           info.get("trailingPE"),
+                "PSR":           info.get("priceToSalesTrailing12Months"),
+                "配当利回り(%)": round((info.get("dividendYield") or 0) * 100, 2),
+                "ROE(%)":        round((info.get("returnOnEquity") or 0) * 100, 2),
+            }
+        except Exception:
+            return {"企業名": name, "業種": sector, "ティッカー": ticker,
+                    "時価総額": None, "PBR": None, "PER": None,
+                    "PSR": None, "配当利回り(%)": None, "ROE(%)": None}
+
+    with _cfe.ThreadPoolExecutor(max_workers=12) as ex:
+        results = list(ex.map(_get, ticker_name_map.items()))
+    return pd.DataFrame(results)
+
+
+def _size_label(mc):
+    if mc is None or (isinstance(mc, float) and mc != mc):
+        return "不明"
+    if mc >= 1_000_000_000_000:
+        return "大型株(>1兆)"
+    elif mc >= 100_000_000_000:
+        return "中型株(1000億-1兆)"
+    return "小型株(<1000億)"
+
+
+def _value_label(pbr):
+    if pbr is None or (isinstance(pbr, float) and pbr != pbr):
+        return "不明"
+    if pbr < 1.0:   return "割安(PBR<1)"
+    if pbr < 2.0:   return "適正(PBR 1-2)"
+    if pbr < 3.0:   return "やや割高(PBR 2-3)"
+    return "割高(PBR>3)"
+
+
+def _port_returns(tickers, start, end, max_n=20):
+    """等重みポートフォリオの日次リターンを返す"""
+    rets = []
+    for t in tickers[:max_n]:
+        df_t = _yfdownload(t, start=start, end=end, progress=False)
+        if df_t.empty or len(df_t) < 10:
+            continue
+        r = _to_series(df_t["Close"]).pct_change().dropna()
+        rets.append(r)
+    if not rets:
+        return pd.Series(dtype=float)
+    return pd.concat(rets, axis=1).mean(axis=1)
+
+
+# ─── ファクターデータ一括取得 ────────────────────────────────────
+with st.spinner(f"サイズ・バリューファクターデータ取得中（{len(ticker_name_map)}銘柄）..."):
+    df_factor = fetch_factor_metrics(ticker_name_map)
+
+df_factor["サイズ分類"]    = df_factor["時価総額"].apply(_size_label)
+df_factor["バリュー分類"]  = df_factor["PBR"].apply(_value_label)
+df_factor["時価総額(億円)"] = (df_factor["時価総額"].fillna(0) / 1e8).round(1)
+
+try:
+    _has_results = not df_results.empty
+except Exception:
+    _has_results = False
+
+if _has_results:
+    _perf_cols = ["企業名", "年間平均リターン(%)", "年間リスク(%)",
+                  "シャープレシオ", "アルファ(%)", "ベータ"]
+    df_factor_merged = df_factor.merge(df_results[_perf_cols], on="企業名", how="inner")
+else:
+    df_factor_merged = df_factor.copy()
+
+_SIZE_ORDER  = ["大型株(>1兆)", "中型株(1000億-1兆)", "小型株(<1000億)"]
+_VALUE_ORDER = ["割安(PBR<1)", "適正(PBR 1-2)", "やや割高(PBR 2-3)", "割高(PBR>3)"]
+
+
+# =================================================================
+# 📏 サイズファクター分析
+# =================================================================
+
+st.header("📏 サイズファクター分析")
+st.divider()
+st.caption(
+    "時価総額で銘柄を **大型・中型・小型** に分類し、リターン・リスク・シャープレシオを比較します。"
+    "**SMBファクター**（Small Minus Big）で小型株プレミアムを検証します。"
+)
+
+sz_t1, sz_t2, sz_t3, sz_t4 = st.tabs([
+    "📊 時価総額分布",
+    "📈 サイズ別パフォーマンス",
+    "📉 SMBファクター",
+    "🗺️ 時価総額×アルファ",
+])
+
+with sz_t1:
+    df_mc_v = df_factor.dropna(subset=["時価総額"])
+    sc = df_mc_v["サイズ分類"].value_counts()
+    cols_sc = st.columns(3)
+    for i, (lbl, col) in enumerate(zip(_SIZE_ORDER, cols_sc)):
+        col.metric(lbl, f"{int(sc.get(lbl, 0))}銘柄")
+
+    col_pie, col_hist = st.columns(2)
+    with col_pie:
+        labels_p = [l for l in _SIZE_ORDER if l in sc.index]
+        fig_pie, ax_pie = plt.subplots(figsize=(5, 4))
+        ax_pie.pie([sc[l] for l in labels_p], labels=labels_p,
+                   colors=["#1565c0", "#42a5f5", "#90caf9"],
+                   autopct="%1.1f%%", startangle=90,
+                   wedgeprops=dict(edgecolor="white", linewidth=1.5))
+        ax_pie.set_title("サイズ分類の割合", fontsize=12, fontweight="bold")
+        plt.tight_layout()
+        st.pyplot(fig_pie, clear_figure=True)
+
+    with col_hist:
+        mc_log = np.log10(df_mc_v[df_mc_v["時価総額(億円)"] > 0]["時価総額(億円)"] + 1)
+        fig_hist, ax_hist = plt.subplots(figsize=(5, 4))
+        ax_hist.hist(mc_log, bins=30, color="#1565c0", alpha=0.75, edgecolor="white")
+        ax_hist.axvline(np.log10(1000), color="#f57c00", linestyle="--",
+                        alpha=0.8, label="1000億円")
+        ax_hist.axvline(np.log10(10000), color="#d1242f", linestyle="--",
+                        alpha=0.8, label="1兆円")
+        ax_hist.set_xlabel("log10(時価総額・億円)", fontsize=10)
+        ax_hist.set_ylabel("銘柄数", fontsize=10)
+        ax_hist.set_title("時価総額分布（対数）", fontsize=12, fontweight="bold")
+        ax_hist.legend(fontsize=8); ax_hist.grid(True, alpha=0.2)
+        plt.tight_layout()
+        st.pyplot(fig_hist, clear_figure=True)
+
+    col_top20, col_bot20 = st.columns(2)
+    with col_top20:
+        st.markdown("**時価総額 上位20銘柄**")
+        st.dataframe(
+            df_mc_v.nlargest(20, "時価総額")[
+                ["企業名", "業種", "サイズ分類", "時価総額(億円)"]
+            ].reset_index(drop=True)
+            .style.format({"時価総額(億円)": "{:,.0f}"}),
+            use_container_width=True, hide_index=True,
+        )
+    with col_bot20:
+        st.markdown("**時価総額 下位20銘柄**")
+        st.dataframe(
+            df_mc_v.nsmallest(20, "時価総額")[
+                ["企業名", "業種", "サイズ分類", "時価総額(億円)"]
+            ].reset_index(drop=True)
+            .style.format({"時価総額(億円)": "{:,.0f}"}),
+            use_container_width=True, hide_index=True,
+        )
+
+with sz_t2:
+    if not _has_results:
+        st.info("上部の「パフォーマンス分析」が自動実行後に表示されます")
+    else:
+        df_sz_p = df_factor_merged.dropna(subset=["シャープレシオ", "サイズ分類"])
+        sz_agg = df_sz_p.groupby("サイズ分類").agg(
+            銘柄数=("企業名", "count"),
+            平均リターン=("年間平均リターン(%)", "mean"),
+            平均リスク=("年間リスク(%)", "mean"),
+            平均シャープレシオ=("シャープレシオ", "mean"),
+            平均アルファ=("アルファ(%)", "mean"),
+        ).round(3).reset_index()
+        sz_agg["_o"] = sz_agg["サイズ分類"].map({s: i for i, s in enumerate(_SIZE_ORDER)})
+        sz_agg = sz_agg.sort_values("_o").drop("_o", axis=1)
+
+        cols_m = st.columns(len(sz_agg))
+        for i, (_, row) in enumerate(sz_agg.iterrows()):
+            cols_m[i].metric(row["サイズ分類"],
+                             f"SR: {row['平均シャープレシオ']:.2f}",
+                             f"α: {row['平均アルファ']:+.2f}%")
+
+        st.dataframe(sz_agg.style.format({
+            "平均リターン": "{:+.2f}%", "平均リスク": "{:.2f}%",
+            "平均シャープレシオ": "{:.3f}", "平均アルファ": "{:+.2f}%",
+        }), use_container_width=True, hide_index=True)
+
+        fig_sz, axes_sz = plt.subplots(1, 3, figsize=(15, 5))
+        for ax, metric, title in zip(
+            axes_sz,
+            ["平均シャープレシオ", "平均リターン", "平均アルファ"],
+            ["平均シャープレシオ", "平均リターン(%)", "平均アルファ(%)"],
+        ):
+            vld = sz_agg.dropna(subset=[metric])
+            ax.bar(vld["サイズ分類"], vld[metric],
+                   color=["#1a7f37" if v >= 0 else "#d1242f" for v in vld[metric]],
+                   alpha=0.85)
+            ax.axhline(0, color="gray", linewidth=0.8)
+            ax.set_title(title, fontsize=11, fontweight="bold")
+            ax.tick_params(axis="x", rotation=15, labelsize=9)
+            ax.grid(True, axis="y", alpha=0.3)
+        plt.tight_layout()
+        st.pyplot(fig_sz, clear_figure=True)
+
+        box_sz = [df_sz_p[df_sz_p["サイズ分類"] == s]["シャープレシオ"].dropna().values
+                  for s in _SIZE_ORDER if s in df_sz_p["サイズ分類"].values]
+        box_sz_lbl = [s for s in _SIZE_ORDER if s in df_sz_p["サイズ分類"].values]
+        if any(len(d) > 0 for d in box_sz):
+            fig_bx, ax_bx = plt.subplots(figsize=(9, 5))
+            bp = ax_bx.boxplot([d for d in box_sz if len(d) > 0],
+                               labels=[l for l, d in zip(box_sz_lbl, box_sz) if len(d) > 0],
+                               patch_artist=True,
+                               medianprops=dict(color="black", linewidth=2))
+            for patch, color in zip(bp["boxes"], ["#1565c0", "#42a5f5", "#90caf9"]):
+                patch.set_facecolor(color); patch.set_alpha(0.7)
+            ax_bx.axhline(0, color="gray", linestyle="--", alpha=0.5)
+            ax_bx.set_ylabel("シャープレシオ", fontsize=12)
+            ax_bx.set_title("サイズ別シャープレシオ分布", fontsize=12, fontweight="bold")
+            ax_bx.grid(True, axis="y", alpha=0.3)
+            plt.tight_layout()
+            st.pyplot(fig_bx, clear_figure=True)
+
+with sz_t3:
+    smb_days  = st.slider("分析期間（日）", 30, 250, 120, key="smb_days")
+    end_smb   = datetime.today()
+    start_smb = end_smb - _fac_td(days=smb_days + 10)
+
+    df_mc_s = df_factor.dropna(subset=["時価総額"]).sort_values("時価総額")
+    n_s = max(int(len(df_mc_s) * 0.3), 5)
+
+    with st.spinner("SMBファクター計算中..."):
+        small_ret = _port_returns(df_mc_s.head(n_s)["ティッカー"].tolist(), start_smb, end_smb)
+        large_ret = _port_returns(df_mc_s.tail(n_s)["ティッカー"].tolist(), start_smb, end_smb)
+
+    if small_ret.empty or large_ret.empty:
+        st.warning("SMBデータ取得に失敗しました")
+    else:
+        idx_s   = small_ret.index.intersection(large_ret.index)
+        smb_d   = small_ret.loc[idx_s] - large_ret.loc[idx_s]
+        smb_cum = (1 + smb_d).cumprod() - 1
+        s_cum   = (1 + small_ret.loc[idx_s]).cumprod() - 1
+        l_cum   = (1 + large_ret.loc[idx_s]).cumprod() - 1
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("小型株 累積リターン",  f"{s_cum.iloc[-1]*100:+.2f}%")
+        c2.metric("大型株 累積リターン",  f"{l_cum.iloc[-1]*100:+.2f}%")
+        c3.metric("SMBスプレッド", f"{smb_cum.iloc[-1]*100:+.2f}%",
+                  "小型株プレミアム" if smb_cum.iloc[-1] > 0 else "大型株優位")
+
+        fig_smb, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8),
+                                            gridspec_kw={"height_ratios": [2, 1]})
+        ax1.plot(s_cum.index, s_cum * 100, label="小型株", color="#1a7f37", linewidth=2)
+        ax1.plot(l_cum.index, l_cum * 100, label="大型株", color="#1565c0", linewidth=2)
+        ax1.axhline(0, color="gray", linestyle="--", linewidth=0.7)
+        ax1.set_ylabel("累積リターン (%)"); ax1.legend(fontsize=10)
+        ax1.set_title("小型株 vs 大型株 累積リターン", fontsize=12, fontweight="bold")
+        ax1.grid(True, alpha=0.2); ax1.tick_params(axis="x", rotation=30)
+        ax2.bar(smb_cum.index, smb_cum * 100,
+                color=["#1a7f37" if v >= 0 else "#d1242f" for v in smb_cum],
+                alpha=0.7, width=1.5)
+        ax2.axhline(0, color="gray", linewidth=0.7)
+        ax2.set_ylabel("SMB (%)"); ax2.set_title("SMBファクター", fontsize=11)
+        ax2.grid(True, alpha=0.2); ax2.tick_params(axis="x", rotation=30)
+        plt.tight_layout()
+        st.pyplot(fig_smb, clear_figure=True)
+
+        prompt_smb = (
+            f"日本株の過去{smb_days}日間SMBファクター: "
+            f"小型株{s_cum.iloc[-1]*100:+.2f}%、大型株{l_cum.iloc[-1]*100:+.2f}%、"
+            f"スプレッド{smb_cum.iloc[-1]*100:+.2f}%。"
+            "投資家向け200文字以内: 1)サイズプレミアムの現状 2)投資戦略への示唆"
+        )
+        with st.spinner("AI解説中..."):
+            try:
+                comment, ai_name = generate_ai_comment(prompt_smb)
+                st.info(f"🤖 **AI解説（{ai_name}）**\n\n{comment}")
+            except Exception as e:
+                st.warning(f"AI APIエラー: {e}")
+
+with sz_t4:
+    if not _has_results:
+        st.info("上部の「パフォーマンス分析」が自動実行後に表示されます")
+    else:
+        df_sc = df_factor_merged.dropna(subset=["時価総額", "アルファ(%)"]).copy()
+        df_sc = df_sc[df_sc["時価総額(億円)"] > 0]
+        df_sc["log時価総額"] = np.log10(df_sc["時価総額(億円)"])
+        try:
+            import plotly.express as px
+            fig_szsc = px.scatter(
+                df_sc, x="log時価総額", y="アルファ(%)",
+                color="サイズ分類",
+                size=df_sc["シャープレシオ"].clip(lower=0.1),
+                hover_name="企業名",
+                hover_data={"業種": True, "時価総額(億円)": ":.0f",
+                            "アルファ(%)": ":.2f", "シャープレシオ": ":.2f"},
+                title="時価総額 vs アルファ（バブルサイズ=シャープレシオ）",
+                height=600,
+                color_discrete_map={
+                    "大型株(>1兆)": "#1565c0",
+                    "中型株(1000億-1兆)": "#42a5f5",
+                    "小型株(<1000億)": "#90caf9",
+                },
+            )
+            fig_szsc.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
+            fig_szsc.update_layout(xaxis_title="log10(時価総額・億円)",
+                                   yaxis_title="アルファ (%)", plot_bgcolor="white")
+            st.plotly_chart(fig_szsc, use_container_width=True)
+        except ImportError:
+            fig_szsc2, ax_sz = plt.subplots(figsize=(12, 7))
+            for size_cat, color in zip(_SIZE_ORDER, ["#1565c0", "#42a5f5", "#90caf9"]):
+                sub = df_sc[df_sc["サイズ分類"] == size_cat]
+                ax_sz.scatter(sub["log時価総額"], sub["アルファ(%)"],
+                              label=size_cat, color=color, s=60, alpha=0.75)
+            ax_sz.axhline(0, color="gray", linewidth=0.8, linestyle="--")
+            ax_sz.set_xlabel("log10(時価総額・億円)", fontsize=12)
+            ax_sz.set_ylabel("アルファ (%)", fontsize=12)
+            ax_sz.set_title("時価総額 vs アルファ", fontsize=12, fontweight="bold")
+            ax_sz.legend(fontsize=10); ax_sz.grid(True, alpha=0.2)
+            plt.tight_layout()
+            st.pyplot(fig_szsc2, clear_figure=True)
+
+
+# =================================================================
+# 💰 バリューファクター分析
+# =================================================================
+
+st.header("💰 バリューファクター分析")
+st.divider()
+st.caption(
+    "PBR（株価純資産倍率）・PER・PSR・ROEで **割安株（バリュー）と割高株（グロース）** を分類・比較します。"
+    "**HMLファクター**（High Minus Low PBR）でバリュープレミアムを検証します。"
+)
+
+vl_t1, vl_t2, vl_t3, vl_t4 = st.tabs([
+    "💎 低PBR スクリーニング",
+    "📊 バリュー別パフォーマンス",
+    "📉 HMLファクター",
+    "🗺️ PBR×アルファ散布図",
+])
+
+with vl_t1:
+    col_v1, col_v2 = st.columns(2)
+    with col_v1:
+        pbr_max_vl = st.slider("最大PBR", 0.3, 5.0, 1.5, 0.1, key="vl_pbr_max")
+    with col_v2:
+        per_max_vl = st.slider("最大PER", 5, 80, 30, key="vl_per_max")
+
+    df_vl_s = df_factor.dropna(subset=["PBR", "PER"])
+    df_vl_s = df_vl_s[
+        (df_vl_s["PBR"] > 0) & (df_vl_s["PBR"] <= pbr_max_vl) &
+        (df_vl_s["PER"] > 0) & (df_vl_s["PER"] <= per_max_vl)
+    ].sort_values("PBR").reset_index(drop=True)
+
+    st.markdown(f"**{len(df_vl_s)}銘柄** が条件を満たしています"
+                f"（PBR≤{pbr_max_vl} & PER≤{per_max_vl}）")
+
+    if not df_vl_s.empty:
+        disp_vl = [c for c in
+                   ["企業名", "業種", "サイズ分類", "PBR", "PER", "PSR",
+                    "配当利回り(%)", "ROE(%)"]
+                   if c in df_vl_s.columns]
+
+        def _color_pbr(val):
+            if isinstance(val, float):
+                if val < 0.5: return "color:#1a7f37;font-weight:bold;font-size:14px"
+                if val < 1.0: return "color:#1a7f37;font-weight:bold"
+                if val < 1.5: return "color:#388e3c"
+            return ""
+
+        st.dataframe(
+            df_vl_s[disp_vl].head(40)
+            .style.format({
+                "PBR": "{:.2f}", "PER": "{:.1f}", "PSR": "{:.2f}",
+                "配当利回り(%)": "{:.2f}%", "ROE(%)": "{:.1f}%",
+            }, na_rep="N/A")
+            .map(_color_pbr, subset=["PBR"]),
+            use_container_width=True, hide_index=True,
+        )
+        csv_vl = df_vl_s[disp_vl].to_csv(index=False, encoding="utf-8-sig")
+        st.download_button(
+            "⬇️ CSVダウンロード", data=csv_vl,
+            file_name=f"value_screen_{datetime.today().strftime('%Y%m%d')}.csv",
+            mime="text/csv", key="vl_dl",
+        )
+
+    df_pbr_all = df_factor.dropna(subset=["PBR"])
+    df_pbr_all = df_pbr_all[df_pbr_all["PBR"].between(0, 10)]
+    fig_pbr_d, ax_pd = plt.subplots(figsize=(10, 4))
+    ax_pd.hist(df_pbr_all["PBR"], bins=40, color="#1565c0", alpha=0.75, edgecolor="white")
+    ax_pd.axvline(1.0, color="#1a7f37", linestyle="--", linewidth=1.5, label="PBR=1.0")
+    ax_pd.axvline(pbr_max_vl, color="#f57c00", linestyle="--",
+                  linewidth=1.5, label=f"上限({pbr_max_vl})")
+    ax_pd.set_xlabel("PBR", fontsize=11); ax_pd.set_ylabel("銘柄数", fontsize=11)
+    ax_pd.set_title("PBR分布（全銘柄）", fontsize=12, fontweight="bold")
+    ax_pd.legend(fontsize=9); ax_pd.grid(True, alpha=0.2)
+    plt.tight_layout()
+    st.pyplot(fig_pbr_d, clear_figure=True)
+
+with vl_t2:
+    if not _has_results:
+        st.info("上部の「パフォーマンス分析」が自動実行後に表示されます")
+    else:
+        df_vp = df_factor_merged.dropna(subset=["PBR", "シャープレシオ"]).copy()
+        df_vp["バリュー分類"] = df_vp["PBR"].apply(_value_label)
+
+        vl_agg = df_vp.groupby("バリュー分類").agg(
+            銘柄数=("企業名", "count"),
+            平均PBR=("PBR", "mean"),
+            平均リターン=("年間平均リターン(%)", "mean"),
+            平均リスク=("年間リスク(%)", "mean"),
+            平均シャープレシオ=("シャープレシオ", "mean"),
+            平均アルファ=("アルファ(%)", "mean"),
+        ).round(3).reset_index()
+        vl_agg["_o"] = vl_agg["バリュー分類"].map(
+            {v: i for i, v in enumerate(_VALUE_ORDER)}
+        )
+        vl_agg = vl_agg.sort_values("_o").drop("_o", axis=1)
+
+        st.dataframe(vl_agg.style.format({
+            "平均PBR": "{:.2f}", "平均リターン": "{:+.2f}%",
+            "平均リスク": "{:.2f}%", "平均シャープレシオ": "{:.3f}",
+            "平均アルファ": "{:+.2f}%",
+        }), use_container_width=True, hide_index=True)
+
+        fig_vp, axes_vp = plt.subplots(1, 3, figsize=(15, 5))
+        for ax_vp, metric, title in zip(
+            axes_vp,
+            ["平均シャープレシオ", "平均リターン", "平均アルファ"],
+            ["平均シャープレシオ", "平均リターン(%)", "平均アルファ(%)"],
+        ):
+            vld_vp = vl_agg.dropna(subset=[metric])
+            ax_vp.bar(vld_vp["バリュー分類"], vld_vp[metric],
+                      color=["#1a7f37" if v >= 0 else "#d1242f" for v in vld_vp[metric]],
+                      alpha=0.85)
+            ax_vp.axhline(0, color="gray", linewidth=0.8)
+            ax_vp.set_title(title, fontsize=11, fontweight="bold")
+            ax_vp.tick_params(axis="x", rotation=15, labelsize=8)
+            ax_vp.grid(True, axis="y", alpha=0.3)
+        plt.tight_layout()
+        st.pyplot(fig_vp, clear_figure=True)
+
+        box_vl = [df_vp[df_vp["バリュー分類"] == v]["シャープレシオ"].dropna().values
+                  for v in _VALUE_ORDER if v in df_vp["バリュー分類"].values]
+        box_vl_lbl = [v for v in _VALUE_ORDER if v in df_vp["バリュー分類"].values]
+        if any(len(d) > 0 for d in box_vl):
+            fig_vbx, ax_vbx = plt.subplots(figsize=(9, 5))
+            bpv = ax_vbx.boxplot(
+                [d for d in box_vl if len(d) > 0],
+                labels=[l for l, d in zip(box_vl_lbl, box_vl) if len(d) > 0],
+                patch_artist=True,
+                medianprops=dict(color="black", linewidth=2),
+            )
+            for patch, color in zip(bpv["boxes"],
+                                    ["#1a7f37", "#42a5f5", "#f57c00", "#d1242f"]):
+                patch.set_facecolor(color); patch.set_alpha(0.65)
+            ax_vbx.axhline(0, color="gray", linestyle="--", alpha=0.5)
+            ax_vbx.set_ylabel("シャープレシオ", fontsize=12)
+            ax_vbx.set_title("バリュー分類別シャープレシオ分布",
+                              fontsize=12, fontweight="bold")
+            ax_vbx.grid(True, axis="y", alpha=0.3)
+            plt.tight_layout()
+            st.pyplot(fig_vbx, clear_figure=True)
+
+with vl_t3:
+    hml_days  = st.slider("分析期間（日）", 30, 250, 120, key="hml_days")
+    end_hml   = datetime.today()
+    start_hml = end_hml - _fac_td(days=hml_days + 10)
+
+    df_pbr_s = df_factor.dropna(subset=["PBR"])
+    df_pbr_s = df_pbr_s[df_pbr_s["PBR"] > 0].sort_values("PBR")
+    n_h = max(int(len(df_pbr_s) * 0.3), 5)
+
+    with st.spinner("HMLファクター計算中..."):
+        low_ret  = _port_returns(df_pbr_s.head(n_h)["ティッカー"].tolist(), start_hml, end_hml)
+        high_ret = _port_returns(df_pbr_s.tail(n_h)["ティッカー"].tolist(), start_hml, end_hml)
+
+    if low_ret.empty or high_ret.empty:
+        st.warning("HMLデータ取得に失敗しました")
+    else:
+        idx_h   = low_ret.index.intersection(high_ret.index)
+        hml_d   = low_ret.loc[idx_h] - high_ret.loc[idx_h]
+        hml_cum = (1 + hml_d).cumprod() - 1
+        l_cum_h = (1 + low_ret.loc[idx_h]).cumprod() - 1
+        h_cum_h = (1 + high_ret.loc[idx_h]).cumprod() - 1
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("低PBR（割安）累積リターン", f"{l_cum_h.iloc[-1]*100:+.2f}%")
+        c2.metric("高PBR（割高）累積リターン", f"{h_cum_h.iloc[-1]*100:+.2f}%")
+        c3.metric("HMLスプレッド", f"{hml_cum.iloc[-1]*100:+.2f}%",
+                  "バリュープレミアム" if hml_cum.iloc[-1] > 0 else "グロース優位")
+
+        fig_hml, (ax_h1, ax_h2) = plt.subplots(2, 1, figsize=(12, 8),
+                                                gridspec_kw={"height_ratios": [2, 1]})
+        ax_h1.plot(l_cum_h.index, l_cum_h * 100,
+                   label="低PBR（バリュー）", color="#1a7f37", linewidth=2)
+        ax_h1.plot(h_cum_h.index, h_cum_h * 100,
+                   label="高PBR（グロース）", color="#d1242f", linewidth=2)
+        ax_h1.axhline(0, color="gray", linestyle="--", linewidth=0.7)
+        ax_h1.set_ylabel("累積リターン (%)"); ax_h1.legend(fontsize=10)
+        ax_h1.set_title("低PBR（バリュー）vs 高PBR（グロース）累積リターン",
+                        fontsize=12, fontweight="bold")
+        ax_h1.grid(True, alpha=0.2); ax_h1.tick_params(axis="x", rotation=30)
+        ax_h2.bar(hml_cum.index, hml_cum * 100,
+                  color=["#1a7f37" if v >= 0 else "#d1242f" for v in hml_cum],
+                  alpha=0.7, width=1.5)
+        ax_h2.axhline(0, color="gray", linewidth=0.7)
+        ax_h2.set_ylabel("HML (%)"); ax_h2.set_title("HMLファクター（バリュープレミアム）",
+                                                      fontsize=11)
+        ax_h2.grid(True, alpha=0.2); ax_h2.tick_params(axis="x", rotation=30)
+        plt.tight_layout()
+        st.pyplot(fig_hml, clear_figure=True)
+
+        prompt_hml = (
+            f"日本株の過去{hml_days}日間HMLファクター: "
+            f"低PBR（割安）{l_cum_h.iloc[-1]*100:+.2f}%、"
+            f"高PBR（グロース）{h_cum_h.iloc[-1]*100:+.2f}%、"
+            f"スプレッド{hml_cum.iloc[-1]*100:+.2f}%。"
+            "投資家向け200文字以内: 1)バリュープレミアムの現状 2)バリュー投資戦略への示唆"
+        )
+        with st.spinner("AI解説中..."):
+            try:
+                comment, ai_name = generate_ai_comment(prompt_hml)
+                st.info(f"🤖 **AI解説（{ai_name}）**\n\n{comment}")
+            except Exception as e:
+                st.warning(f"AI APIエラー: {e}")
+
+with vl_t4:
+    if not _has_results:
+        st.info("上部の「パフォーマンス分析」が自動実行後に表示されます")
+    else:
+        df_vsc = df_factor_merged.dropna(subset=["PBR", "アルファ(%)"]).copy()
+        df_vsc = df_vsc[df_vsc["PBR"].between(0.1, 15)]
+        df_vsc["バリュー分類"] = df_vsc["PBR"].apply(_value_label)
+        try:
+            import plotly.express as px
+            fig_vsc = px.scatter(
+                df_vsc, x="PBR", y="アルファ(%)",
+                color="バリュー分類",
+                size=df_vsc["シャープレシオ"].clip(lower=0.1),
+                hover_name="企業名",
+                hover_data={"業種": True, "PBR": ":.2f",
+                            "アルファ(%)": ":.2f", "シャープレシオ": ":.2f"},
+                title="PBR vs アルファ（バブルサイズ=シャープレシオ）",
+                height=600,
+                color_discrete_map={
+                    "割安(PBR<1)":       "#1a7f37",
+                    "適正(PBR 1-2)":     "#42a5f5",
+                    "やや割高(PBR 2-3)": "#f57c00",
+                    "割高(PBR>3)":       "#d1242f",
+                },
+            )
+            fig_vsc.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
+            fig_vsc.add_vline(x=1.0, line_dash="dash", line_color="#1a7f37",
+                              opacity=0.5, annotation_text="PBR=1")
+            fig_vsc.update_layout(xaxis_title="PBR（株価純資産倍率）",
+                                  yaxis_title="アルファ (%)", plot_bgcolor="white")
+            st.plotly_chart(fig_vsc, use_container_width=True)
+        except ImportError:
+            fig_vsc2, ax_vs = plt.subplots(figsize=(12, 7))
+            for cat, color in zip(_VALUE_ORDER,
+                                  ["#1a7f37", "#42a5f5", "#f57c00", "#d1242f"]):
+                sub = df_vsc[df_vsc["バリュー分類"] == cat]
+                if not sub.empty:
+                    ax_vs.scatter(sub["PBR"], sub["アルファ(%)"],
+                                  label=cat, color=color, s=60, alpha=0.8)
+                    for _, row in sub.iterrows():
+                        if abs(row["アルファ(%)"]) > df_vsc["アルファ(%)"].std() * 1.5:
+                            ax_vs.annotate(row["企業名"],
+                                          (row["PBR"], row["アルファ(%)"]),
+                                          fontsize=7, alpha=0.9,
+                                          xytext=(4, 4), textcoords="offset points")
+            ax_vs.axhline(0, color="gray", linewidth=0.8, linestyle="--")
+            ax_vs.axvline(1.0, color="#1a7f37", linewidth=1.0,
+                          linestyle="--", alpha=0.6, label="PBR=1.0")
+            ax_vs.set_xlabel("PBR（株価純資産倍率）", fontsize=12)
+            ax_vs.set_ylabel("アルファ (%)", fontsize=12)
+            ax_vs.set_title("PBR vs アルファ分析マップ", fontsize=12, fontweight="bold")
+            ax_vs.legend(fontsize=9); ax_vs.grid(True, alpha=0.2)
+            plt.tight_layout()
+            st.pyplot(fig_vsc2, clear_figure=True)
+
+
+
+# =================================================================
+# 🌟 バリューファクターによる価値創造分析
+# =================================================================
+
+_ERP_JAPAN = 0.05  # 日本株式リスクプレミアム想定（5%）
+
+st.header("🌟 バリューファクターによる価値創造分析")
+st.divider()
+st.caption(
+    "**価値創造（Value Creation）= ROE > 資本コスト（CoE）**。"
+    "CAPMで推定した資本コストとROEを比較し、企業が株主価値を創造しているかを判定します。"
+    "伊藤レポートが提唱するROE 8%基準・PBR-ROEマトリクスで「割安の価値創造企業」を発掘します。"
+)
+
+try:
+    _vc_ok = not df_results.empty and not df_factor.empty
+except Exception:
+    _vc_ok = False
+
+if not _vc_ok:
+    st.info("上部の「パフォーマンス分析」が自動実行後に表示されます")
+else:
+    df_vc = df_factor_merged.dropna(subset=["ROE(%)", "ベータ", "PBR"]).copy()
+    df_vc = df_vc[df_vc["ROE(%)"].abs() < 200]  # 異常値除去
+
+    _rf_pct = risk_free_rate * 100
+    df_vc["資本コスト(%)"]        = (_rf_pct + df_vc["ベータ"] * _ERP_JAPAN * 100).round(2)
+    df_vc["価値創造スプレッド(%)"] = (df_vc["ROE(%)"] - df_vc["資本コスト(%)"]).round(2)
+    df_vc["価値創造判定"]          = df_vc["価値創造スプレッド(%)"].apply(
+        lambda x: "✅ 価値創造" if x > 0 else "❌ 価値破壊"
+    )
+    _avg_coe = df_vc["資本コスト(%)"].mean()
+    df_vc["理論PBR"] = (
+        df_vc["ROE(%)"] / df_vc["資本コスト(%)"].replace(0, np.nan)
+    ).round(2)
+
+    _creators  = (df_vc["価値創造スプレッド(%)"] > 0).sum()
+    _destroyers = (df_vc["価値創造スプレッド(%)"] <= 0).sum()
+    _ito_pass  = (df_vc["ROE(%)"] >= 8).sum()
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("✅ 価値創造企業", f"{_creators}社", f"全{_creators+_destroyers}社中")
+    m2.metric("❌ 価値破壊企業", f"{_destroyers}社")
+    m3.metric("平均スプレッド（ROE−CoE）", f"{df_vc['価値創造スプレッド(%)'].mean():+.2f}%")
+    m4.metric("伊藤レポート ROE≥8%", f"{_ito_pass}社")
+
+    st.divider()
+
+    vc_t1, vc_t2, vc_t3, vc_t4 = st.tabs([
+        "🏆 価値創造ランキング",
+        "🗺️ PBR-ROEマトリクス",
+        "📊 価値創造スコアカード",
+        "🤖 AI価値創造分析",
+    ])
+
+    with vc_t1:
+        st.markdown("#### 🏆 価値創造スプレッドランキング（ROE − 資本コスト）")
+        st.caption(
+            f"資本コスト = 無リスク金利（{_rf_pct:.1f}%）"
+            f" + β × 株式リスクプレミアム（{_ERP_JAPAN*100:.0f}%）"
+        )
+
+        col_cr, col_ds = st.columns(2)
+        with col_cr:
+            st.markdown("**✅ 価値創造企業 上位30（ROE > CoE）**")
+            top_vc = df_vc[df_vc["価値創造スプレッド(%)"] > 0].nlargest(
+                30, "価値創造スプレッド(%)")
+
+            def _color_spread(val):
+                if isinstance(val, float):
+                    if val >= 20: return "color:#1a7f37;font-weight:bold;font-size:14px"
+                    if val >= 10: return "color:#1a7f37;font-weight:bold"
+                    if val > 0:   return "color:#388e3c"
+                return ""
+
+            st.dataframe(
+                top_vc[["企業名", "業種", "ROE(%)", "資本コスト(%)",
+                         "価値創造スプレッド(%)", "PBR", "アルファ(%)"]].reset_index(drop=True)
+                .style.format({
+                    "ROE(%)": "{:.1f}%", "資本コスト(%)": "{:.1f}%",
+                    "価値創造スプレッド(%)": "{:+.2f}%",
+                    "PBR": "{:.2f}", "アルファ(%)": "{:+.2f}%",
+                })
+                .map(_color_spread, subset=["価値創造スプレッド(%)"]),
+                use_container_width=True, hide_index=True,
+            )
+
+        with col_ds:
+            st.markdown("**❌ 価値破壊企業 下位20（ROE < CoE）**")
+            bot_vc = df_vc[df_vc["価値創造スプレッド(%)"] <= 0].nsmallest(
+                20, "価値創造スプレッド(%)")
+
+            def _color_neg(val):
+                if isinstance(val, float):
+                    if val <= -20: return "color:#d1242f;font-weight:bold;font-size:14px"
+                    if val <= -10: return "color:#d1242f;font-weight:bold"
+                    if val < 0:    return "color:#e57373"
+                return ""
+
+            st.dataframe(
+                bot_vc[["企業名", "業種", "ROE(%)", "資本コスト(%)",
+                         "価値創造スプレッド(%)", "PBR"]].reset_index(drop=True)
+                .style.format({
+                    "ROE(%)": "{:.1f}%", "資本コスト(%)": "{:.1f}%",
+                    "価値創造スプレッド(%)": "{:+.2f}%", "PBR": "{:.2f}",
+                })
+                .map(_color_neg, subset=["価値創造スプレッド(%)"]),
+                use_container_width=True, hide_index=True,
+            )
+
+        top20_sp = df_vc.nlargest(20, "価値創造スプレッド(%)")
+        fig_sp, ax_sp = plt.subplots(figsize=(14, 6))
+        ax_sp.bar(top20_sp["企業名"], top20_sp["価値創造スプレッド(%)"],
+                  color=["#1a7f37" if v > 0 else "#d1242f"
+                         for v in top20_sp["価値創造スプレッド(%)"]],
+                  alpha=0.85)
+        ax_sp.axhline(0, color="black", linewidth=0.8)
+        ax_sp.axhline(8 - _rf_pct, color="orange", linestyle="--",
+                      alpha=0.7, label="伊藤レポート基準（ROE8%相当）")
+        ax_sp.set_title("価値創造スプレッド 上位20銘柄（ROE − 資本コスト）",
+                        fontsize=12, fontweight="bold")
+        ax_sp.set_ylabel("スプレッド (%)")
+        ax_sp.tick_params(axis="x", rotation=45, labelsize=9)
+        ax_sp.legend(fontsize=9); ax_sp.grid(True, axis="y", alpha=0.3)
+        plt.tight_layout()
+        st.pyplot(fig_sp, clear_figure=True)
+
+        csv_vc = df_vc.sort_values("価値創造スプレッド(%)", ascending=False)[[
+            "企業名", "業種", "ROE(%)", "資本コスト(%)",
+            "価値創造スプレッド(%)", "価値創造判定", "PBR", "理論PBR", "アルファ(%)"
+        ]].to_csv(index=False, encoding="utf-8-sig")
+        st.download_button(
+            "⬇️ 価値創造分析CSV", data=csv_vc,
+            file_name=f"value_creation_{datetime.today().strftime('%Y%m%d')}.csv",
+            mime="text/csv", key="vc_dl",
+        )
+
+    with vc_t2:
+        st.markdown("#### 🗺️ PBR-ROEマトリクス（価値創造マップ）")
+        st.caption(
+            "**理論値**: PBR ≈ ROE ÷ 資本コスト（成長ゼロ仮定）。"
+            " **💎左上**（高ROE・低PBR）= 割安の価値創造企業（投資好機候補）"
+        )
+
+        df_pbr_roe = df_vc.dropna(subset=["PBR", "ROE(%)"])
+        df_pbr_roe = df_pbr_roe[df_pbr_roe["PBR"].between(0.1, 15)].copy()
+
+        try:
+            import plotly.express as px
+            df_pbr_roe["_dist2"] = np.sqrt(
+                (df_pbr_roe["ROE(%)"] - df_pbr_roe["ROE(%)"].mean())**2 +
+                (df_pbr_roe["PBR"] - df_pbr_roe["PBR"].mean())**2
+            )
+            top_idx2 = df_pbr_roe.nlargest(20, "_dist2").index
+            df_pbr_roe["_label2"] = ""
+            df_pbr_roe.loc[top_idx2, "_label2"] = df_pbr_roe.loc[top_idx2, "企業名"]
+
+            fig_pr = px.scatter(
+                df_pbr_roe,
+                x="ROE(%)", y="PBR",
+                color="価値創造判定",
+                text="_label2",
+                size=df_pbr_roe["時価総額(億円)"].clip(lower=100),
+                hover_name="企業名",
+                hover_data={
+                    "業種": True, "ROE(%)": ":.1f", "PBR": ":.2f",
+                    "価値創造スプレッド(%)": ":.2f",
+                    "資本コスト(%)": ":.1f", "理論PBR": ":.2f",
+                    "時価総額(億円)": ":.0f",
+                    "_label2": False, "_dist2": False,
+                },
+                title="PBR-ROEマトリクス（バブルサイズ=時価総額、ラベル=注目銘柄）",
+                height=680,
+                color_discrete_map={
+                    "✅ 価値創造": "#1a7f37",
+                    "❌ 価値破壊": "#d1242f",
+                },
+            )
+            roe_line = np.linspace(
+                max(df_pbr_roe["ROE(%)"].min(), -5),
+                min(df_pbr_roe["ROE(%)"].max(), 60), 100
+            )
+            fig_pr.add_scatter(
+                x=roe_line, y=roe_line / _avg_coe,
+                mode="lines",
+                name=f"理論PBRライン（CoE≈{_avg_coe:.1f}%）",
+                line=dict(color="#f57c00", dash="dash", width=2),
+            )
+            fig_pr.add_hline(y=1.0, line_dash="dot", line_color="gray",
+                             opacity=0.5, annotation_text="PBR=1")
+            fig_pr.add_vline(x=8.0, line_dash="dot", line_color="orange",
+                             opacity=0.5, annotation_text="ROE=8%（伊藤）")
+            fig_pr.add_vline(x=_rf_pct, line_dash="dot", line_color="#1565c0",
+                             opacity=0.3, annotation_text=f"rf={_rf_pct:.1f}%")
+            fig_pr.update_traces(
+                textposition="top center",
+                textfont=dict(size=8, color="rgba(0,0,0,0.72)"),
+            )
+            fig_pr.update_layout(
+                xaxis_title="ROE (%)", yaxis_title="PBR（株価純資産倍率）",
+                plot_bgcolor="white",
+                hoverlabel=dict(bgcolor="white", font_size=12, namelength=-1),
+            )
+            st.plotly_chart(fig_pr, use_container_width=True)
+
+        except ImportError:
+            fig_pr2, ax_pr = plt.subplots(figsize=(12, 8))
+            for verdict, color in [("✅ 価値創造", "#1a7f37"), ("❌ 価値破壊", "#d1242f")]:
+                sub = df_pbr_roe[df_pbr_roe["価値創造判定"] == verdict]
+                ax_pr.scatter(sub["ROE(%)"], sub["PBR"],
+                              label=verdict, color=color, s=60, alpha=0.75)
+                for _, row in sub.iterrows():
+                    if abs(row["価値創造スプレッド(%)"]) > df_vc["価値創造スプレッド(%)"].std() * 1.5:
+                        ax_pr.annotate(row["企業名"], (row["ROE(%)"], row["PBR"]),
+                                      fontsize=7, xytext=(4, 4),
+                                      textcoords="offset points")
+            roe_r = np.linspace(df_pbr_roe["ROE(%)"].min(),
+                                df_pbr_roe["ROE(%)"].max(), 100)
+            ax_pr.plot(roe_r, roe_r / _avg_coe, "r--", alpha=0.5,
+                      label=f"理論PBR（CoE≈{_avg_coe:.1f}%）")
+            ax_pr.axhline(1.0, color="gray", linestyle=":", alpha=0.5)
+            ax_pr.axvline(8.0, color="orange", linestyle=":", alpha=0.5,
+                         label="ROE=8%")
+            ax_pr.set_xlabel("ROE (%)"); ax_pr.set_ylabel("PBR")
+            ax_pr.set_title("PBR-ROEマトリクス", fontsize=12, fontweight="bold")
+            ax_pr.legend(fontsize=9); ax_pr.grid(True, alpha=0.2)
+            plt.tight_layout()
+            st.pyplot(fig_pr2, clear_figure=True)
+
+        st.markdown("#### 📋 4象限サマリー")
+        _med_roe = df_pbr_roe["ROE(%)"].median()
+        _med_pbr = df_pbr_roe["PBR"].median()
+        q1 = df_pbr_roe[(df_pbr_roe["ROE(%)"] >= _med_roe) & (df_pbr_roe["PBR"] < _med_pbr)]
+        q2 = df_pbr_roe[(df_pbr_roe["ROE(%)"] >= _med_roe) & (df_pbr_roe["PBR"] >= _med_pbr)]
+        q3 = df_pbr_roe[(df_pbr_roe["ROE(%)"] < _med_roe)  & (df_pbr_roe["PBR"] < _med_pbr)]
+        q4 = df_pbr_roe[(df_pbr_roe["ROE(%)"] < _med_roe)  & (df_pbr_roe["PBR"] >= _med_pbr)]
+
+        cq1, cq2, cq3, cq4 = st.columns(4)
+        cq1.metric("💎 高ROE・低PBR（割安価値創造）", f"{len(q1)}社")
+        cq2.metric("🚀 高ROE・高PBR（成長期待）",     f"{len(q2)}社")
+        cq3.metric("⚠️ 低ROE・低PBR（バリュートラップ）", f"{len(q3)}社")
+        cq4.metric("🔴 低ROE・高PBR（割高・価値破壊）", f"{len(q4)}社")
+
+        if not q1.empty:
+            st.markdown("**💎 割安の価値創造企業（高ROE・低PBR）上位10銘柄**")
+            st.dataframe(
+                q1.nlargest(10, "価値創造スプレッド(%)")[
+                    ["企業名", "業種", "ROE(%)", "PBR", "価値創造スプレッド(%)", "アルファ(%)"]
+                ].reset_index(drop=True)
+                .style.format({
+                    "ROE(%)": "{:.1f}%", "PBR": "{:.2f}",
+                    "価値創造スプレッド(%)": "{:+.2f}%", "アルファ(%)": "{:+.2f}%",
+                }),
+                use_container_width=True, hide_index=True,
+            )
+
+    with vc_t3:
+        st.markdown("#### 📊 価値創造スコアカード（マルチファクター総合評価）")
+        st.caption(
+            "価値創造スプレッド・PBR割安度・α・シャープレシオの4軸を"
+            "0〜25点に正規化して合算した総合スコア（最高100点）でランキングします。"
+        )
+
+        df_score = df_vc.copy()
+
+        def _norm(series, reverse=False, pts=25):
+            mn, mx = series.min(), series.max()
+            if mx == mn:
+                return pd.Series(pts / 2, index=series.index)
+            n = (series - mn) / (mx - mn) * pts
+            return (pts - n) if reverse else n
+
+        df_score["S_spread"] = _norm(df_score["価値創造スプレッド(%)"])
+        df_score["S_pbr"]    = _norm(df_score["PBR"], reverse=True)
+        df_score["S_alpha"]  = _norm(df_score["アルファ(%)"])
+        df_score["S_sr"]     = _norm(df_score["シャープレシオ"])
+        df_score["総合スコア"] = (
+            df_score["S_spread"] + df_score["S_pbr"] +
+            df_score["S_alpha"]  + df_score["S_sr"]
+        ).round(1)
+        df_score = df_score.sort_values("総合スコア", ascending=False).reset_index(drop=True)
+
+        def _color_sc(val):
+            if isinstance(val, float):
+                if val >= 80: return "color:#1a7f37;font-weight:bold;font-size:14px"
+                if val >= 60: return "color:#1a7f37;font-weight:bold"
+                if val >= 40: return "color:#f57c00"
+            return ""
+
+        st.dataframe(
+            df_score.head(30)[[
+                "企業名", "業種", "総合スコア", "価値創造スプレッド(%)",
+                "PBR", "アルファ(%)", "シャープレシオ", "ROE(%)", "価値創造判定"
+            ]].style.format({
+                "総合スコア": "{:.1f}", "価値創造スプレッド(%)": "{:+.2f}%",
+                "PBR": "{:.2f}", "アルファ(%)": "{:+.2f}%",
+                "シャープレシオ": "{:.2f}", "ROE(%)": "{:.1f}%",
+            }).map(_color_sc, subset=["総合スコア"]),
+            use_container_width=True, hide_index=True,
+        )
+
+        st.markdown("#### 🕸️ 上位5銘柄 レーダーチャート")
+        top5_r = df_score.head(5)
+        _rcols  = ["S_spread", "S_pbr", "S_alpha", "S_sr"]
+        _rlabels = ["価値創造\nスプレッド", "割安度\n(低PBR)", "アルファ", "シャープ\nレシオ"]
+        angles  = np.linspace(0, 2 * np.pi, len(_rcols), endpoint=False).tolist()
+        angles += angles[:1]
+        colors_r = ["#1565c0", "#1a7f37", "#f57c00", "#7b1fa2", "#d32f2f"]
+
+        fig_r, ax_r = plt.subplots(figsize=(9, 8), subplot_kw=dict(polar=True))
+        for i, (_, row) in enumerate(top5_r.iterrows()):
+            vals = [row[c] for c in _rcols] + [row[_rcols[0]]]
+            ax_r.plot(angles, vals, "o-", linewidth=2,
+                     color=colors_r[i], label=row["企業名"])
+            ax_r.fill(angles, vals, alpha=0.08, color=colors_r[i])
+        ax_r.set_xticks(angles[:-1])
+        ax_r.set_xticklabels(_rlabels, fontsize=10)
+        ax_r.set_ylim(0, 25)
+        ax_r.set_title("価値創造 上位5銘柄 マルチファクター評価",
+                       fontsize=12, fontweight="bold", pad=20)
+        ax_r.legend(loc="upper right", bbox_to_anchor=(1.35, 1.1), fontsize=9)
+        ax_r.grid(True, alpha=0.3)
+        plt.tight_layout()
+        st.pyplot(fig_r, clear_figure=True)
+
+    with vc_t4:
+        st.markdown("#### 🤖 AI価値創造企業 投資テーゼ分析")
+
+        top10_ai = df_score.head(10)
+        _vc_sum = top10_ai[[
+            "企業名", "業種", "総合スコア", "価値創造スプレッド(%)",
+            "PBR", "ROE(%)", "アルファ(%)"
+        ]].to_string(index=False)
+
+        _top1 = df_vc.nlargest(1, "価値創造スプレッド(%)").iloc[0]
+        _q1_top = q1.nlargest(3, "価値創造スプレッド(%)")[
+            ["企業名", "ROE(%)", "PBR"]
+        ].to_string(index=False) if not q1.empty else "該当なし"
+
+        _prompt_vc = f"""
+あなたは日本株の機関投資家向けバリュー分析ストラテジストです。
+
+【価値創造分析 前提条件】
+- 無リスク金利: {_rf_pct:.1f}%  株式リスクプレミアム: {_ERP_JAPAN*100:.0f}%
+- 平均資本コスト（CoE）: {_avg_coe:.1f}%
+- 価値創造企業: {_creators}社 / 全{_creators+_destroyers}社
+- 伊藤レポート ROE8%達成: {_ito_pass}社
+
+【総合スコア上位10銘柄】
+{_vc_sum}
+
+【最高スプレッド企業】
+{_top1["企業名"]}（ROE {_top1["ROE(%)"]:.1f}%、CoE {_top1["資本コスト(%)"]:.1f}%、スプレッド {_top1["価値創造スプレッド(%)"]:.1f}%）
+
+【割安の価値創造候補（高ROE・低PBR）上位3社】
+{_q1_top}
+
+以下の観点で600文字以内で分析してください:
+1. 🏆 特に注目すべき価値創造企業とその投資テーゼ
+2. 📊 日本市場全体の価値創造状況（ROE vs CoEの現状評価）
+3. 💎 割安の価値創造企業（高ROE・低PBR）への戦略的アプローチ
+4. ⚠️ バリュートラップを避けるための注意点
+5. 💡 伊藤レポート・東証改革の観点からの総合評価
+
+※ 投資判断は自己責任である旨を最後に一言付記してください。
+"""
+        with st.spinner("AI価値創造分析中..."):
+            try:
+                comment, ai_name = generate_ai_comment(_prompt_vc)
+                st.info(f"🤖 **AI価値創造分析（{ai_name}）**\n\n{comment}")
+            except Exception as e:
+                st.warning(f"AI APIエラー: {e}")
+
 
 st.divider()
 st.caption("データソース: Yahoo Finance / J-Quants / Finnhub / Alpha Vantage / TDnet / 株探 / みんかぶ / 日経 | 投資判断は自己責任で")
