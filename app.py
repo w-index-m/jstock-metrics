@@ -1,0 +1,4739 @@
+import streamlit as st
+import google.generativeai as genai
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from datetime import datetime
+from dateutil.relativedelta import relativedelta
+from groq import Groq
+import requests
+import xml.etree.ElementTree as ET
+import re
+from io import StringIO
+
+# -----------------------------
+# フォント設定（日本語対応）
+# -----------------------------
+import matplotlib.font_manager as fm
+import os
+
+_FONT_PATHS = [
+    "font/NotoSansCJK-Regular.ttc",
+    "font/NotoSansJP-ExtraBold.ttf",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Medium.ttc",
+    "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf",
+    "/usr/share/fonts/opentype/ipafont-gothic/ipag.ttf",
+]
+
+def _set_japanese_font():
+    for path in _FONT_PATHS:
+        if os.path.exists(path):
+            fm.fontManager.addfont(path)
+            prop = fm.FontProperties(fname=path)
+            plt.rcParams["font.family"] = prop.get_name()
+            return prop.get_name()
+    return None
+
+_set_japanese_font()
+plt.rcParams["axes.unicode_minus"] = False
+
+# -----------------------------
+# 定数
+# -----------------------------
+GEMINI_MODEL = "gemini-2.5-pro"
+GROQ_MODEL = "llama-3.1-8b-instant"
+
+# -----------------------------
+# ページ設定
+# -----------------------------
+st.set_page_config(layout="wide", page_title="📈 日本株 分析ダッシュボード", page_icon="📈", initial_sidebar_state="expanded")
+st.title("📈 日本株 シャープレシオ分析 + ニュース統合")
+
+# ── アクセス計測 ────────────────────────────────────────────────
+try:
+    from analytics import track_pageview as _track_pv
+    _track_pv("jstock")
+except Exception:
+    pass
+
+# ── Google翻訳ウィジェット ────────────────────────────────────────
+import streamlit.components.v1 as components
+components.html(
+    """
+    <div id="google_translate_element" style="margin:4px 0 8px 0;display:inline-block;"></div>
+    <script type="text/javascript">
+    function googleTranslateElementInit(){
+        new google.translate.TranslateElement({
+            pageLanguage:'ja',includedLanguages:'ja,en,zh-TW',
+            layout:google.translate.TranslateElement.InlineLayout.SIMPLE,
+            autoDisplay:false
+        },'google_translate_element');
+    }
+    </script>
+    <script src="//translate.google.com/translate_a/element.js?cb=googleTranslateElementInit"></script>
+    <style>
+    .goog-te-gadget-simple{border:1px solid #d0d7de!important;border-radius:6px!important;padding:4px 8px!important;font-size:13px!important;background:#f6f8fa!important;}
+    .goog-te-banner-frame{display:none!important;}body{top:0!important;}
+    </style>
+    """, height=50,
+)
+
+# ── 関連ダッシュボード リンクバー ────────────────────────────────
+st.markdown(
+    """
+    <div style="
+        background: linear-gradient(135deg, #e8eaf6 0%, #e8f5e9 100%);
+        border: 1px solid #c5cae9;
+        border-radius: 10px;
+        padding: 10px 16px;
+        margin-bottom: 16px;
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        flex-wrap: wrap;
+    ">
+        <span style="font-weight:700;font-size:13px;color:#3949ab;white-space:nowrap;">
+            🔗 関連ダッシュボード
+        </span>
+        <a href="https://usstock-metrics.streamlit.app/" target="_blank" rel="noopener noreferrer" style="
+            display:inline-flex;align-items:center;gap:6px;
+            background:linear-gradient(135deg,#1565c0,#1976d2);
+            color:#fff;padding:7px 16px;border-radius:7px;text-decoration:none;
+            font-size:13px;font-weight:700;
+            box-shadow:0 2px 8px rgba(21,101,192,0.35);
+            white-space:nowrap;
+        ">🇺🇸&nbsp;USStockMetrics</a>
+        <a href="https://windex.streamlit.app/" target="_blank" rel="noopener noreferrer" style="
+            display:inline-flex;align-items:center;gap:6px;
+            background:linear-gradient(135deg,#2e7d32,#43a047);
+            color:#fff;padding:7px 16px;border-radius:7px;text-decoration:none;
+            font-size:13px;font-weight:700;
+            box-shadow:0 2px 8px rgba(46,125,50,0.35);
+            white-space:nowrap;
+        ">📊&nbsp;Market Dashboard</a>
+        <span style="font-size:11px;color:#888;">
+            各ダッシュボードで詳細な銘柄分析・指標をご覧いただけます
+        </span>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+# -----------------------------
+# AI設定（Gemini優先 / Groqフォールバック）
+# -----------------------------
+GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
+GROQ_API_KEY   = st.secrets.get("GROQ_API_KEY", "")
+genai.configure(api_key=GEMINI_API_KEY)
+gemini_model = genai.GenerativeModel(GEMINI_MODEL)
+groq_client  = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+
+def generate_ai_comment(prompt: str) -> tuple[str, str]:
+    """Gemini → Groq フォールバック（安定版）"""
+    # ---- Gemini ----
+    try:
+        response = gemini_model.generate_content(prompt)
+        text = getattr(response, "text", None)
+        if not text and hasattr(response, "candidates") and response.candidates:
+            text = response.candidates[0].content.parts[0].text
+        if text:
+            return text, "Gemini"
+    except Exception as e:
+        print("Gemini Error:", e)
+
+    # ---- Groq ----
+    if groq_client is None:
+        return "AIエラー（Gemini失敗・Groq未設定）", "Error"
+    try:
+        chat = groq_client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=400,
+        )
+        return chat.choices[0].message.content, "Groq"
+    except Exception as e:
+        print("Groq Error:", e)
+        return f"Groqも失敗: {e}", "Error"
+
+
+# ================================================================
+# yfinance ユーティリティ（MultiIndex対応）
+# ================================================================
+
+def _yfdownload(ticker, start=None, end=None, period=None, progress=False, **kwargs):
+    """yfinance v0.2以降のMultiIndex列を自動フラット化"""
+    try:
+        params = dict(progress=progress, auto_adjust=True)
+        params.update(kwargs)
+        if period:
+            params["period"] = period
+        else:
+            params["start"] = start
+            params["end"]   = end
+        df = yf.download(ticker, **params)
+        if df.empty:
+            return df
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.droplevel(1)
+        df = df.loc[:, ~df.columns.duplicated()]
+        return df
+    except Exception as e:
+        import logging as _lg
+        _lg.getLogger(__name__).warning(f"_yfdownload({ticker}): {e}")
+        return pd.DataFrame()
+
+
+def _to_series(col):
+    """DataFrame列またはSeriesを確実に1次元Seriesに変換"""
+    if isinstance(col, pd.DataFrame):
+        return col.iloc[:, 0]
+    return col
+
+
+# ================================================================
+# 📰 ニュース取得モジュール
+# ================================================================
+
+_NEWS_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+
+@st.cache_data(ttl=600)
+def fetch_yahoo_jp_news(ticker_code: str, max_items: int = 8) -> list[dict]:
+    code = ticker_code.replace(".T", "")
+    url = f"https://finance.yahoo.co.jp/rss/stocks/{code}"
+    try:
+        r = requests.get(url, headers=_NEWS_HEADERS, timeout=10)
+        if r.status_code != 200:
+            return []
+        root = ET.fromstring(r.content)
+        items = []
+        for item in root.findall(".//item")[:max_items]:
+            title = item.findtext("title", "").strip()
+            link  = item.findtext("link", "").strip()
+            pubdate = item.findtext("pubDate", "").strip()
+            desc  = item.findtext("description", "").strip()
+            desc = re.sub(r"<[^>]+>", "", desc)[:100]
+            if title:
+                items.append({"source": "Yahoo!Finance JP", "title": title,
+                              "link": link, "date": pubdate, "summary": desc})
+        return items
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=600)
+def fetch_kabutan_news(ticker_code: str, max_items: int = 8) -> list[dict]:
+    code = ticker_code.replace(".T", "")
+    url = f"https://kabutan.jp/stock/news?code={code}"
+    try:
+        r = requests.get(url, headers=_NEWS_HEADERS, timeout=12)
+        if r.status_code != 200:
+            return []
+        titles = re.findall(
+            r'<a href="(/news/[^"]+)"[^>]*>([^<]{5,120})</a>', r.text
+        )
+        times  = re.findall(r'<time[^>]*>([^<]+)</time>', r.text)
+        items = []
+        for i, (path, title) in enumerate(titles[:max_items]):
+            title = title.strip()
+            if len(title) < 5 or "株探" in title:
+                continue
+            date = times[i].strip() if i < len(times) else ""
+            items.append({
+                "source": "株探(Kabutan)",
+                "title": title,
+                "link": f"https://kabutan.jp{path}",
+                "date": date,
+                "summary": "",
+            })
+        return items
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=600)
+def fetch_minkabu_news(ticker_code: str, max_items: int = 6) -> list[dict]:
+    code = ticker_code.replace(".T", "")
+    url = f"https://minkabu.jp/stock/{code}/news"
+    try:
+        r = requests.get(url, headers=_NEWS_HEADERS, timeout=12)
+        if r.status_code != 200:
+            return []
+        titles = re.findall(
+            r'<a[^>]+href="(/stock/[^"]+/news/[^"]+)"[^>]*>\s*<[^>]+>\s*([^<]{5,120})\s*</[^>]+>',
+            r.text,
+        )
+        if not titles:
+            titles = re.findall(
+                r'class="[^"]*news[^"]*"[^>]*>.*?<a[^>]+href="([^"]+)"[^>]*>([^<]{5,120})</a>',
+                r.text, re.DOTALL
+            )
+        dates = re.findall(r'\d{4}/\d{2}/\d{2}', r.text)
+        items = []
+        for i, (path, title) in enumerate(titles[:max_items]):
+            title = title.strip()
+            if len(title) < 5:
+                continue
+            link = f"https://minkabu.jp{path}" if path.startswith("/") else path
+            date = dates[i] if i < len(dates) else ""
+            items.append({
+                "source": "みんかぶ",
+                "title": title,
+                "link": link,
+                "date": date,
+                "summary": "",
+            })
+        return items
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=900)
+def fetch_tdnet_news(ticker_code: str, max_items: int = 6) -> list[dict]:
+    code = ticker_code.replace(".T", "")
+    search_url = f"https://www.release.tdnet.info/inbs/I_main_00.html?target-code={code}"
+    try:
+        r = requests.get(search_url, headers=_NEWS_HEADERS, timeout=12)
+        if r.status_code != 200:
+            return []
+        rows = re.findall(
+            r'<td[^>]*class="[^"]*kjTitle[^"]*"[^>]*>(.*?)</td>.*?'
+            r'href="([^"]+\.pdf)"',
+            r.text, re.DOTALL
+        )
+        items = []
+        for title_raw, pdf_path in rows[:max_items]:
+            title = re.sub(r"<[^>]+>", "", title_raw).strip()
+            if not title:
+                continue
+            link = f"https://www.release.tdnet.info{pdf_path}" if pdf_path.startswith("/") else pdf_path
+            items.append({
+                "source": "TDnet（適時開示）",
+                "title": title,
+                "link": link,
+                "date": "",
+                "summary": "📄 PDF",
+            })
+        return items
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=600)
+def fetch_nikkei_market_rss(max_items: int = 8) -> list[dict]:
+    url = "https://www.nikkei.com/rss/market.xml"
+    try:
+        r = requests.get(url, headers=_NEWS_HEADERS, timeout=10)
+        if r.status_code != 200:
+            return []
+        root = ET.fromstring(r.content)
+        items = []
+        for item in root.findall(".//item")[:max_items]:
+            title   = item.findtext("title", "").strip()
+            link    = item.findtext("link", "").strip()
+            pubdate = item.findtext("pubDate", "").strip()
+            if title:
+                items.append({"source": "日経新聞", "title": title,
+                              "link": link, "date": pubdate, "summary": ""})
+        return items
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=600)
+def fetch_reuters_jp_rss(max_items: int = 8) -> list[dict]:
+    url = "https://feeds.reuters.com/reuters/JPBusinessNews"
+    try:
+        r = requests.get(url, headers=_NEWS_HEADERS, timeout=10)
+        if r.status_code != 200:
+            return []
+        root = ET.fromstring(r.content)
+        items = []
+        for item in root.findall(".//item")[:max_items]:
+            title   = item.findtext("title", "").strip()
+            link    = item.findtext("link", "").strip()
+            pubdate = item.findtext("pubDate", "").strip()
+            if title:
+                items.append({"source": "Reuters JP", "title": title,
+                              "link": link, "date": pubdate, "summary": ""})
+        return items
+    except Exception:
+        return []
+
+
+def fetch_all_news(ticker_code: str, max_per_source: int = 5) -> list[dict]:
+    import concurrent.futures
+    code = ticker_code.replace(".T", "")
+    tasks = {
+        "yahoo_jp":  lambda: fetch_yahoo_jp_news(code, max_per_source),
+        "kabutan":   lambda: fetch_kabutan_news(code, max_per_source),
+        "minkabu":   lambda: fetch_minkabu_news(code, max_per_source),
+        "tdnet":     lambda: fetch_tdnet_news(code, max_per_source),
+        "nikkei":    lambda: fetch_nikkei_market_rss(max_per_source),
+        "reuters":   lambda: fetch_reuters_jp_rss(max_per_source),
+    }
+    all_items = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
+        futures = {ex.submit(fn): key for key, fn in tasks.items()}
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                all_items.extend(future.result())
+            except Exception:
+                pass
+    seen, unique = set(), []
+    for item in all_items:
+        if item["title"] not in seen:
+            seen.add(item["title"])
+            unique.append(item)
+    return unique
+
+
+def ai_news_summary(news_items: list[dict], company_name: str, ticker: str) -> str:
+    if not news_items:
+        return "ニュースが取得できませんでした。"
+    headlines = "\n".join(
+        f"[{it['source']}] {it['title']}" for it in news_items[:15]
+    )
+    prompt = (
+        f"以下は日本株「{company_name}({ticker})」に関する最新ニュースです。\n\n"
+        f"{headlines}\n\n"
+        "投資家向けに300文字以内でまとめてください:\n"
+        "1. センチメント判定: 強気 / 弱気 / 中立\n"
+        "2. 注目イベントの要点\n"
+        "3. 株価への影響の可能性\n"
+    )
+    try:
+        comment, ai_name = generate_ai_comment(prompt)
+        return f"{comment}\n\n_AI: {ai_name}_"
+    except Exception as e:
+        return f"AI分析エラー: {e}"
+
+
+# ================================================================
+# 🔄 セクターローテーション分析モジュール
+# ================================================================
+
+@st.cache_data(ttl=1800)
+def get_sector_performance(ticker_name_map: dict, period_days: int = 20) -> pd.DataFrame:
+    from datetime import timedelta
+    end_date   = datetime.today()
+    start_date = end_date - timedelta(days=period_days + 10)
+    sector_returns = {}
+    for ticker, (name, sector) in ticker_name_map.items():
+        try:
+            df = _yfdownload(ticker, start=start_date, end=end_date, progress=False)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.droplevel(1)
+            if df.empty or len(df) < 2:
+                continue
+            close = df["Close"].dropna()
+            ret = (close.iloc[-1] - close.iloc[0]) / close.iloc[0] * 100
+            if sector not in sector_returns:
+                sector_returns[sector] = []
+            sector_returns[sector].append(float(ret))
+        except Exception:
+            continue
+    rows = []
+    for sector, rets in sector_returns.items():
+        rows.append({
+            "業種": sector,
+            "平均リターン(%)": np.mean(rets),
+            "中央値リターン(%)": np.median(rets),
+            "銘柄数": len(rets),
+            "上昇銘柄数": sum(1 for r in rets if r > 0),
+            "下落銘柄数": sum(1 for r in rets if r < 0),
+        })
+    df_result = pd.DataFrame(rows).sort_values("平均リターン(%)", ascending=False).reset_index(drop=True)
+    df_result["騰落率(%)"] = df_result["平均リターン(%)"].round(2)
+    df_result["上昇率(%)"] = (df_result["上昇銘柄数"] / df_result["銘柄数"] * 100).round(1)
+    return df_result
+
+
+@st.cache_data(ttl=1800)
+def get_sector_timeseries(ticker_name_map: dict, days: int = 60) -> pd.DataFrame:
+    from datetime import timedelta
+    end_date   = datetime.today()
+    start_date = end_date - timedelta(days=days + 5)
+    sector_price_data = {}
+    for ticker, (name, sector) in ticker_name_map.items():
+        try:
+            df = _yfdownload(ticker, start=start_date, end=end_date, progress=False)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.droplevel(1)
+            if df.empty or len(df) < 5:
+                continue
+            close = df["Close"].dropna()
+            norm  = close / close.iloc[0] * 100
+            if sector not in sector_price_data:
+                sector_price_data[sector] = []
+            sector_price_data[sector].append(norm)
+        except Exception:
+            continue
+    sector_avg = {}
+    for sector, series_list in sector_price_data.items():
+        combined = pd.concat(series_list, axis=1)
+        sector_avg[sector] = combined.mean(axis=1)
+    df_ts = pd.DataFrame(sector_avg)
+    df_ts.index = pd.to_datetime(df_ts.index)
+    return df_ts.sort_index()
+
+
+def plot_sector_bar(df_sector: pd.DataFrame, title: str) -> plt.Figure:
+    df_sorted = df_sector.sort_values("平均リターン(%)", ascending=True)
+    colors = ["#d32f2f" if v < 0 else "#388e3c" for v in df_sorted["平均リターン(%)"]]
+    fig, ax = plt.subplots(figsize=(10, max(5, len(df_sorted) * 0.45)))
+    bars = ax.barh(df_sorted["業種"], df_sorted["平均リターン(%)"], color=colors, edgecolor="none")
+    for bar, val in zip(bars, df_sorted["平均リターン(%)"]):
+        xpos = bar.get_width() + (0.05 if val >= 0 else -0.05)
+        ha   = "left" if val >= 0 else "right"
+        ax.text(xpos, bar.get_y() + bar.get_height() / 2,
+                f"{val:+.2f}%", va="center", ha=ha, fontsize=8)
+    ax.axvline(0, color="black", linewidth=0.8)
+    ax.set_title(title, fontsize=13, fontweight="bold")
+    ax.set_xlabel("平均リターン (%)")
+    ax.tick_params(axis="y", labelsize=9)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    green_patch = mpatches.Patch(color="#388e3c", label="買われている（上昇）")
+    red_patch   = mpatches.Patch(color="#d32f2f", label="売られている（下落）")
+    ax.legend(handles=[green_patch, red_patch], loc="lower right", fontsize=8)
+    plt.tight_layout()
+    return fig
+
+
+def plot_sector_timeseries(df_ts: pd.DataFrame, top_sectors: list, bottom_sectors: list) -> plt.Figure:
+    fig, axes = plt.subplots(1, 2, figsize=(20, 7))
+    ax = axes[0]
+    cmap = plt.cm.get_cmap("Greens", len(top_sectors) + 2)
+    for i, sec in enumerate(top_sectors):
+        if sec in df_ts.columns:
+            series = df_ts[sec].dropna()
+            ax.plot(series.index, series - 100, label=sec, color=cmap(i + 2), linewidth=2.2)
+    ax.axhline(0, color="gray", linewidth=0.7, linestyle="--")
+    ax.set_title("買われているセクター（累積リターン）", fontsize=14, fontweight="bold", pad=12)
+    ax.set_ylabel("累積リターン (%)", fontsize=12)
+    ax.legend(fontsize=12, loc="upper left", framealpha=0.9,
+              bbox_to_anchor=(0, 1), borderaxespad=0)
+    ax.tick_params(axis="x", rotation=30, labelsize=11)
+    ax.tick_params(axis="y", labelsize=11)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax = axes[1]
+    cmap2 = plt.cm.get_cmap("Reds", len(bottom_sectors) + 2)
+    for i, sec in enumerate(bottom_sectors):
+        if sec in df_ts.columns:
+            series = df_ts[sec].dropna()
+            ax.plot(series.index, series - 100, label=sec, color=cmap2(i + 2), linewidth=2.2)
+    ax.axhline(0, color="gray", linewidth=0.7, linestyle="--")
+    ax.set_title("売られているセクター（累積リターン）", fontsize=14, fontweight="bold", pad=12)
+    ax.set_ylabel("累積リターン (%)", fontsize=12)
+    ax.legend(fontsize=12, loc="upper left", framealpha=0.9,
+              bbox_to_anchor=(0, 1), borderaxespad=0)
+    ax.tick_params(axis="x", rotation=30, labelsize=11)
+    ax.tick_params(axis="y", labelsize=11)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    plt.tight_layout(pad=2.0)
+    return fig
+
+
+def plot_sector_heatmap(df_multi: pd.DataFrame) -> plt.Figure:
+    df_heat = df_multi.set_index("業種")[["1週間", "1ヶ月", "3ヶ月"]]
+    df_heat = df_heat.sort_values("1ヶ月", ascending=False)
+    vmax = max(abs(df_heat.values.max()), abs(df_heat.values.min()), 3)
+    fig, ax = plt.subplots(figsize=(10, max(7, len(df_heat) * 0.48)))
+    im = ax.imshow(df_heat.values, cmap="RdYlGn", aspect="auto", vmin=-vmax, vmax=vmax)
+
+    # ── 上部ラベル（通常のxticks）
+    ax.set_xticks(range(len(df_heat.columns)))
+    ax.set_xticklabels(df_heat.columns, fontsize=12, fontweight="bold")
+    ax.tick_params(axis="x", which="both", top=False, bottom=True,
+                   labeltop=False, labelbottom=True, labelsize=12, pad=6)
+
+    # ── 下部ラベル（ax2xaxisで上部にも表示）
+    ax2 = ax.twiny()
+    ax2.set_xlim(ax.get_xlim())
+    ax2.set_xticks(range(len(df_heat.columns)))
+    ax2.set_xticklabels(df_heat.columns, fontsize=12, fontweight="bold")
+    ax2.tick_params(axis="x", which="both", top=True, bottom=False,
+                    labeltop=True, labelbottom=False, labelsize=12, pad=6)
+
+    # ── Y軸（業種名）
+    ax.set_yticks(range(len(df_heat.index)))
+    ax.set_yticklabels(df_heat.index, fontsize=10)
+
+    # ── セル内テキスト
+    for i in range(len(df_heat.index)):
+        for j in range(len(df_heat.columns)):
+            val = df_heat.values[i, j]
+            color = "white" if abs(val) > vmax * 0.6 else "black"
+            ax.text(j, i, f"{val:+.1f}%", ha="center", va="center",
+                    fontsize=9, color=color, fontweight="bold")
+
+    plt.colorbar(im, ax=ax, label="リターン (%)", shrink=0.8)
+    ax.set_title("セクター別リターン ヒートマップ（期間比較）",
+                 fontsize=13, fontweight="bold", pad=36)
+    plt.tight_layout(pad=2.0)
+    return fig
+
+
+# ================================================================
+# 🔥 需給系モジュール
+# ================================================================
+
+@st.cache_data(ttl=1800)
+def get_volume_surge(ticker_name_map: dict, surge_ratio: float = 2.0,
+                     short_days: int = 5, base_days: int = 20) -> pd.DataFrame:
+    from datetime import timedelta
+    end_date   = datetime.today()
+    start_date = end_date - timedelta(days=base_days + 10)
+    results = []
+    for ticker, (name, sector) in ticker_name_map.items():
+        try:
+            df = _yfdownload(ticker, start=start_date, end=end_date, progress=False)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.droplevel(1)
+            if df.empty or len(df) < base_days:
+                continue
+            vol = df["Volume"].dropna()
+            recent_avg = vol.iloc[-short_days:].mean()
+            base_avg   = vol.iloc[-base_days:-short_days].mean()
+            if base_avg == 0:
+                continue
+            ratio = recent_avg / base_avg
+            price_chg = (df["Close"].iloc[-1] - df["Close"].iloc[-short_days]) / df["Close"].iloc[-short_days] * 100
+            if ratio >= surge_ratio:
+                results.append({
+                    "企業名": name, "業種": sector, "ティッカー": ticker,
+                    "出来高倍率": round(ratio, 2),
+                    "直近5日平均出来高": int(recent_avg),
+                    "基準平均出来高": int(base_avg),
+                    "株価変化率(5日%)": round(float(price_chg), 2),
+                    "最新株価": round(float(df["Close"].iloc[-1]), 1),
+                })
+        except Exception:
+            continue
+    df_r = pd.DataFrame(results)
+    if not df_r.empty:
+        df_r = df_r.sort_values("出来高倍率", ascending=False).reset_index(drop=True)
+    return df_r
+
+
+@st.cache_data(ttl=1800)
+def get_vwap_deviation(ticker_name_map: dict, days: int = 20) -> pd.DataFrame:
+    from datetime import timedelta
+    end_date   = datetime.today()
+    start_date = end_date - timedelta(days=days + 5)
+    results = []
+    for ticker, (name, sector) in ticker_name_map.items():
+        try:
+            df = _yfdownload(ticker, start=start_date, end=end_date, progress=False)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.droplevel(1)
+            if df.empty or len(df) < 5:
+                continue
+            df = df.dropna(subset=["Close", "Volume"])
+            vwap = (df["Close"] * df["Volume"]).sum() / df["Volume"].sum()
+            current_price = float(df["Close"].iloc[-1])
+            deviation = (current_price - float(vwap)) / float(vwap) * 100
+            results.append({
+                "企業名": name, "業種": sector, "ティッカー": ticker,
+                "現在値": round(current_price, 1),
+                "VWAP": round(float(vwap), 1),
+                "VWAP乖離率(%)": round(deviation, 2),
+            })
+        except Exception:
+            continue
+    df_r = pd.DataFrame(results)
+    if not df_r.empty:
+        df_r = df_r.sort_values("VWAP乖離率(%)", ascending=False).reset_index(drop=True)
+    return df_r
+
+
+@st.cache_data(ttl=1800)
+def get_price_volume_scatter(ticker_name_map: dict, days: int = 20) -> pd.DataFrame:
+    from datetime import timedelta
+    end_date   = datetime.today()
+    start_date = end_date - timedelta(days=days + 10)
+    results = []
+    for ticker, (name, sector) in ticker_name_map.items():
+        try:
+            df = _yfdownload(ticker, start=start_date, end=end_date, progress=False)
+            if df.empty or len(df) < 5:
+                continue
+            close  = _to_series(df["Close"]).dropna()
+            volume = _to_series(df["Volume"]).dropna()
+            if len(close) < 5 or len(volume) < 10:
+                continue
+            price_chg = (close.iloc[-1] - close.iloc[0]) / close.iloc[0] * 100
+            vol_chg   = (volume.iloc[-5:].mean() - volume.iloc[:5].mean()) / (volume.iloc[:5].mean() + 1) * 100
+            results.append({
+                "企業名": name, "業種": sector,
+                "株価騰落率(%)": round(float(price_chg), 2),
+                "出来高変化率(%)": round(float(vol_chg), 2),
+            })
+        except Exception:
+            continue
+    return pd.DataFrame(results)
+
+
+def plot_pv_scatter(df: pd.DataFrame) -> None:
+    """Price x Volume 散布図（Plotly・ホバーで銘柄名・数値表示）"""
+    if df.empty:
+        st.warning("データなし")
+        return
+
+    try:
+        import plotly.graph_objects as go
+        import plotly.express as px
+
+        df = df.copy()
+        # 原点からの距離で外れ値上位25銘柄にフロートラベルを付与
+        df["_dist"] = np.sqrt(df["株価騰落率(%)"]**2 + df["出来高変化率(%)"]**2)
+        top_idx = df.nlargest(min(25, len(df)), "_dist").index
+        df["_label"] = ""
+        df.loc[top_idx, "_label"] = df.loc[top_idx, "企業名"]
+
+        x_max = df["出来高変化率(%)"].max()
+        x_min = df["出来高変化率(%)"].min()
+        y_max = df["株価騰落率(%)"].max()
+        y_min = df["株価騰落率(%)"].min()
+
+        fig = px.scatter(
+            df,
+            x="出来高変化率(%)",
+            y="株価騰落率(%)",
+            color="業種",
+            text="_label",
+            hover_name="企業名",
+            hover_data={
+                "業種": True,
+                "株価騰落率(%)":  ":.2f",
+                "出来高変化率(%)": ":.2f",
+                "_label": False,
+                "_dist": False,
+            },
+            title="Price x Volume マップ（セクター別）― ホバーで銘柄名・数値表示",
+            height=650,
+            color_discrete_sequence=px.colors.qualitative.Light24,
+        )
+
+        # 軸線
+        fig.add_hline(y=0, line_dash="dash", line_color="gray",
+                      line_width=1, opacity=0.6)
+        fig.add_vline(x=0, line_dash="dash", line_color="gray",
+                      line_width=1, opacity=0.6)
+
+        # 4象限ラベル
+        quad_labels = [
+            (x_max * 0.65, y_max * 0.85, "株高+出来高増<br>（本命上昇）",    "#388e3c", "rgba(232,245,233,0.85)"),
+            (x_min * 0.65, y_max * 0.85, "株高+出来高減<br>（戻り弱い）",    "#f57c00", "rgba(255,243,224,0.85)"),
+            (x_max * 0.65, y_min * 0.85, "株安+出来高増<br>（売り圧力）",    "#d32f2f", "rgba(255,235,238,0.85)"),
+            (x_min * 0.65, y_min * 0.85, "株安+出来高減<br>（静かな下落）",  "#9e9e9e", "rgba(245,245,245,0.85)"),
+        ]
+        for x, y, text, color, bgcolor in quad_labels:
+            fig.add_annotation(
+                x=x, y=y, text=text,
+                showarrow=False,
+                font=dict(color=color, size=12, family="Arial"),
+                bgcolor=bgcolor,
+                bordercolor=color,
+                borderwidth=1,
+                borderpad=6,
+            )
+
+        fig.update_traces(
+            marker=dict(size=9, opacity=0.82, line=dict(width=0.5, color="gray")),
+            textposition="top center",
+            textfont=dict(size=8, color="rgba(0,0,0,0.72)"),
+        )
+        fig.update_layout(
+            xaxis_title="出来高変化率 (%)",
+            yaxis_title="株価騰落率 (%)",
+            legend=dict(
+                orientation="v", x=1.01, y=1,
+                font=dict(size=10),
+                bgcolor="rgba(255,255,255,0.9)",
+                bordercolor="lightgray", borderwidth=1,
+            ),
+            hoverlabel=dict(
+                bgcolor="white",
+                font_size=13,
+                font_family="Arial",
+                namelength=-1,
+            ),
+            margin=dict(r=180),
+            plot_bgcolor="white",
+            paper_bgcolor="white",
+        )
+        fig.update_xaxes(gridcolor="rgba(0,0,0,0.07)", zeroline=False)
+        fig.update_yaxes(gridcolor="rgba(0,0,0,0.07)", zeroline=False)
+
+        st.plotly_chart(fig, use_container_width=True)
+
+    except ImportError:
+        # plotlyが無い場合はmatplotlibにフォールバック
+        pass
+    except Exception as _pv_err:
+        st.error(f"チャート描画エラー: {_pv_err}")
+        return
+    else:
+        return  # plotly成功時はここで終了
+
+    # matplotlib fallback（plotly未インストール時のみ到達）
+        sectors = df["業種"].unique()
+        cmap = plt.cm.get_cmap("tab20", len(sectors))
+        sector_color = {sec: cmap(i) for i, sec in enumerate(sectors)}
+        fig2, ax = plt.subplots(figsize=(14, 8))
+        for sec in sectors:
+            sub = df[df["業種"] == sec]
+            ax.scatter(sub["出来高変化率(%)"], sub["株価騰落率(%)"],
+                       label=sec, color=sector_color[sec], s=60, alpha=0.8)
+            for _, row in sub.iterrows():
+                if abs(row["株価騰落率(%)"]) > df["株価騰落率(%)"].std() * 1.2 or \
+                   abs(row["出来高変化率(%)"]) > df["出来高変化率(%)"].std() * 1.2:
+                    ax.annotate(row["企業名"],
+                                (row["出来高変化率(%)"], row["株価騰落率(%)"]),
+                                fontsize=7, alpha=0.85,
+                                xytext=(4, 4), textcoords="offset points")
+        ax.axhline(0, color="gray", linewidth=0.8, linestyle="--")
+        ax.axvline(0, color="gray", linewidth=0.8, linestyle="--")
+        ax.set_xlabel("出来高変化率 (%)", fontsize=12)
+        ax.set_ylabel("株価騰落率 (%)", fontsize=12)
+        ax.set_title("Price x Volume マップ（セクター別）", fontsize=13, fontweight="bold")
+        ax.legend(bbox_to_anchor=(1.01, 1), loc="upper left", fontsize=8)
+        ax.grid(True, alpha=0.2)
+        plt.tight_layout()
+        st.pyplot(fig2, clear_figure=True)
+
+
+# ================================================================
+# 📊 価格パターン系モジュール
+# ================================================================
+
+@st.cache_data(ttl=1800)
+def get_52week_highlow(ticker_name_map: dict) -> pd.DataFrame:
+    from datetime import timedelta
+    end_date   = datetime.today()
+    start_date = end_date - timedelta(days=365)
+    results = []
+    for ticker, (name, sector) in ticker_name_map.items():
+        try:
+            df = _yfdownload(ticker, start=start_date, end=end_date, progress=False)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.droplevel(1)
+            if df.empty or len(df) < 50:
+                continue
+            high_52w = float(df["High"].max())
+            low_52w  = float(df["Low"].min())
+            current  = float(df["Close"].iloc[-1])
+            from_high = (current - high_52w) / high_52w * 100
+            from_low  = (current - low_52w)  / low_52w  * 100
+            is_new_high = float(df["High"].iloc[-1]) >= high_52w * 0.995
+            is_new_low  = float(df["Low"].iloc[-1])  <= low_52w  * 1.005
+            results.append({
+                "企業名": name, "業種": sector,
+                "現在値": round(current, 1),
+                "52週高値": round(high_52w, 1),
+                "52週安値": round(low_52w, 1),
+                "高値からの乖離(%)": round(from_high, 2),
+                "安値からの乖離(%)": round(from_low, 2),
+                "新高値": "新高値" if is_new_high else "",
+                "新安値": "新安値" if is_new_low else "",
+            })
+        except Exception:
+            continue
+    return pd.DataFrame(results)
+
+
+@st.cache_data(ttl=1800)
+def get_ma_deviation(ticker_name_map: dict) -> pd.DataFrame:
+    from datetime import timedelta
+    end_date   = datetime.today()
+    start_date = end_date - timedelta(days=250)
+    results = []
+    for ticker, (name, sector) in ticker_name_map.items():
+        try:
+            df = _yfdownload(ticker, start=start_date, end=end_date, progress=False)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.droplevel(1)
+            if df.empty or len(df) < 200:
+                continue
+            close   = df["Close"].dropna()
+            current = float(close.iloc[-1])
+            ma25    = float(close.rolling(25).mean().iloc[-1])
+            ma75    = float(close.rolling(75).mean().iloc[-1])
+            ma200   = float(close.rolling(200).mean().iloc[-1])
+            results.append({
+                "企業名": name, "業種": sector,
+                "現在値": round(current, 1),
+                "25日MA乖離(%)": round((current - ma25) / ma25 * 100, 2),
+                "75日MA乖離(%)": round((current - ma75) / ma75 * 100, 2),
+                "200日MA乖離(%)": round((current - ma200) / ma200 * 100, 2),
+            })
+        except Exception:
+            continue
+    df_r = pd.DataFrame(results)
+    if not df_r.empty:
+        df_r = df_r.sort_values("25日MA乖離(%)", ascending=False).reset_index(drop=True)
+    return df_r
+
+
+@st.cache_data(ttl=1800)
+def get_cross_signals(ticker_name_map: dict, lookback_days: int = 10) -> pd.DataFrame:
+    from datetime import timedelta
+    end_date   = datetime.today()
+    start_date = end_date - timedelta(days=120)
+    results = []
+    for ticker, (name, sector) in ticker_name_map.items():
+        try:
+            df = _yfdownload(ticker, start=start_date, end=end_date, progress=False)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.droplevel(1)
+            if df.empty or len(df) < 75:
+                continue
+            close = df["Close"].dropna()
+            ma25  = close.rolling(25).mean()
+            ma75  = close.rolling(75).mean()
+            diff  = ma25 - ma75
+            for i in range(max(1, len(diff) - lookback_days), len(diff)):
+                if pd.isna(diff.iloc[i]) or pd.isna(diff.iloc[i-1]):
+                    continue
+                if diff.iloc[i-1] < 0 and diff.iloc[i] >= 0:
+                    results.append({
+                        "企業名": name, "業種": sector,
+                        "シグナル": "ゴールデンクロス",
+                        "発生日": str(diff.index[i])[:10],
+                        "現在値": round(float(close.iloc[-1]), 1),
+                    })
+                    break
+                elif diff.iloc[i-1] > 0 and diff.iloc[i] <= 0:
+                    results.append({
+                        "企業名": name, "業種": sector,
+                        "シグナル": "デッドクロス",
+                        "発生日": str(diff.index[i])[:10],
+                        "現在値": round(float(close.iloc[-1]), 1),
+                    })
+                    break
+        except Exception:
+            continue
+    return pd.DataFrame(results)
+
+
+# ================================================================
+# 💡 モメンタム・相関分析モジュール
+# ================================================================
+
+@st.cache_data(ttl=1800)
+def get_dow_of_week_pattern(ticker_name_map: dict, days: int = 180) -> pd.DataFrame:
+    from datetime import timedelta
+    end_date   = datetime.today()
+    start_date = end_date - timedelta(days=days)
+    dow_map    = {0: "月", 1: "火", 2: "水", 3: "木", 4: "金"}
+    sector_dow: dict = {}
+    for ticker, (name, sector) in ticker_name_map.items():
+        try:
+            df = _yfdownload(ticker, start=start_date, end=end_date, progress=False)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.droplevel(1)
+            if df.empty or len(df) < 20:
+                continue
+            ret = df["Close"].pct_change().dropna() * 100
+            ret.index = pd.to_datetime(ret.index)
+            for dow_num, dow_label in dow_map.items():
+                avg = float(ret[ret.index.dayofweek == dow_num].mean())
+                key = (sector, dow_label)
+                if key not in sector_dow:
+                    sector_dow[key] = []
+                sector_dow[key].append(avg)
+        except Exception:
+            continue
+    rows = []
+    for (sector, dow), vals in sector_dow.items():
+        rows.append({"業種": sector, "曜日": dow, "平均リターン(%)": round(np.mean(vals), 4)})
+    df_long = pd.DataFrame(rows)
+    if df_long.empty:
+        return df_long
+    df_pivot = df_long.pivot(index="業種", columns="曜日", values="平均リターン(%)")
+    dow_order = ["月", "火", "水", "木", "金"]
+    df_pivot  = df_pivot.reindex(columns=[d for d in dow_order if d in df_pivot.columns])
+    return df_pivot
+
+
+@st.cache_data(ttl=1800)
+def get_correlation_divergence(ticker_name_map: dict, days: int = 60,
+                                corr_window: int = 20) -> pd.DataFrame:
+    from datetime import timedelta
+    end_date   = datetime.today()
+    start_date = end_date - timedelta(days=days + 10)
+    benchmark = _yfdownload("^N225", start=start_date, end=end_date, progress=False)
+    if isinstance(benchmark.columns, pd.MultiIndex):
+        benchmark.columns = benchmark.columns.droplevel(1)
+    market_ret = benchmark["Close"].pct_change().dropna()
+    results = []
+    for ticker, (name, sector) in ticker_name_map.items():
+        try:
+            df = _yfdownload(ticker, start=start_date, end=end_date, progress=False)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.droplevel(1)
+            if df.empty or len(df) < corr_window + 5:
+                continue
+            ret = df["Close"].pct_change().dropna()
+            common = ret.index.intersection(market_ret.index)
+            if len(common) < corr_window + 5:
+                continue
+            r = ret.loc[common]
+            m = market_ret.loc[common]
+            corr_long   = float(r.corr(m))
+            corr_recent = float(r.iloc[-corr_window:].corr(m.iloc[-corr_window:]))
+            divergence  = corr_long - corr_recent
+            price_chg   = (df["Close"].iloc[-1] - df["Close"].iloc[-5]) / df["Close"].iloc[-5] * 100
+            results.append({
+                "企業名": name, "業種": sector,
+                "長期相関": round(corr_long, 3),
+                "直近相関": round(corr_recent, 3),
+                "相関乖離度": round(divergence, 3),
+                "直近5日株価変化(%)": round(float(price_chg), 2),
+            })
+        except Exception:
+            continue
+    df_r = pd.DataFrame(results)
+    if not df_r.empty:
+        df_r = df_r.sort_values("相関乖離度", ascending=False).reset_index(drop=True)
+    return df_r
+
+
+@st.cache_data(ttl=1800)
+def get_momentum_score(ticker_name_map: dict) -> pd.DataFrame:
+    from datetime import timedelta
+    end_date   = datetime.today()
+    start_date = end_date - timedelta(days=30)
+    results = []
+    for ticker, (name, sector) in ticker_name_map.items():
+        try:
+            df = _yfdownload(ticker, start=start_date, end=end_date, progress=False)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.droplevel(1)
+            if df.empty or len(df) < 10:
+                continue
+            price_chg = (df["Close"].iloc[-1] - df["Close"].iloc[0]) / df["Close"].iloc[0] * 100
+            vol_chg   = (df["Volume"].iloc[-5:].mean() - df["Volume"].mean()) / (df["Volume"].mean() + 1) * 100
+            score = float(price_chg) * np.log1p(max(float(vol_chg), 0) / 100 + 1)
+            results.append({
+                "企業名": name, "業種": sector,
+                "モメンタムスコア": round(score, 3),
+                "株価騰落率(%)": round(float(price_chg), 2),
+                "出来高変化率(%)": round(float(vol_chg), 2),
+                "現在値": round(float(df["Close"].iloc[-1]), 1),
+            })
+        except Exception:
+            continue
+    df_r = pd.DataFrame(results)
+    if not df_r.empty:
+        df_r = df_r.sort_values("モメンタムスコア", ascending=False).reset_index(drop=True)
+    return df_r
+
+
+def plot_dow_heatmap(df_pivot: pd.DataFrame) -> plt.Figure:
+    vmax = max(abs(df_pivot.values[~np.isnan(df_pivot.values)]).max(), 0.1)
+    fig, ax = plt.subplots(figsize=(8, max(5, len(df_pivot) * 0.4)))
+    im = ax.imshow(df_pivot.values, cmap="RdYlGn", aspect="auto", vmin=-vmax, vmax=vmax)
+    ax.set_xticks(range(len(df_pivot.columns)))
+    ax.set_xticklabels(df_pivot.columns, fontsize=11)
+    ax.set_yticks(range(len(df_pivot.index)))
+    ax.set_yticklabels(df_pivot.index, fontsize=9)
+    for i in range(len(df_pivot.index)):
+        for j in range(len(df_pivot.columns)):
+            val = df_pivot.values[i, j]
+            if not np.isnan(val):
+                color = "white" if abs(val) > vmax * 0.6 else "black"
+                ax.text(j, i, f"{val:+.3f}", ha="center", va="center", fontsize=7, color=color)
+    plt.colorbar(im, ax=ax, label="平均リターン (%)", shrink=0.8)
+    ax.set_title("曜日別平均リターン ヒートマップ（セクター別）", fontsize=12, fontweight="bold", pad=10)
+    plt.tight_layout()
+    return fig
+
+
+# ================================================================
+# サイドバー
+# ================================================================
+with st.sidebar:
+    st.header("⚙️ 分析パラメータ")
+    years          = st.number_input("📅 過去何年で分析？", 1, 10, 3)
+    risk_free_rate = st.number_input("📉 無リスク金利（%）", 0.0, 10.0, 1.0, step=0.1) / 100
+    top_n          = st.number_input("📊 上位何社を表示？", 5, 50, 20, step=5)
+    st.divider()
+    st.header("📰 ニュース設定")
+    news_max_per_source = st.slider("各ソースの最大取得件数", 3, 10, 5)
+    show_news_sources = st.multiselect(
+        "表示するニュースソース",
+        ["Yahoo!Finance JP", "株探(Kabutan)", "みんかぶ", "TDnet（適時開示）", "日経新聞", "Reuters JP"],
+        default=["Yahoo!Finance JP", "株探(Kabutan)", "TDnet（適時開示）", "日経新聞", "Reuters JP"],
+    )
+    st.divider()
+    st.caption("データソース: Yahoo Finance, TDnet, 株探, みんかぶ, 日経, Reuters")
+
+# ================================================================
+# 銘柄マスタ
+# ================================================================
+ticker_name_map = {
+    '1332.T': ('ニッスイ', '水産'),
+    '1605.T': ('ＩＮＰＥＸ', '鉱業'),
+    '1721.T': ('コムシスＨＤ', '建設'),
+    '1801.T': ('大成建', '建設'),
+    '1802.T': ('大林組', '建設'),
+    '1803.T': ('清水建', '建設'),
+    '1808.T': ('長谷工', '建設'),
+    '1812.T': ('鹿島', '建設'),
+    '1925.T': ('ハウス', '建設'),
+    '1928.T': ('積ハウス', '建設'),
+    '1963.T': ('日揮ＨＤ', '建設'),
+    '2002.T': ('日清粉Ｇ', '食品'),
+    '2269.T': ('明治ＨＤ', '食品'),
+    '2282.T': ('日ハム', '食品'),
+    '2413.T': ('エムスリー', 'サービス'),
+    '2432.T': ('ディーエヌエ', 'サービス'),
+    '2501.T': ('サッポロＨＤ', '食品'),
+    '2502.T': ('アサヒ', '食品'),
+    '2503.T': ('キリンＨＤ', '食品'),
+    '2768.T': ('双日', '商社'),
+    '2801.T': ('キッコマン', '食品'),
+    '2802.T': ('味の素', '食品'),
+    '2871.T': ('ニチレイ', '食品'),
+    '2914.T': ('ＪＴ', '食品'),
+    '3086.T': ('Ｊフロント', '小売業'),
+    '3092.T': ('ＺＯＺＯ', '小売業'),
+    '3099.T': ('三越伊勢丹', '小売業'),
+    '3289.T': ('東急不ＨＤ', '不動産'),
+    '3382.T': ('セブン＆アイ', '小売業'),
+    '3401.T': ('帝人', '繊維'),
+    '3402.T': ('東レ', '繊維'),
+    '3405.T': ('クラレ', '化学'),
+    '3407.T': ('旭化成', '化学'),
+    '3436.T': ('ＳＵＭＣＯ', '非鉄・金属'),
+    '3659.T': ('ネクソン', 'サービス'),
+    '3861.T': ('王子ＨＤ', 'パルプ・紙'),
+    '4004.T': ('レゾナック', '化学'),
+    '4005.T': ('住友化', '化学'),
+    '4021.T': ('日産化', '化学'),
+    '4042.T': ('東ソー', '化学'),
+    '4043.T': ('トクヤマ', '化学'),
+    '4061.T': ('デンカ', '化学'),
+    '4063.T': ('信越化', '化学'),
+    '4151.T': ('協和キリン', '医薬品'),
+    '4183.T': ('三井化学', '化学'),
+    '4188.T': ('三菱ケミＧ', '化学'),
+    '4208.T': ('ＵＢＥ', '化学'),
+    '4307.T': ('野村総研', 'サービス'),
+    '4324.T': ('電通グループ', 'サービス'),
+    '4385.T': ('メルカリ', 'サービス'),
+    '4452.T': ('花王', '化学'),
+    '4502.T': ('武田', '医薬品'),
+    '4503.T': ('アステラス', '医薬品'),
+    '4506.T': ('住友ファーマ', '医薬品'),
+    '4507.T': ('塩野義', '医薬品'),
+    '4519.T': ('中外薬', '医薬品'),
+    '4523.T': ('エーザイ', '医薬品'),
+    '4543.T': ('テルモ', '精密機器'),
+    '4568.T': ('第一三共', '医薬品'),
+    '4578.T': ('大塚ＨＤ', '医薬品'),
+    '4661.T': ('ＯＬＣ', 'サービス'),
+    '4689.T': ('ラインヤフー', 'サービス'),
+    '4704.T': ('トレンド', 'サービス'),
+    '4751.T': ('サイバー', 'サービス'),
+    '4755.T': ('楽天グループ', 'サービス'),
+    '4901.T': ('富士フイルム', '化学'),
+    '4902.T': ('コニカミノル', '精密機器'),
+    '4911.T': ('資生堂', '化学'),
+    '5019.T': ('出光興産', '石油'),
+    '5020.T': ('ＥＮＥＯＳ', '石油'),
+    '5101.T': ('浜ゴム', 'ゴム'),
+    '5108.T': ('ブリヂストン', 'ゴム'),
+    '5201.T': ('ＡＧＣ', '窯業'),
+    '5214.T': ('日電硝', '窯業'),
+    '5233.T': ('太平洋セメ', '窯業'),
+    '5301.T': ('東海カーボン', '窯業'),
+    '5332.T': ('ＴＯＴＯ', '窯業'),
+    '5333.T': ('ガイシ', '窯業'),
+    '5401.T': ('日本製鉄', '鉄鋼'),
+    '5406.T': ('神戸鋼', '鉄鋼'),
+    '5411.T': ('ＪＦＥ', '鉄鋼'),
+    '5631.T': ('日製鋼', '機械'),
+    '5706.T': ('三井金', '非鉄・金属'),
+    '5711.T': ('三菱マ', '非鉄・金属'),
+    '5713.T': ('住友鉱', '非鉄・金属'),
+    '5714.T': ('ＤＯＷＡ', '非鉄・金属'),
+    '5801.T': ('古河電', '非鉄・金属'),
+    '5802.T': ('住友電', '非鉄・金属'),
+    '5803.T': ('フジクラ', '非鉄・金属'),
+    '5831.T': ('しずおかＦＧ', '銀行'),
+    '6098.T': ('リクルート', 'サービス'),
+    '6103.T': ('オークマ', '機械'),
+    '6113.T': ('アマダ', '機械'),
+    '6146.T': ('ディスコ', '精密機器'),
+    '6178.T': ('日本郵政', 'サービス'),
+    '6273.T': ('ＳＭＣ', '機械'),
+    '6301.T': ('コマツ', '機械'),
+    '6302.T': ('住友重', '機械'),
+    '6305.T': ('日立建機', '機械'),
+    '6326.T': ('クボタ', '機械'),
+    '6361.T': ('荏原', '機械'),
+    '6367.T': ('ダイキン', '機械'),
+    '6471.T': ('日精工', '機械'),
+    '6472.T': ('ＮＴＮ', '機械'),
+    '6473.T': ('ジェイテクト', '機械'),
+    '6479.T': ('ミネベア', '電気機器'),
+    '6501.T': ('日立', '電気機器'),
+    '6503.T': ('三菱電', '電気機器'),
+    '6504.T': ('富士電機', '電気機器'),
+    '6506.T': ('安川電', '電気機器'),
+    '6526.T': ('ソシオネクス', '電気機器'),
+    '6532.T': ('ベイカレント', 'サービス'),
+    '6594.T': ('ニデック', '電気機器'),
+    '6645.T': ('オムロン', '電気機器'),
+    '6674.T': ('ＧＳユアサ', '電気機器'),
+    '6701.T': ('ＮＥＣ', '電気機器'),
+    '6702.T': ('富士通', '電気機器'),
+    '6723.T': ('ルネサス', '電気機器'),
+    '6724.T': ('エプソン', '電気機器'),
+    '6752.T': ('パナＨＤ', '電気機器'),
+    '6753.T': ('シャープ', '電気機器'),
+    '6758.T': ('ソニーＧ', '電気機器'),
+    '6762.T': ('ＴＤＫ', '電気機器'),
+    '6770.T': ('アルプスアル', '電気機器'),
+    '6841.T': ('横河電', '電気機器'),
+    '6857.T': ('アドテスト', '電気機器'),
+    '6861.T': ('キーエンス', '電気機器'),
+    '6902.T': ('デンソー', '電気機器'),
+    '6920.T': ('レーザーテク', '電気機器'),
+    '6952.T': ('カシオ', '電気機器'),
+    '6954.T': ('ファナック', '電気機器'),
+    '6971.T': ('京セラ', '電気機器'),
+    '6976.T': ('太陽誘電', '電気機器'),
+    '6981.T': ('村田製', '電気機器'),
+    '6988.T': ('日東電', '化学'),
+    '7004.T': ('カナデビア', '機械'),
+    '7011.T': ('三菱重', '機械'),
+    '7012.T': ('川重', '造船'),
+    '7013.T': ('ＩＨＩ', '機械'),
+    '7186.T': ('コンコルディ', '銀行'),
+    '7201.T': ('日産自', '自動車'),
+    '7202.T': ('いすゞ', '自動車'),
+    '7203.T': ('トヨタ', '自動車'),
+    '7205.T': ('日野自', '自動車'),
+    '7211.T': ('三菱自', '自動車'),
+    '7261.T': ('マツダ', '自動車'),
+    '7267.T': ('ホンダ', '自動車'),
+    '7269.T': ('スズキ', '自動車'),
+    '7270.T': ('ＳＵＢＡＲＵ', '自動車'),
+    '7272.T': ('ヤマハ発', '自動車'),
+    '7453.T': ('良品計画', '小売業'),
+    '7731.T': ('ニコン', '精密機器'),
+    '7733.T': ('オリンパス', '精密機器'),
+    '7735.T': ('スクリン', '電気機器'),
+    '7741.T': ('ＨＯＹＡ', '精密機器'),
+    '7751.T': ('キヤノン', '電気機器'),
+    '7752.T': ('リコー', '電気機器'),
+    '7762.T': ('シチズン', '精密機器'),
+    '7832.T': ('バンナムＨＤ', 'その他製造'),
+    '7911.T': ('ＴＯＰＰＡＮ', 'その他製造'),
+    '7912.T': ('大日印', 'その他製造'),
+    '7951.T': ('ヤマハ', 'その他製造'),
+    '7974.T': ('任天堂', 'サービス'),
+    '8001.T': ('伊藤忠', '商社'),
+    '8002.T': ('丸紅', '商社'),
+    '8015.T': ('豊田通商', '商社'),
+    '8031.T': ('三井物', '商社'),
+    '8035.T': ('東エレク', '電気機器'),
+    '8053.T': ('住友商', '商社'),
+    '8058.T': ('三菱商', '商社'),
+    '8233.T': ('高島屋', '小売業'),
+    '8252.T': ('丸井Ｇ', '小売業'),
+    '8253.T': ('クレセゾン', 'その他金融'),
+    '8267.T': ('イオン', '小売業'),
+    '8304.T': ('あおぞら銀', '銀行'),
+    '8306.T': ('三菱ＵＦＪ', '銀行'),
+    '8308.T': ('りそなＨＤ', '銀行'),
+    '8309.T': ('三井住友トラ', '銀行'),
+    '8316.T': ('三井住友ＦＧ', '銀行'),
+    '8331.T': ('千葉銀', '銀行'),
+    '8354.T': ('ふくおかＦＧ', '銀行'),
+    '8411.T': ('みずほＦＧ', '銀行'),
+    '8591.T': ('オリックス', 'その他金融'),
+    '8601.T': ('大和', '証券'),
+    '8604.T': ('野村', '証券'),
+    '8630.T': ('ＳＯＭＰＯ', '保険'),
+    '8697.T': ('日本取引所', 'その他金融'),
+    '8725.T': ('ＭＳ＆ＡＤ', '保険'),
+    '8750.T': ('第一生命ＨＤ', '保険'),
+    '8766.T': ('東京海上', '保険'),
+    '8795.T': ('Ｔ＆Ｄ', '保険'),
+    '8801.T': ('三井不', '不動産'),
+    '8802.T': ('菱地所', '不動産'),
+    '8804.T': ('東建物', '不動産'),
+    '8830.T': ('住友不', '不動産'),
+    '9001.T': ('東武', '鉄道・バス'),
+    '9005.T': ('東急', '鉄道・バス'),
+    '9007.T': ('小田急', '鉄道・バス'),
+    '9008.T': ('京王', '鉄道・バス'),
+    '9009.T': ('京成', '鉄道・バス'),
+    '9020.T': ('ＪＲ東日本', '鉄道・バス'),
+    '9021.T': ('ＪＲ西日本', '鉄道・バス'),
+    '9022.T': ('ＪＲ東海', '鉄道・バス'),
+    '9064.T': ('ヤマトＨＤ', '陸運'),
+    '9101.T': ('郵船', '海運'),
+    '9104.T': ('商船三井', '海運'),
+    '9107.T': ('川崎汽', '海運'),
+    '9147.T': ('ＮＸＨＤ', '陸運'),
+    '9201.T': ('ＪＡＬ', '空運'),
+    '9202.T': ('ＡＮＡＨＤ', '空運'),
+    '9432.T': ('ＮＴＴ', '通信'),
+    '9433.T': ('ＫＤＤＩ', '通信'),
+    '9434.T': ('ＳＢ', '通信'),
+    '9501.T': ('東電ＨＤ', '電力'),
+    '9502.T': ('中部電', '電力'),
+    '9503.T': ('関西電', '電力'),
+    '9531.T': ('東ガス', 'ガス'),
+    '9532.T': ('大ガス', 'ガス'),
+    '9602.T': ('東宝', 'サービス'),
+    '9613.T': ('ＮＴＴデータ', '通信'),
+    '9735.T': ('セコム', 'サービス'),
+    '9766.T': ('コナミＧ', 'サービス'),
+    '9843.T': ('ニトリＨＤ', '小売業'),
+    '9983.T': ('ファストリ', '小売業'),
+    '9984.T': ('ＳＢＧ', '通信'),
+}
+
+# ================================================================
+# データ取得
+# ================================================================
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_price(ticker, start, end):
+    return _yfdownload(ticker, start=start, end=end)
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_benchmark(start, end):
+    return _yfdownload("^N225", start=start, end=end)
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def compute_sharpe_all(
+    ticker_map_items: tuple, start_str: str, end_str: str, rfr: float
+) -> pd.DataFrame:
+    """全銘柄のシャープレシオ・ベータ・アルファをバッチダウンロードで一括計算。
+    225銘柄の個別ダウンロードを1回のyf.downloadに集約し初回ロードを高速化する。"""
+    tickers  = [t for t, _ in ticker_map_items]
+    name_map = {t: info for t, info in ticker_map_items}
+    try:
+        raw = yf.download(
+            tickers + ["^N225"], start=start_str, end=end_str,
+            progress=False, auto_adjust=True, threads=True,
+        )
+    except Exception:
+        return pd.DataFrame()
+    if raw.empty:
+        return pd.DataFrame()
+    close_all = raw["Close"] if isinstance(raw.columns, pd.MultiIndex) else raw
+    if "^N225" not in close_all.columns:
+        return pd.DataFrame()
+    market_ret = close_all["^N225"].dropna().pct_change().dropna()
+    market_annual = float(market_ret.mean()) * 252
+    results = []
+    for ticker in tickers:
+        if ticker not in close_all.columns:
+            continue
+        name, sector = name_map[ticker]
+        close = close_all[ticker].dropna()
+        if len(close) < 2:
+            continue
+        ret = close.pct_change().dropna()
+        common = ret.index.intersection(market_ret.index)
+        if len(common) < 30:
+            continue
+        x = ret.loc[common].to_numpy(dtype=float)
+        y = market_ret.loc[common].to_numpy(dtype=float)
+        annual_return = x.mean() * 252
+        annual_vol    = x.std() * np.sqrt(252)
+        if annual_vol == 0:
+            continue
+        try:
+            beta = np.cov(x, y)[0][1] / np.var(y)
+        except Exception:
+            beta = 0.0
+        results.append({
+            "企業名":              name,
+            "業種":                sector,
+            "年間平均リターン(%)": round(annual_return * 100, 2),
+            "年間リスク(%)":       round(annual_vol * 100, 2),
+            "シャープレシオ":      round((annual_return - rfr) / annual_vol, 4),
+            "ベータ":              round(beta, 4),
+            "アルファ(%)":         round((annual_return - beta * market_annual) * 100, 2),
+        })
+    df = pd.DataFrame(results)
+    if not df.empty:
+        df = df.sort_values("シャープレシオ", ascending=False).reset_index(drop=True)
+    return df
+
+# ================================================================
+# メインタブ
+# ================================================================
+
+# ================================================================
+# デフォルトパラメータで事前計算（自動実行用）
+# ================================================================
+end_date   = datetime.today()
+start_date = end_date - relativedelta(years=3)  # デフォルト3年
+
+
+# ─── Tab1: パフォーマンス分析 ────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────
+st.header("📊 パフォーマンス分析")
+st.divider()
+with st.spinner("全銘柄データを一括取得・計算中（初回のみ時間がかかります）..."):
+    df_results = compute_sharpe_all(
+        tuple(ticker_name_map.items()),
+        start_date.strftime("%Y-%m-%d"),
+        end_date.strftime("%Y-%m-%d"),
+        risk_free_rate,
+    )
+
+if df_results.empty:
+    st.warning("分析データが取得できませんでした。しばらく後に再度お試しください。")
+else:
+    st.subheader("📋 分析結果一覧")
+
+    def _color_alpha_cell(val):
+        if isinstance(val, float):
+            if val > 5:  return "color:#1a7f37;font-weight:bold"
+            elif val > 0: return "color:#388e3c"
+            elif val < 0: return "color:#d1242f"
+        return ""
+
+    st.dataframe(
+        df_results.style.format({
+            "年間平均リターン(%)": "{:.2f}",
+            "年間リスク(%)": "{:.2f}",
+            "シャープレシオ": "{:.2f}",
+            "ベータ": "{:.2f}",
+            "アルファ(%)": "{:+.2f}",
+        }).map(_color_alpha_cell, subset=["アルファ(%)"]),
+        use_container_width=True,
+    )
+
+    top_n_disp = int(top_n)
+    top_stocks = df_results.head(top_n_disp)
+
+    fig1, ax1 = plt.subplots(figsize=(14, 6))
+    ax1.bar(top_stocks["企業名"], top_stocks["シャープレシオ"], color="green")
+    ax1.set_title(f"シャープレシオ 上位{top_n_disp}社")
+    ax1.set_ylabel("シャープレシオ")
+    ax1.tick_params(axis="x", rotation=45)
+    plt.tight_layout()
+    st.pyplot(fig1)
+    plt.close(fig1)
+
+    fig2, ax2 = plt.subplots(figsize=(14, 6))
+    ax2.bar(top_stocks["企業名"], top_stocks["年間平均リターン(%)"], color="steelblue")
+    ax2.set_title(f"年間平均リターン(%) 上位{top_n_disp}社")
+    ax2.set_ylabel("年間平均リターン(%)")
+    ax2.tick_params(axis="x", rotation=45)
+    plt.tight_layout()
+    st.pyplot(fig2)
+    plt.close(fig2)
+
+    summary = top_stocks.head(5).to_string()
+    prompt = (
+        "以下は日本株のリスク・リターン分析結果です。\n"
+        "投資家向けに簡潔に300文字以内で評価してください。\n\n"
+        f"{summary}\n"
+    )
+    try:
+        comment, ai_name = generate_ai_comment(prompt)
+        st.subheader(f"🤖 AIコメント（{ai_name}）")
+        st.write(comment)
+    except Exception as e:
+        st.warning(f"AI APIエラー: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────
+st.header("🎯 アルファ・ベータ分析")
+st.divider()
+st.caption(
+    "**α（アルファ）**= 市場平均を超えた銘柄固有の超過リターン。"
+    "**β（ベータ）**= 市場との連動性。"
+    "理想は「高α × 低β」＝市場に左右されず独自に稼ぐ銘柄。"
+)
+
+# df_results が存在するときのみ表示
+try:
+    _ab_ok = not df_results.empty
+except Exception:
+    _ab_ok = False
+
+if not _ab_ok:
+    st.info("パフォーマンス分析を先に実行してください（上のセクションで自動実行されます）")
+else:
+    # ── アルファ計算（df_resultsに既に含まれている）────────────────
+    df_ab = df_results.copy()
+    # アルファ列が無い場合のみ計算（念のため）
+    if "アルファ(%)" not in df_ab.columns:
+        _bench_close2 = _to_series(benchmark["Close"])
+        _market_annual = float(
+            (_bench_close2.iloc[-1] - _bench_close2.iloc[0]) / _bench_close2.iloc[0]
+        )
+        df_ab["アルファ(%)"] = (
+            df_ab["年間平均リターン(%)"] / 100
+            - df_ab["ベータ"] * _market_annual
+        ) * 100
+        df_ab["アルファ(%)"] = df_ab["アルファ(%)"].round(2)
+
+    # ── メトリクス ────────────────────────────────────────────────
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("高アルファ銘柄数（α>0）",
+              f"{(df_ab['アルファ(%)'] > 0).sum()}社")
+    m2.metric("平均アルファ",
+              f"{df_ab['アルファ(%)'].mean():.2f}%")
+    m3.metric("最大アルファ",
+              f"{df_ab['アルファ(%)'].max():.2f}%",
+              df_ab.loc[df_ab['アルファ(%)'].idxmax(), '企業名'])
+    m4.metric("低β高α銘柄数（β<1 & α>0）",
+              f"{((df_ab['ベータ'] < 1) & (df_ab['アルファ(%)'] > 0)).sum()}社")
+
+    st.divider()
+
+    ab_t1, ab_t2, ab_t3 = st.tabs([
+        "🏆 高アルファランキング",
+        "🔵 α vs β 散布図",
+        "💎 低β・高α スクリーナー",
+    ])
+
+    # ── Tab1: 高アルファランキング ───────────────────────────────
+    with ab_t1:
+        st.markdown("#### 🏆 アルファランキング（市場超過リターン上位）")
+        st.caption("αが高い = 日経平均の動きに関係なく独自に上昇している銘柄")
+
+        top_alpha = df_ab.sort_values("アルファ(%)", ascending=False).head(30)
+        bot_alpha = df_ab.sort_values("アルファ(%)", ascending=True).head(10)
+
+        col_a1, col_a2 = st.columns([2, 1])
+        with col_a1:
+            st.markdown("**上位30銘柄（高アルファ）**")
+            def _color_alpha(val):
+                if isinstance(val, float):
+                    if val > 10: return "color:#1a7f37;font-weight:bold;font-size:14px"
+                    elif val > 0: return "color:#1a7f37;font-weight:bold"
+                    elif val < 0: return "color:#d1242f"
+                return ""
+            st.dataframe(
+                top_alpha[["企業名","業種","アルファ(%)","ベータ",
+                            "年間平均リターン(%)","シャープレシオ"]]
+                .style
+                .format({"アルファ(%)":"{:+.2f}","ベータ":"{:.2f}",
+                         "年間平均リターン(%)":"{:.2f}","シャープレシオ":"{:.2f}"})
+                .map(_color_alpha, subset=["アルファ(%)"]),
+                use_container_width=True, hide_index=True
+            )
+        with col_a2:
+            st.markdown("**下位10銘柄（低アルファ・市場負け）**")
+            st.dataframe(
+                bot_alpha[["企業名","業種","アルファ(%)","ベータ"]]
+                .style
+                .format({"アルファ(%)":"{:+.2f}","ベータ":"{:.2f}"})
+                .map(_color_alpha, subset=["アルファ(%)"]),
+                use_container_width=True, hide_index=True
+            )
+
+        # アルファ棒グラフ
+        fig_alpha, ax_alpha = plt.subplots(figsize=(14, 6))
+        top20 = df_ab.sort_values("アルファ(%)", ascending=False).head(20)
+        colors_a = ["#1a7f37" if v >= 0 else "#d1242f" for v in top20["アルファ(%)"]]
+        ax_alpha.bar(top20["企業名"], top20["アルファ(%)"],
+                     color=colors_a, alpha=0.85)
+        ax_alpha.axhline(0, color="black", linewidth=0.8)
+        ax_alpha.set_title("アルファ上位20銘柄（年間・市場超過リターン）",
+                            fontsize=12, fontweight="bold")
+        ax_alpha.set_ylabel("アルファ (%)")
+        ax_alpha.tick_params(axis="x", rotation=45, labelsize=9)
+        ax_alpha.grid(True, axis="y", alpha=0.3)
+        plt.tight_layout()
+        st.pyplot(fig_alpha, clear_figure=True)
+
+    # ── Tab2: α vs β 散布図 ─────────────────────────────────────
+    with ab_t2:
+        st.markdown("#### 🔵 アルファ vs ベータ 散布図（全銘柄）")
+        st.caption(
+            "**右上**（高β・高α）= 積極的成長株 | "
+            "**左上**（低β・高α）= 理想的な優良株 | "
+            "**右下**（高β・低α）= 市場連動だが割高 | "
+            "**左下**（低β・低α）= 市場負け・ディフェンシブ"
+        )
+
+        sectors_ab = df_ab["業種"].unique()
+        cmap_ab = plt.cm.get_cmap("tab20", len(sectors_ab))
+        sec_color_ab = {s: cmap_ab(i) for i, s in enumerate(sectors_ab)}
+
+        fig_ab, ax_ab = plt.subplots(figsize=(14, 9))
+
+        for sec in sectors_ab:
+            sub = df_ab[df_ab["業種"] == sec]
+            ax_ab.scatter(
+                sub["ベータ"], sub["アルファ(%)"],
+                label=sec, color=sec_color_ab[sec],
+                s=70, alpha=0.8, zorder=3
+            )
+            # 注目銘柄にラベル
+            for _, row in sub.iterrows():
+                if row["アルファ(%)"] > df_ab["アルファ(%)"].quantile(0.85) or \
+                   row["アルファ(%)"] < df_ab["アルファ(%)"].quantile(0.10):
+                    ax_ab.annotate(
+                        row["企業名"],
+                        (row["ベータ"], row["アルファ(%)"]),
+                        fontsize=7, alpha=0.9,
+                        xytext=(4, 4), textcoords="offset points",
+                    )
+
+        # 軸線
+        ax_ab.axhline(0, color="gray", linewidth=0.8, linestyle="--", zorder=2)
+        ax_ab.axvline(1, color="orange", linewidth=1.0,
+                      linestyle="--", alpha=0.6, zorder=2, label="β=1（市場平均）")
+
+        # 象限ラベル
+        x_lim = ax_ab.get_xlim()
+        y_lim = ax_ab.get_ylim()
+        ax_ab.text(0.3, df_ab["アルファ(%)"].max() * 0.8,
+                   "低β・高α\n💎 理想優良株",
+                   color="#1a7f37", fontsize=10, fontweight="bold", ha="center",
+                   bbox=dict(boxstyle="round,pad=0.3", facecolor="#e8f5e9", alpha=0.8))
+        ax_ab.text(1.5, df_ab["アルファ(%)"].max() * 0.8,
+                   "高β・高α\n🚀 積極成長株",
+                   color="#1565c0", fontsize=10, fontweight="bold", ha="center",
+                   bbox=dict(boxstyle="round,pad=0.3", facecolor="#e3f2fd", alpha=0.8))
+        ax_ab.text(0.3, df_ab["アルファ(%)"].min() * 0.8,
+                   "低β・低α\n😴 市場負け",
+                   color="#9e9e9e", fontsize=10, fontweight="bold", ha="center",
+                   bbox=dict(boxstyle="round,pad=0.3", facecolor="#f5f5f5", alpha=0.8))
+        ax_ab.text(1.5, df_ab["アルファ(%)"].min() * 0.8,
+                   "高β・低α\n⚠️ 市場連動・割高",
+                   color="#d1242f", fontsize=10, fontweight="bold", ha="center",
+                   bbox=dict(boxstyle="round,pad=0.3", facecolor="#ffebee", alpha=0.8))
+
+        ax_ab.set_xlabel("ベータ（β）― 市場連動性", fontsize=12)
+        ax_ab.set_ylabel("アルファ（α）(%) ― 市場超過リターン", fontsize=12)
+        ax_ab.set_title("アルファ vs ベータ 分析マップ", fontsize=13, fontweight="bold")
+        ax_ab.legend(bbox_to_anchor=(1.01, 1), loc="upper left",
+                     fontsize=8, framealpha=0.9, ncol=1)
+        ax_ab.grid(True, alpha=0.2, zorder=1)
+        ax_ab.spines["top"].set_visible(False)
+        ax_ab.spines["right"].set_visible(False)
+        plt.tight_layout()
+        st.pyplot(fig_ab, clear_figure=True)
+
+    # ── Tab3: 低β・高α スクリーナー ────────────────────────────
+    with ab_t3:
+        st.markdown("#### 💎 低ベータ・高アルファ スクリーナー")
+        st.caption("市場リスクを抑えながら超過リターンを稼いでいる銘柄を抽出")
+
+        col_s1, col_s2, col_s3 = st.columns(3)
+        with col_s1:
+            beta_max  = st.slider("最大β（低いほど市場影響小）",
+                                  0.3, 2.0, 1.0, 0.1, key="ab_beta_max")
+        with col_s2:
+            alpha_min = st.slider("最小α（%）（高いほど超過収益大）",
+                                  -10.0, 30.0, 0.0, 0.5, key="ab_alpha_min")
+        with col_s3:
+            sharpe_min = st.slider("最小シャープレシオ",
+                                   0.0, 3.0, 0.5, 0.1, key="ab_sharpe_min")
+
+        df_screen = df_ab[
+            (df_ab["ベータ"] <= beta_max) &
+            (df_ab["アルファ(%)"] >= alpha_min) &
+            (df_ab["シャープレシオ"] >= sharpe_min)
+        ].sort_values("アルファ(%)", ascending=False)
+
+        st.markdown(f"**{len(df_screen)}銘柄が条件を満たしています**"
+                    f"（β≤{beta_max} & α≥{alpha_min}% & SR≥{sharpe_min}）")
+
+        if df_screen.empty:
+            st.info("条件を緩めてみてください")
+        else:
+            # スコア計算（α/β比）
+            df_screen = df_screen.copy()
+            df_screen["α/β比"] = (
+                df_screen["アルファ(%)"] / (df_screen["ベータ"].abs() + 0.01)
+            ).round(2)
+
+            disp_cols = ["企業名", "業種", "アルファ(%)", "ベータ",
+                         "α/β比", "シャープレシオ", "年間平均リターン(%)", "年間リスク(%)"]
+
+            def _color_score(val):
+                if isinstance(val, float):
+                    if val > 10: return "color:#1a7f37;font-weight:bold;font-size:14px"
+                    elif val > 5: return "color:#1a7f37;font-weight:bold"
+                    elif val > 0: return "color:#388e3c"
+                return ""
+
+            st.dataframe(
+                df_screen[disp_cols].style
+                .format({
+                    "アルファ(%)": "{:+.2f}",
+                    "ベータ": "{:.2f}",
+                    "α/β比": "{:.2f}",
+                    "シャープレシオ": "{:.2f}",
+                    "年間平均リターン(%)": "{:.2f}",
+                    "年間リスク(%)": "{:.2f}",
+                })
+                .map(_color_score, subset=["α/β比"]),
+                use_container_width=True, hide_index=True
+            )
+
+            # CSVダウンロード
+            csv_ab = df_screen[disp_cols].to_csv(index=False, encoding="utf-8-sig")
+            st.download_button(
+                "⬇️ スクリーニング結果をCSVダウンロード",
+                data=csv_ab,
+                file_name=f"alpha_beta_screen_{datetime.today().strftime('%Y%m%d')}.csv",
+                mime="text/csv",
+                key="ab_dl"
+            )
+
+            # バブルチャート（サイズ=シャープレシオ）
+            fig_sc, ax_sc = plt.subplots(figsize=(12, 7))
+            sc = ax_sc.scatter(
+                df_screen["ベータ"],
+                df_screen["アルファ(%)"],
+                s=df_screen["シャープレシオ"].clip(lower=0.1) * 200,
+                c=df_screen["α/β比"],
+                cmap="YlGn",
+                alpha=0.8, edgecolors="gray", linewidth=0.5, zorder=3
+            )
+            for _, row in df_screen.head(20).iterrows():
+                ax_sc.annotate(
+                    row["企業名"],
+                    (row["ベータ"], row["アルファ(%)"]),
+                    fontsize=8,
+                    xytext=(5, 5), textcoords="offset points",
+                )
+            plt.colorbar(sc, ax=ax_sc, label="α/β比")
+            ax_sc.axhline(0, color="gray", linewidth=0.8, linestyle="--")
+            ax_sc.axvline(1, color="orange", linewidth=0.8,
+                          linestyle="--", alpha=0.6)
+            ax_sc.set_xlabel("ベータ（β）", fontsize=12)
+            ax_sc.set_ylabel("アルファ（α）(%)", fontsize=12)
+            ax_sc.set_title(
+                "低β・高α スクリーニング結果\n（バブルサイズ = シャープレシオ、色 = α/β比）",
+                fontsize=12, fontweight="bold"
+            )
+            ax_sc.grid(True, alpha=0.2)
+            ax_sc.spines["top"].set_visible(False)
+            ax_sc.spines["right"].set_visible(False)
+            plt.tight_layout()
+            st.pyplot(fig_sc, clear_figure=True)
+
+
+# ─── Tab2: セクターローテーション ────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────
+st.header("🔄 セクターローテーション")
+st.divider()
+st.subheader("🔄 セクターローテーション分析")
+st.caption("各業種に属する銘柄の平均リターンを集計し、資金が流入・流出しているセクターを可視化します。")
+
+col_ctrl1, col_ctrl2, col_ctrl3 = st.columns([2, 2, 3])
+with col_ctrl1:
+    rotation_period = st.selectbox(
+        "分析期間",
+        options=[5, 10, 20, 60, 90],
+        index=2,
+        format_func=lambda x: {5: "1週間(5日)", 10: "2週間(10日)",
+                                20: "1ヶ月(20日)", 60: "3ヶ月(60日)",
+                                90: "約半年(90日)"}[x],
+    )
+with col_ctrl2:
+    top_bottom_n = st.slider("上位・下位 表示セクター数", 3, 8, 5)
+with col_ctrl3:
+    run_rotation = True  # 自動実行
+
+st.divider()
+
+if run_rotation:
+    with st.spinner(f"全銘柄の株価データを取得中（{len(ticker_name_map)}銘柄）..."):
+        df_sector = get_sector_performance(ticker_name_map, period_days=rotation_period)
+
+    if df_sector.empty:
+        st.error("データの取得に失敗しました。しばらくしてから再試行してください。")
+    else:
+        top_sec    = df_sector.iloc[0]
+        bottom_sec = df_sector.iloc[-1]
+        rising     = (df_sector["平均リターン(%)"] > 0).sum()
+        falling    = (df_sector["平均リターン(%)"] < 0).sum()
+
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("📈 最強セクター",  top_sec["業種"],    f"{top_sec['騰落率(%)']:+.2f}%")
+        k2.metric("📉 最弱セクター",  bottom_sec["業種"], f"{bottom_sec['騰落率(%)']:+.2f}%")
+        k3.metric("🟢 上昇セクター数", f"{rising} 業種")
+        k4.metric("🔴 下落セクター数", f"{falling} 業種")
+
+        st.divider()
+
+        period_label = {5: "1週間", 10: "2週間", 20: "1ヶ月", 60: "3ヶ月", 90: "約半年"}[rotation_period]
+        fig_bar = plot_sector_bar(
+            df_sector,
+            title=f"セクター別平均リターン（{period_label}） 買われ / 売られ",
+        )
+        st.pyplot(fig_bar)
+        plt.close(fig_bar)
+
+        st.divider()
+        st.subheader("📈 買われセクター vs 📉 売られセクター の値動き比較")
+        top_sectors    = df_sector.head(top_bottom_n)["業種"].tolist()
+        bottom_sectors = df_sector.tail(top_bottom_n)["業種"].tolist()
+
+        with st.spinner("時系列データ取得中..."):
+            df_ts = get_sector_timeseries(ticker_name_map, days=max(rotation_period + 10, 30))
+
+        if not df_ts.empty:
+            fig_ts = plot_sector_timeseries(df_ts, top_sectors, bottom_sectors)
+            st.pyplot(fig_ts)
+            plt.close(fig_ts)
+
+        st.divider()
+        st.subheader("🌡️ セクター別ヒートマップ（期間比較）")
+        with st.spinner("複数期間データを取得中..."):
+            df_1w = get_sector_performance(ticker_name_map, period_days=5)
+            df_1m = get_sector_performance(ticker_name_map, period_days=20)
+            df_3m = get_sector_performance(ticker_name_map, period_days=60)
+
+        df_heat_base = df_1m[["業種"]].copy()
+        df_heat_base = df_heat_base.merge(
+            df_1w[["業種", "平均リターン(%)"]].rename(columns={"平均リターン(%)": "1週間"}), on="業種", how="left"
+        ).merge(
+            df_1m[["業種", "平均リターン(%)"]].rename(columns={"平均リターン(%)": "1ヶ月"}), on="業種", how="left"
+        ).merge(
+            df_3m[["業種", "平均リターン(%)"]].rename(columns={"平均リターン(%)": "3ヶ月"}), on="業種", how="left"
+        )
+
+        fig_heat = plot_sector_heatmap(df_heat_base)
+        st.pyplot(fig_heat)
+        plt.close(fig_heat)
+
+        st.divider()
+        st.subheader("📋 セクター別詳細データ")
+        df_display = df_sector[["業種", "平均リターン(%)", "中央値リターン(%)",
+                                 "銘柄数", "上昇銘柄数", "下落銘柄数", "上昇率(%)"]].copy()
+
+        def color_return(val):
+            if isinstance(val, float):
+                if val > 2:    return "background-color: rgba(56,142,60,0.45); color: white; font-weight:bold"
+                elif val > 0:  return "color: #388e3c; font-weight:bold"
+                elif val < -2: return "background-color: rgba(211,47,47,0.45); color: white; font-weight:bold"
+                elif val < 0:  return "color: #d32f2f; font-weight:bold"
+            return ""
+
+        styled = df_display.style.format({
+            "平均リターン(%)": "{:+.2f}",
+            "中央値リターン(%)": "{:+.2f}",
+            "上昇率(%)": "{:.1f}",
+        }).map(color_return, subset=["平均リターン(%)", "中央値リターン(%)"])
+        st.dataframe(styled, use_container_width=True, height=500)
+
+        st.divider()
+        st.subheader("🤖 AIによるセクターローテーション解説")
+        top5_str    = df_sector.head(5)[["業種", "騰落率(%)"]].to_string(index=False)
+        bottom5_str = df_sector.tail(5)[["業種", "騰落率(%)"]].to_string(index=False)
+        prompt_rotation = (
+            "あなたは日本株の機関投資家向けストラテジストです。\n"
+            f"以下は直近{period_label}のJPX上場主要銘柄のセクター別平均リターンです。\n\n"
+            f"【買われているセクター上位5】\n{top5_str}\n\n"
+            f"【売られているセクター下位5】\n{bottom5_str}\n\n"
+            "以下の観点で400文字以内で分析してください:\n"
+            "1. 現在のセクターローテーションの特徴\n"
+            "2. 買われているセクターの背景・理由\n"
+            "3. 売られているセクターの背景・理由\n"
+            "4. 投資家へのアドバイス\n"
+        )
+        with st.spinner("AI分析中..."):
+            try:
+                comment, ai_name = generate_ai_comment(prompt_rotation)
+                st.info(f"{comment}\n\n_AI: {ai_name}_")
+            except Exception as e:
+                st.warning(f"AI APIエラー: {e}")
+
+else:
+    st.info(
+        "「▶ セクターローテーション分析を実行」ボタンを押すと分析が始まります。\n\n"
+        "表示されるグラフ:\n"
+        "- セクター別平均リターン棒グラフ（買われ・売られ色分け）\n"
+        "- 上位・下位セクターの累積リターン時系列グラフ\n"
+        "- 1週間 / 1ヶ月 / 3ヶ月 ヒートマップ（期間比較）\n"
+        "- セクター別詳細テーブル（上昇銘柄数・上昇率など）\n"
+        "- AIによるローテーション解説とアドバイス"
+    )
+    st.caption("全銘柄データ取得のため、初回実行には数十秒かかる場合があります。結果は30分キャッシュされます。")
+
+
+# ─── Tab3: 需給スクリーナー ──────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────
+st.header("🔥 需給スクリーナー")
+st.divider()
+st.subheader("🔥 需給スクリーナー（出来高ベース）")
+
+col_v1, col_v2, col_v3 = st.columns([2, 2, 3])
+with col_v1:
+    surge_ratio = st.slider("出来高急増の閾値（倍）", 1.5, 5.0, 2.0, 0.5)
+with col_v2:
+    pv_days = st.selectbox("Price x Volume 期間", [10, 20, 60], index=1,
+                            format_func=lambda x: f"{x}日")
+with col_v3:
+    run_volume = True  # 自動実行
+
+st.divider()
+
+if run_volume:
+    st.subheader(f"📊 出来高急増銘柄（過去5日平均が20日平均の{surge_ratio}倍以上）")
+    with st.spinner("出来高データ取得中..."):
+        df_surge = get_volume_surge(ticker_name_map, surge_ratio=surge_ratio)
+
+    if df_surge.empty:
+        st.info(f"現在、出来高が{surge_ratio}倍以上の銘柄は検出されませんでした。")
+    else:
+        st.success(f"🔺 {len(df_surge)} 銘柄検出")
+        def color_surge(val):
+            if isinstance(val, float):
+                if val >= 3:  return "background-color: #d32f2f; color: white; font-weight:bold"
+                elif val >= 2: return "background-color: #f57c00; color: white; font-weight:bold"
+            return ""
+        styled_surge = df_surge.style.format({
+            "出来高倍率": "{:.2f}x",
+            "株価変化率(5日%)": "{:+.2f}",
+        }).map(color_surge, subset=["出来高倍率"])
+        st.dataframe(styled_surge, use_container_width=True)
+
+        top5 = df_surge.head(5)[["企業名", "業種", "出来高倍率", "株価変化率(5日%)"]].to_string(index=False)
+        prompt_surge = (
+            "以下は直近5日間で出来高が急増した日本株銘柄上位5社です。\n\n"
+            f"{top5}\n\n"
+            "投資家向けに300文字以内で分析してください:\n"
+            "1. 機関投資家・仕手の動きと考えられるか\n"
+            "2. 業種・テーマ的な特徴\n"
+            "3. 注意点・リスク\n"
+        )
+        with st.spinner("AI分析中..."):
+            try:
+                comment, ai_name = generate_ai_comment(prompt_surge)
+                st.info(f"🤖 **AI解説（{ai_name}）**\n\n{comment}")
+            except Exception as e:
+                st.warning(f"AI APIエラー: {e}")
+
+    st.divider()
+
+    st.subheader("📏 VWAP乖離率ランキング（割高・割安スクリーニング）")
+    with st.spinner("VWAPデータ計算中..."):
+        df_vwap = get_vwap_deviation(ticker_name_map)
+
+    if not df_vwap.empty:
+        col_up, col_down = st.columns(2)
+        with col_up:
+            st.markdown("#### 🔴 割高（VWAP上方乖離 上位10）")
+            df_over = df_vwap[df_vwap["VWAP乖離率(%)"] > 0].head(10)
+            st.dataframe(df_over.style.format({"VWAP乖離率(%)": "{:+.2f}"}),
+                         use_container_width=True)
+        with col_down:
+            st.markdown("#### 🟢 割安（VWAP下方乖離 下位10）")
+            df_under = df_vwap[df_vwap["VWAP乖離率(%)"] < 0].tail(10).sort_values("VWAP乖離率(%)")
+            st.dataframe(df_under.style.format({"VWAP乖離率(%)": "{:+.2f}"}),
+                         use_container_width=True)
+
+    st.divider()
+
+    st.subheader(f"🗺️ Price x Volume マップ（直近{pv_days}日）")
+    with st.spinner("散布図データ取得中..."):
+        df_pv = get_price_volume_scatter(ticker_name_map, days=pv_days)
+
+    if df_pv.empty:
+        st.info("散布図データを取得できませんでした。しばらく待って再読み込みしてください。")
+    else:
+        plot_pv_scatter(df_pv)
+
+        q1 = df_pv[(df_pv["株価騰落率(%)"] > 0) & (df_pv["出来高変化率(%)"] > 0)]
+        q1_top = q1.nlargest(5, "株価騰落率(%)")[["企業名", "業種", "株価騰落率(%)", "出来高変化率(%)"]].to_string(index=False)
+        prompt_pv = (
+            "株価上昇かつ出来高増加の上位銘柄:\n\n"
+            f"{q1_top}\n\n"
+            "投資家向けに200文字以内でコメントしてください。\n"
+        )
+        with st.spinner("AI分析中..."):
+            try:
+                comment, ai_name = generate_ai_comment(prompt_pv)
+                st.info(f"🤖 **本命上昇銘柄 AI解説（{ai_name}）**\n\n{comment}")
+            except Exception as e:
+                st.warning(f"AI APIエラー: {e}")
+else:
+    st.info(
+        "「▶ 需給分析を実行」ボタンを押してください。\n\n"
+        "- 📊 出来高急増スクリーナー\n"
+        "- 📏 VWAP乖離ランキング\n"
+        "- 🗺️ Price x Volume マップ"
+    )
+
+
+# ─── Tab4: 価格パターン ──────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────
+st.header("📈 価格パターン")
+st.divider()
+st.subheader("📈 価格パターン分析")
+
+col_p1, col_p2 = st.columns([3, 2])
+with col_p1:
+    run_price = True  # 自動実行
+with col_p2:
+    cross_lookback = st.slider("クロスシグナル 直近何日以内を検出？", 3, 20, 10)
+
+st.divider()
+
+if run_price:
+    st.subheader("🏔️ 52週高値・安値ダッシュボード")
+    with st.spinner("52週データ取得中..."):
+        df_52 = get_52week_highlow(ticker_name_map)
+
+    if not df_52.empty:
+        new_highs = df_52[df_52["新高値"] != ""]
+        new_lows  = df_52[df_52["新安値"] != ""]
+
+        col_nh, col_nl = st.columns(2)
+        with col_nh:
+            st.metric("🔺 新高値更新銘柄", f"{len(new_highs)} 銘柄")
+            if not new_highs.empty:
+                st.dataframe(new_highs[["企業名", "業種", "現在値", "52週高値", "高値からの乖離(%)"]],
+                             use_container_width=True)
+        with col_nl:
+            st.metric("🔻 新安値更新銘柄", f"{len(new_lows)} 銘柄")
+            if not new_lows.empty:
+                st.dataframe(new_lows[["企業名", "業種", "現在値", "52週安値", "安値からの乖離(%)"]],
+                             use_container_width=True)
+
+        hl_index = len(new_highs) / max(len(new_highs) + len(new_lows), 1) * 100
+        st.metric("📊 ハイローインデックス", f"{hl_index:.1f}%",
+                  help="新高値/(新高値+新安値)x100。50%超=強気市場の目安")
+        if hl_index >= 70:
+            st.success("📈 強気市場シグナル（新高値銘柄が多数）")
+        elif hl_index <= 30:
+            st.error("📉 弱気市場シグナル（新安値銘柄が多数）")
+        else:
+            st.info("⚖️ 中立（方向感なし）")
+
+    st.divider()
+
+    st.subheader("📐 移動平均線乖離率ランキング")
+    with st.spinner("移動平均データ計算中..."):
+        df_ma = get_ma_deviation(ticker_name_map)
+
+    if not df_ma.empty:
+        col_ma1, col_ma2 = st.columns(2)
+        with col_ma1:
+            st.markdown("#### 🔴 25日MA 上方乖離 上位10（買われすぎ）")
+            st.dataframe(
+                df_ma.head(10)[["企業名", "業種", "現在値", "25日MA乖離(%)", "75日MA乖離(%)"]].style.format({
+                    "25日MA乖離(%)": "{:+.2f}", "75日MA乖離(%)": "{:+.2f}"
+                }), use_container_width=True
+            )
+        with col_ma2:
+            st.markdown("#### 🟢 25日MA 下方乖離 下位10（売られすぎ）")
+            st.dataframe(
+                df_ma.tail(10)[["企業名", "業種", "現在値", "25日MA乖離(%)", "75日MA乖離(%)"]].style.format({
+                    "25日MA乖離(%)": "{:+.2f}", "75日MA乖離(%)": "{:+.2f}"
+                }), use_container_width=True
+            )
+
+    st.divider()
+
+    st.subheader(f"🔔 ゴールデンクロス / デッドクロス（直近{cross_lookback}日以内）")
+    with st.spinner("クロスシグナル検出中..."):
+        df_cross = get_cross_signals(ticker_name_map, lookback_days=cross_lookback)
+
+    if df_cross.empty:
+        st.info(f"直近{cross_lookback}日以内にクロスシグナルは検出されませんでした。")
+    else:
+        gc = df_cross[df_cross["シグナル"].str.contains("ゴールデン")]
+        dc = df_cross[df_cross["シグナル"].str.contains("デッド")]
+        col_gc, col_dc = st.columns(2)
+        with col_gc:
+            st.markdown(f"#### 🟡 ゴールデンクロス — {len(gc)} 銘柄")
+            if not gc.empty:
+                st.dataframe(gc[["企業名", "業種", "発生日", "現在値"]], use_container_width=True)
+        with col_dc:
+            st.markdown(f"#### 💀 デッドクロス — {len(dc)} 銘柄")
+            if not dc.empty:
+                st.dataframe(dc[["企業名", "業種", "発生日", "現在値"]], use_container_width=True)
+
+        cross_str = df_cross.head(8)[["企業名", "業種", "シグナル", "発生日"]].to_string(index=False)
+        prompt_cross = (
+            "直近のゴールデンクロス・デッドクロス発生銘柄:\n\n"
+            f"{cross_str}\n\n"
+            "投資家向けに200文字以内で注目ポイントをコメントしてください。\n"
+        )
+        with st.spinner("AI分析中..."):
+            try:
+                comment, ai_name = generate_ai_comment(prompt_cross)
+                st.info(f"🤖 **AI解説（{ai_name}）**\n\n{comment}")
+            except Exception as e:
+                st.warning(f"AI APIエラー: {e}")
+else:
+    st.info(
+        "「▶ 価格パターン分析を実行」ボタンを押してください。\n\n"
+        "- 🏔️ 52週高値・安値ダッシュボード + ハイローインデックス\n"
+        "- 📐 25日・75日・200日MA乖離率ランキング\n"
+        "- 🔔 ゴールデンクロス/デッドクロス 直近発生銘柄"
+    )
+
+
+# ─── Tab5: モメンタム・相関分析 ──────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────
+st.header("💡 モメンタム・相関分析")
+st.divider()
+st.subheader("💡 モメンタム・相関分析")
+
+col_u1, col_u2 = st.columns([3, 2])
+with col_u1:
+    run_unique = True  # 自動実行
+with col_u2:
+    corr_window = st.slider("相関崩れ 直近ウィンドウ（日）", 10, 30, 20)
+
+st.divider()
+
+if run_unique:
+    st.subheader("🚀 週次モメンタムスコアランキング")
+    with st.spinner("モメンタムスコア計算中..."):
+        df_mom = get_momentum_score(ticker_name_map)
+
+    if not df_mom.empty:
+        col_m1, col_m2 = st.columns(2)
+        with col_m1:
+            st.markdown("#### 📈 上位20銘柄（買いモメンタム）")
+            st.dataframe(
+                df_mom.head(20).style.format({
+                    "モメンタムスコア": "{:.3f}",
+                    "株価騰落率(%)": "{:+.2f}",
+                    "出来高変化率(%)": "{:+.2f}",
+                }), use_container_width=True
+            )
+        with col_m2:
+            st.markdown("#### 📉 下位20銘柄（売りモメンタム）")
+            st.dataframe(
+                df_mom.tail(20).sort_values("モメンタムスコア").style.format({
+                    "モメンタムスコア": "{:.3f}",
+                    "株価騰落率(%)": "{:+.2f}",
+                    "出来高変化率(%)": "{:+.2f}",
+                }), use_container_width=True
+            )
+
+        top10 = df_mom.head(10)[["企業名", "業種", "モメンタムスコア", "株価騰落率(%)", "出来高変化率(%)"]].to_string(index=False)
+        bot10 = df_mom.tail(10)[["企業名", "業種", "モメンタムスコア", "株価騰落率(%)", "出来高変化率(%)"]].to_string(index=False)
+        prompt_mom = (
+            "あなたは日本株ストラテジストです。\n"
+            "以下は直近1ヶ月のモメンタムスコアランキングです。\n\n"
+            f"【高モメンタム上位10銘柄】\n{top10}\n\n"
+            f"【低モメンタム下位10銘柄】\n{bot10}\n\n"
+            "週次レポートとして400文字以内で分析してください:\n"
+            "1. 今週のモメンタム相場の特徴\n"
+            "2. 注目銘柄とその理由\n"
+            "3. 逆張りの観点からの注意点\n"
+        )
+        with st.spinner("AI週次レポート生成中..."):
+            try:
+                comment, ai_name = generate_ai_comment(prompt_mom)
+                st.subheader(f"🤖 AI週次モメンタムレポート（{ai_name}）")
+                st.info(comment)
+            except Exception as e:
+                st.warning(f"AI APIエラー: {e}")
+
+    st.divider()
+
+    st.subheader("📅 曜日別平均リターン（市場の癖）")
+    with st.spinner("曜日パターン分析中..."):
+        df_dow = get_dow_of_week_pattern(ticker_name_map)
+
+    if not df_dow.empty:
+        fig_dow = plot_dow_heatmap(df_dow)
+        st.pyplot(fig_dow)
+        plt.close(fig_dow)
+
+        stack = df_dow.stack().reset_index()
+        stack.columns = ["業種", "曜日", "平均リターン(%)"]
+        best  = stack.nlargest(3, "平均リターン(%)")
+        worst = stack.nsmallest(3, "平均リターン(%)")
+        col_b, col_w = st.columns(2)
+        with col_b:
+            st.markdown("#### 🟢 最もリターンが高い 曜日×セクター")
+            st.dataframe(best.style.format({"平均リターン(%)": "{:+.4f}"}), use_container_width=True)
+        with col_w:
+            st.markdown("#### 🔴 最もリターンが低い 曜日×セクター")
+            st.dataframe(worst.style.format({"平均リターン(%)": "{:+.4f}"}), use_container_width=True)
+
+    st.divider()
+
+    st.subheader("🔍 日経平均との相関崩れ検知（個別材料の先行シグナル）")
+    with st.spinner("相関分析中..."):
+        df_corr = get_correlation_divergence(ticker_name_map, corr_window=corr_window)
+
+    if not df_corr.empty:
+        st.caption("相関乖離度が高い = 最近、日経と独自の動きをしている銘柄（個別材料の可能性）")
+        col_div1, col_div2 = st.columns(2)
+        with col_div1:
+            st.markdown("#### 🟡 相関崩れ上位15（独自上昇の可能性）")
+            rising_div = df_corr[df_corr["直近5日株価変化(%)"] > 0].head(15)
+            st.dataframe(rising_div.style.format({
+                "長期相関": "{:.3f}", "直近相関": "{:.3f}",
+                "相関乖離度": "{:.3f}", "直近5日株価変化(%)": "{:+.2f}"
+            }), use_container_width=True)
+        with col_div2:
+            st.markdown("#### 🔴 相関崩れ上位15（独自下落・要注意）")
+            falling_div = df_corr[df_corr["直近5日株価変化(%)"] < 0].head(15)
+            st.dataframe(falling_div.style.format({
+                "長期相関": "{:.3f}", "直近相関": "{:.3f}",
+                "相関乖離度": "{:.3f}", "直近5日株価変化(%)": "{:+.2f}"
+            }), use_container_width=True)
+
+        top_div = df_corr.head(5)[["企業名", "業種", "相関乖離度", "直近5日株価変化(%)"]].to_string(index=False)
+        prompt_corr = (
+            "以下は日経平均との相関が最近崩れている日本株銘柄上位5社です。\n\n"
+            f"{top_div}\n\n"
+            "投資家向けに200文字以内でコメントしてください:\n"
+            "1. 考えられる個別材料の種類\n"
+            "2. 投資機会またはリスク\n"
+        )
+        with st.spinner("AI分析中..."):
+            try:
+                comment, ai_name = generate_ai_comment(prompt_corr)
+                st.info(f"🤖 **AI解説（{ai_name}）**\n\n{comment}")
+            except Exception as e:
+                st.warning(f"AI APIエラー: {e}")
+else:
+    st.info(
+        "「▶ モメンタム・相関分析を実行」ボタンを押してください。\n\n"
+        "- 🚀 週次モメンタムスコアランキング + AI自動レポート\n"
+        "- 📅 曜日別平均リターンヒートマップ（市場の癖）\n"
+        "- 🔍 日経平均との相関崩れ検知（個別材料の先行シグナル）"
+    )
+
+
+# ─── Tab6: 銘柄別ニュース ─────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────
+st.header("📰 銘柄別ニュース")
+st.divider()
+st.subheader("📰 銘柄別ニュース・適時開示")
+
+ticker_options = {f"{name}（{t}）": t for t, (name, _) in ticker_name_map.items()}
+selected_label = st.selectbox(
+    "銘柄を選択", list(ticker_options.keys()),
+    index=list(ticker_options.keys()).index("トヨタ（7203.T）")
+    if "トヨタ（7203.T）" in ticker_options else 0
+)
+selected_ticker = ticker_options[selected_label]
+selected_name   = ticker_name_map[selected_ticker][0]
+
+col_btn1, col_btn2 = st.columns([1, 4])
+with col_btn1:
+    run_news = True  # 自動実行
+with col_btn2:
+    run_ai   = st.checkbox("🤖 AIによる要約・センチメント分析も行う", value=True)
+
+if run_news:
+    with st.spinner(f"{selected_name} のニュースを全ソースから取得中..."):
+        all_news = fetch_all_news(selected_ticker, news_max_per_source)
+
+    filtered = [n for n in all_news if n["source"] in show_news_sources] if show_news_sources else all_news
+
+    if not filtered:
+        st.warning("ニュースが取得できませんでした（ソース設定を確認してください）")
+    else:
+        source_colors = {
+            "Yahoo!Finance JP":  "🟦",
+            "株探(Kabutan)":     "🟩",
+            "みんかぶ":          "🟨",
+            "TDnet（適時開示）": "🟥",
+            "日経新聞":          "⬛",
+            "Reuters JP":        "🟫",
+        }
+
+        from collections import Counter
+        src_counts = Counter(n["source"] for n in filtered)
+        cols_stat  = st.columns(len(src_counts))
+        for i, (src, cnt) in enumerate(src_counts.items()):
+            icon = source_colors.get(src, "⚪")
+            cols_stat[i].metric(f"{icon} {src}", f"{cnt}件")
+
+        st.divider()
+
+        for item in filtered:
+            icon = source_colors.get(item["source"], "⚪")
+            with st.expander(f"{icon} [{item['source']}] {item['title'][:60]}{'...' if len(item['title'])>60 else ''}"):
+                c1, c2 = st.columns([3, 1])
+                with c1:
+                    st.markdown(f"**{item['title']}**")
+                    if item.get("summary"):
+                        st.caption(item["summary"])
+                with c2:
+                    if item.get("date"):
+                        st.caption(f"📅 {item['date']}")
+                    if item.get("link"):
+                        st.markdown(f"[🔗 記事を開く]({item['link']})")
+
+        if run_ai:
+            st.divider()
+            st.subheader("🤖 AI ニュース分析（センチメント）")
+            with st.spinner("AI分析中..."):
+                ai_result = ai_news_summary(filtered, selected_name, selected_ticker)
+            st.info(ai_result)
+
+
+# ─── Tab7: 市場全体ニュース ──────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────
+st.header("🌐 市場全体ニュース")
+st.divider()
+st.subheader("🌐 市場全体ニュース（日経・Reuters）")
+
+if True:  # 自動実行
+    import concurrent.futures
+
+    with st.spinner("市場ニュースを取得中..."):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+            f_nikkei  = ex.submit(fetch_nikkei_market_rss, 10)
+            f_reuters = ex.submit(fetch_reuters_jp_rss, 10)
+            nikkei_news  = f_nikkei.result()
+            reuters_news = f_reuters.result()
+
+    col_n, col_r = st.columns(2)
+
+    with col_n:
+        st.markdown("### ⬛ 日経新聞 マーケットニュース")
+        if nikkei_news:
+            for item in nikkei_news:
+                st.markdown(f"- [{item['title']}]({item['link']})")
+                if item.get("date"):
+                    st.caption(f"  📅 {item['date']}")
+        else:
+            st.info("取得できませんでした（日経新聞RSSは会員制の場合があります）")
+
+    with col_r:
+        st.markdown("### 🟫 Reuters Japan ビジネスニュース")
+        if reuters_news:
+            for item in reuters_news:
+                st.markdown(f"- [{item['title']}]({item['link']})")
+                if item.get("date"):
+                    st.caption(f"  📅 {item['date']}")
+        else:
+            st.info("取得できませんでした")
+
+    all_market = nikkei_news + reuters_news
+    if all_market and st.checkbox("🤖 市場全体のAI要約を表示", value=True):
+        headlines = "\n".join(f"[{n['source']}] {n['title']}" for n in all_market[:12])
+        prompt = (
+            "以下は本日の日本株マーケット関連ニュースです。\n\n"
+            f"{headlines}\n\n"
+            "投資家向けに300文字以内でまとめてください:\n"
+            "1. 本日の市場全体のセンチメント\n"
+            "2. 注目テーマ・セクター\n"
+            "3. 今後の注意点\n"
+        )
+        with st.spinner("AI要約中..."):
+            try:
+                comment, ai_name = generate_ai_comment(prompt)
+                st.subheader(f"🤖 市場全体AI要約（{ai_name}）")
+                st.info(comment)
+            except Exception as e:
+                st.warning(f"AI APIエラー: {e}")
+
+
+# ================================================================
+# J-Quants APIクライアント（V2対応）
+# ================================================================
+JQUANTS_API_BASE = "https://api.jquants.com/v1"
+_JQ_RESPONSE_KEYS = {
+    "/equities/bars/daily":      "daily_quotes",
+    "/fins/summary":             "statements",
+    "/indices/bars/daily/topix": "topix",
+    "/equities/investor-types":  "investor_type",
+    "/markets/margin-interest":  "margin_interest",
+    "/markets/short-ratio":      "short_ratio",
+}
+
+def _jq_headers():
+    api_key = st.secrets.get("JQUANTS_API_KEY", "")
+    if not api_key:
+        return {}
+    return {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
+def _jq_get(endpoint, params=None, debug=False):
+    headers = _jq_headers()
+    if not headers:
+        return {"error": "NO_API_KEY"}
+    try:
+        res = requests.get(f"{JQUANTS_API_BASE}{endpoint}", params=params or {}, headers=headers, timeout=20)
+        if debug:
+            return {"status": res.status_code, "raw": res.text[:2000], "json": res.json() if res.status_code==200 else {}}
+        if res.status_code != 200:
+            return {"error": res.status_code, "msg": res.text[:300]}
+        d = res.json()
+        known_key = _JQ_RESPONSE_KEYS.get(endpoint)
+        data_key = known_key if (known_key and known_key in d) else next(
+            (k for k in d if k != "pagination_key" and isinstance(d.get(k), list)), None)
+        if not data_key:
+            return d
+        all_data = list(d[data_key])
+        while "pagination_key" in d:
+            p = dict(params or {}); p["pagination_key"] = d["pagination_key"]
+            r2 = requests.get(f"{JQUANTS_API_BASE}{endpoint}", params=p, headers=headers, timeout=20)
+            if r2.status_code != 200: break
+            d = r2.json(); all_data += list(d.get(data_key, []))
+        return {data_key: all_data}
+    except Exception as e:
+        return {"error": str(e)}
+
+def _jq_to_df(d, endpoint):
+    if not d or "error" in d:
+        return pd.DataFrame()
+    known_key = _JQ_RESPONSE_KEYS.get(endpoint)
+    data_key = known_key if (known_key and known_key in d) else next(
+        (k for k in d if isinstance(d.get(k), list)), None)
+    if not data_key or not d[data_key]:
+        return pd.DataFrame()
+    df = pd.DataFrame(d[data_key])
+    date_col = next((c for c in df.columns if c.lower() in ["date","publisheddate","discloseddate"]), None)
+    if date_col and date_col != "Date":
+        df = df.rename(columns={date_col: "Date"})
+    if "Date" in df.columns:
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+        df = df.sort_values("Date")
+    return df
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def jq_fetch_stock_bars(code, date_from, date_to):
+    return _jq_to_df(_jq_get("/equities/bars/daily", {"code": code, "from": date_from, "to": date_to}), "/equities/bars/daily")
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def jq_fetch_topix(date_from, date_to):
+    return _jq_to_df(_jq_get("/indices/bars/daily/topix", {"date_from": date_from, "date_to": date_to}), "/indices/bars/daily/topix")
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def jq_fetch_investor_types(date_from, date_to):
+    return _jq_to_df(_jq_get("/equities/investor-types", {"from": date_from, "to": date_to}), "/equities/investor-types")
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def jq_fetch_margin(code, date_from, date_to):
+    return _jq_to_df(_jq_get("/markets/margin-interest", {"code": code, "from": date_from, "to": date_to}), "/markets/margin-interest")
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def jq_fetch_short_ratio(s33, date_from, date_to):
+    return _jq_to_df(_jq_get("/markets/short-ratio", {"s33": s33, "from": date_from, "to": date_to}), "/markets/short-ratio")
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def jq_fetch_fins(code):
+    return _jq_to_df(_jq_get("/fins/summary", {"code": code}), "/fins/summary")
+
+def _plot_candlestick_jq(df, title):
+    if df.empty:
+        st.warning("データなし"); return
+    open_col  = next((c for c in df.columns if c.lower() in ["open","openingprice"]), None)
+    high_col  = next((c for c in df.columns if c.lower() in ["high","highprice"]), None)
+    low_col   = next((c for c in df.columns if c.lower() in ["low","lowprice"]), None)
+    close_col = next((c for c in df.columns if c.lower() in ["close","closeprice"]), None)
+    if not all([open_col, high_col, low_col, close_col]):
+        st.dataframe(df.tail(20)); return
+    fig, ax = plt.subplots(figsize=(12, 4))
+    for _, row in df.tail(60).iterrows():
+        o, h, l, c = row[open_col], row[high_col], row[low_col], row[close_col]
+        color = "#1a7f37" if c >= o else "#d1242f"
+        ax.plot([row["Date"], row["Date"]], [l, h], color=color, linewidth=0.8)
+        ax.bar(row["Date"], abs(c - o), bottom=min(o, c), color=color, alpha=0.85, width=1.2)
+    ax.set_title(title, fontsize=11); ax.set_ylabel("Price")
+    ax.grid(True, alpha=0.25); plt.xticks(rotation=45); plt.tight_layout()
+    st.pyplot(fig, clear_figure=True)
+
+
+# ─────────────────────────────────────────────────────────────────
+st.header("🏦 J-Quants 需給分析")
+st.divider()
+st.subheader("🏦 J-Quants 需給分析")
+st.caption("J-Quants API V2を使用した日本株の公式データ（JPX提供）")
+
+jq_key = st.secrets.get("JQUANTS_API_KEY", "")
+if not jq_key:
+    st.warning(
+        "⚠️ J-Quants APIキー未設定\n\n"
+        "Streamlit Secrets に `JQUANTS_API_KEY = 'your_key'` を追加してください。\n"
+        "[J-Quants Webサイト](https://jpx-jquants.com/) のダッシュボードからAPIキーを取得できます。"
+    )
+else:
+    col_jq1, col_jq2, col_jq3 = st.columns(3)
+    with col_jq1:
+        jq_code_input = st.text_input("銘柄コード（4桁）", value="72030", key="jq_code")
+        jq_code = jq_code_input.strip()
+    with col_jq2:
+        jq_period = st.selectbox("取得期間", ["3ヶ月","6ヶ月","1年"], index=1, key="jq_period")
+        period_days_jq = {"3ヶ月":90,"6ヶ月":180,"1年":365}[jq_period]
+    with col_jq3:
+        st.markdown("")
+        st.markdown("")
+        run_jq = st.button("▶ J-Quants データ取得", type="primary", key="run_jq")
+
+    if run_jq:
+        end_jq   = datetime.today()
+        jq_date_to   = end_jq.strftime("%Y%m%d")
+        jq_date_from = (end_jq - relativedelta(days=period_days_jq)).strftime("%Y%m%d")
+
+        # 診断モード
+        with st.expander("🔧 API診断（動作しない場合はここを確認）", expanded=False):
+            raw = _jq_get("/fins/summary", {"code": jq_code}, debug=True)
+            st.json(raw)
+
+        jq_t1, jq_t2, jq_t3, jq_t4, jq_t5 = st.tabs([
+            "📈 株価・TOPIX","👥 投資部門別","⚖️ 信用取引残高","📉 空売り比率","📋 財務情報"
+        ])
+
+        with jq_t1:
+            col_p1, col_p2 = st.columns(2)
+            with col_p1:
+                with st.spinner(f"{jq_code} 株価取得中..."):
+                    df_bars = jq_fetch_stock_bars(jq_code, jq_date_from, jq_date_to)
+                if df_bars.empty:
+                    st.warning("株価データ取得失敗（銘柄コードまたはプランを確認）")
+                else:
+                    st.caption(f"{len(df_bars)}日分取得")
+                    _plot_candlestick_jq(df_bars, f"{jq_code} 株価（ローソク足）")
+                    with st.expander("生データ"): st.dataframe(df_bars.tail(20), use_container_width=True)
+            with col_p2:
+                with st.spinner("TOPIX取得中..."):
+                    df_topix = jq_fetch_topix(jq_date_from, jq_date_to)
+                if df_topix.empty:
+                    st.warning("TOPIXデータ取得失敗（Lightプラン以上が必要）")
+                else:
+                    close_col = next((c for c in df_topix.columns if c.lower() in ["close","closeprice"]), None)
+                    if close_col:
+                        fig_t, ax_t = plt.subplots(figsize=(6,4))
+                        ax_t.plot(df_topix["Date"], df_topix[close_col], color="#1565c0", linewidth=1.5)
+                        ax_t.fill_between(df_topix["Date"], df_topix[close_col], df_topix[close_col].min(), alpha=0.1, color="#1565c0")
+                        ax_t.set_title("TOPIX", fontsize=11); ax_t.grid(True, alpha=0.25)
+                        plt.xticks(rotation=45); plt.tight_layout()
+                        st.pyplot(fig_t, clear_figure=True)
+
+        with jq_t2:
+            st.caption("Lightプラン以上が必要 | 週次データ（毎週第4営業日更新）")
+            with st.spinner("投資部門別データ取得中..."):
+                df_inv = jq_fetch_investor_types(jq_date_from, jq_date_to)
+            if df_inv.empty:
+                st.warning("データ取得失敗（Lightプラン以上が必要）")
+            else:
+                section_col = next((c for c in df_inv.columns if "section" in c.lower()), None)
+                buy_col     = next((c for c in df_inv.columns if "buy" in c.lower()), None)
+                sell_col    = next((c for c in df_inv.columns if "sell" in c.lower()), None)
+                if section_col and buy_col and sell_col and "Date" in df_inv.columns:
+                    fig_inv, ax_inv = plt.subplots(figsize=(12,5))
+                    for sec, grp in df_inv.groupby(section_col):
+                        net = grp[buy_col].astype(float) - grp[sell_col].astype(float)
+                        ax_inv.plot(grp["Date"], net, label=str(sec), linewidth=1.5, marker="o", markersize=3)
+                    ax_inv.axhline(0, color="gray", linestyle="--", alpha=0.5)
+                    ax_inv.set_title("Investor Type Net Buy/Sell", fontsize=11)
+                    ax_inv.legend(fontsize=8); ax_inv.grid(True, alpha=0.25)
+                    plt.xticks(rotation=45); plt.tight_layout()
+                    st.pyplot(fig_inv, clear_figure=True)
+                else:
+                    st.dataframe(df_inv, use_container_width=True)
+                with st.expander("生データ"): st.dataframe(df_inv, use_container_width=True)
+
+        with jq_t3:
+            st.caption("Standardプラン以上が必要 | 週次データ")
+            with st.spinner("信用取引残高取得中..."):
+                df_mg = jq_fetch_margin(jq_code, jq_date_from, jq_date_to)
+            if df_mg.empty:
+                st.warning("データ取得失敗")
+            else:
+                buy_bal  = next((c for c in df_mg.columns if "longmargin" in c.lower()), None)
+                sell_bal = next((c for c in df_mg.columns if "shortmargin" in c.lower()), None)
+                if buy_bal and sell_bal and "Date" in df_mg.columns:
+                    fig_mg, ax_mg = plt.subplots(figsize=(12,4))
+                    ax_mg.plot(df_mg["Date"], df_mg[buy_bal].astype(float), label="Long", color="#1a7f37", linewidth=1.8)
+                    ax_mg.plot(df_mg["Date"], df_mg[sell_bal].astype(float), label="Short", color="#d1242f", linewidth=1.8)
+                    ax_mg.set_title(f"{jq_code} Margin Balance", fontsize=11)
+                    ax_mg.legend(); ax_mg.grid(True, alpha=0.25)
+                    plt.xticks(rotation=45); plt.tight_layout()
+                    st.pyplot(fig_mg, clear_figure=True)
+                    ratio = df_mg[buy_bal].astype(float) / (df_mg[sell_bal].astype(float) + 1e-8)
+                    c1, c2 = st.columns(2)
+                    c1.metric("最新 信用倍率", f"{ratio.iloc[-1]:.2f}倍",
+                              delta=f"{ratio.iloc[-1]-ratio.iloc[-2]:+.2f}" if len(ratio)>1 else None)
+                    c2.metric("信用買残", f"{int(df_mg[buy_bal].iloc[-1]):,}株")
+                else:
+                    st.dataframe(df_mg, use_container_width=True)
+                with st.expander("生データ"): st.dataframe(df_mg, use_container_width=True)
+
+        with jq_t4:
+            st.caption("Standardプラン以上が必要 | 33業種コードで取得")
+            S33_OPTIONS = {
+                "3650 電気機器":"3650","3700 輸送用機器":"3700","5250 情報・通信":"5250",
+                "7050 銀行":"7050","3200 化学":"3200","3600 機械":"3600",
+                "6100 小売":"6100","8050 不動産":"8050","9050 サービス":"9050",
+                "0050 水産・農林":"0050","2050 建設":"2050","3050 食料品":"3050",
+                "3450 鉄鋼":"3450","3500 非鉄":"3500","5050 陸運":"5050",
+                "5100 海運":"5100","5150 空運":"5150","7100 証券":"7100",
+                "7150 保険":"7150","8050 不動産":"8050",
+            }
+            selected_s33_label = st.selectbox("業種コード", list(S33_OPTIONS.keys()), key="jq_s33")
+            selected_s33 = S33_OPTIONS[selected_s33_label]
+            with st.spinner("業種別空売り比率取得中..."):
+                df_sr = jq_fetch_short_ratio(selected_s33, jq_date_from, jq_date_to)
+            if df_sr.empty:
+                st.warning("データ取得失敗")
+            else:
+                ratio_col = next((c for c in df_sr.columns if "ratio" in c.lower()), None)
+                if ratio_col and "Date" in df_sr.columns:
+                    fig_sr, ax_sr = plt.subplots(figsize=(12,4))
+                    ax_sr.plot(df_sr["Date"], df_sr[ratio_col].astype(float)*100, color="#7b1fa2", linewidth=1.8)
+                    ax_sr.fill_between(df_sr["Date"], df_sr[ratio_col].astype(float)*100, alpha=0.15, color="#7b1fa2")
+                    ax_sr.set_title(f"Short Ratio - {selected_s33_label} (%)", fontsize=11)
+                    ax_sr.grid(True, alpha=0.25); plt.xticks(rotation=45); plt.tight_layout()
+                    st.pyplot(fig_sr, clear_figure=True)
+                    latest_sr = float(df_sr[ratio_col].iloc[-1])*100
+                    avg_sr    = float(df_sr[ratio_col].mean())*100
+                    c1, c2 = st.columns(2)
+                    c1.metric("最新空売り比率", f"{latest_sr:.1f}%")
+                    c2.metric("期間平均", f"{avg_sr:.1f}%", delta=f"{latest_sr-avg_sr:+.1f}%")
+                else:
+                    st.dataframe(df_sr, use_container_width=True)
+
+        with jq_t5:
+            st.caption("Freeプラン以上で利用可能")
+            with st.spinner("財務情報取得中..."):
+                df_fins = jq_fetch_fins(jq_code)
+            if df_fins.empty:
+                st.warning("財務データ取得失敗")
+            else:
+                st.caption(f"取得件数: {len(df_fins)}件")
+                key_cols = [c for c in df_fins.columns if any(k in c.lower() for k in
+                    ["date","period","sales","profit","income","eps","revenue","operating","net","equity"])]
+                st.dataframe(df_fins[key_cols].tail(8) if key_cols else df_fins.tail(8),
+                             use_container_width=True)
+                if st.checkbox("🤖 AI財務分析", key="jq_ai_fins"):
+                    fins_str = df_fins.tail(4).to_string(index=False)
+                    prompt_fins = (
+                        f"銘柄コード {jq_code} の直近4四半期財務情報:\n\n{fins_str}\n\n"
+                        "投資家向けに300文字以内で:\n1. 売上・利益のトレンド\n2. 財務健全性\n3. 注目点"
+                    )
+                    with st.spinner("AI財務分析中..."):
+                        try:
+                            comment, ai_name = generate_ai_comment(prompt_fins)
+                            st.info(f"🤖 **AI財務分析（{ai_name}）**\n\n{comment}")
+                        except Exception as e:
+                            st.warning(f"AI APIエラー: {e}")
+    else:
+        st.info(
+            "「▶ J-Quants データ取得」ボタンを押すとデータを取得します。\n\n"
+            "- 📈 株価ローソク足チャート・TOPIX（Freeプラン以上）\n"
+            "- 👥 投資部門別売買動向（Lightプラン以上）\n"
+            "- ⚖️ 信用取引残高・信用倍率（Standardプラン以上）\n"
+            "- 📉 業種別空売り比率（Standardプラン以上）\n"
+            "- 📋 財務情報・決算短信 + AI分析（Freeプラン以上）"
+        )
+
+
+# =================================================================
+# Finnhub + Alpha Vantage セクション
+# =================================================================
+
+import time as _time
+
+def _fh_get(endpoint: str, params: dict = {}) -> dict:
+    """Finnhub APIリクエスト"""
+    try:
+        key = st.secrets.get("FINNHUB_API_KEY", "")
+        if not key:
+            return {}
+        r = requests.get(
+            f"https://finnhub.io/api/v1{endpoint}",
+            params={**params, "token": key},
+            timeout=10,
+        )
+        return r.json() if r.status_code == 200 else {}
+    except Exception:
+        return {}
+
+def _av_get(func: str, params: dict = {}) -> dict:
+    """Alpha Vantage APIリクエスト"""
+    try:
+        key = st.secrets.get("ALPHA_VANTAGE_KEY", "")
+        if not key:
+            return {}
+        r = requests.get(
+            "https://www.alphavantage.co/query",
+            params={"function": func, "apikey": key, **params},
+            timeout=15,
+        )
+        return r.json() if r.status_code == 200 else {}
+    except Exception:
+        return {}
+
+
+# ─────────────────────────────────────────────────────────────────
+st.header("📡 Finnhub リアルタイム情報")
+st.caption("Finnhub APIによるリアルタイム株価・決算・インサイダー・ニュース")
+
+fh_key = st.secrets.get("FINNHUB_API_KEY", "")
+if not fh_key:
+    st.warning("⚠️ `FINNHUB_API_KEY` を Streamlit Secrets に追加してください")
+else:
+    fh_t1, fh_t2, fh_t3, fh_t4 = st.tabs([
+        "💹 リアルタイム株価",
+        "📊 決算サプライズ",
+        "🕵️ インサイダー取引",
+        "📰 企業ニュース",
+    ])
+
+    # ── Tab1: リアルタイム株価・為替 ────────────────────────────
+    with fh_t1:
+        st.markdown("#### 💹 リアルタイム株価・為替クォート")
+
+        col_fh1, col_fh2 = st.columns(2)
+        with col_fh1:
+            st.markdown("**米国株 (例: AAPL, TSLA, NVDA)**")
+            us_syms = st.text_input(
+                "ティッカー（カンマ区切り）",
+                value="AAPL,TSLA,NVDA,MSFT,GOOGL",
+                key="fh_us_syms"
+            ).upper().split(",")
+
+            quote_rows = []
+            for sym in [s.strip() for s in us_syms if s.strip()]:
+                q = _fh_get("/quote", {"symbol": sym})
+                if q.get("c"):
+                    chg = q["c"] - q["pc"]
+                    chg_pct = chg / q["pc"] * 100 if q["pc"] else 0
+                    quote_rows.append({
+                        "銘柄": sym,
+                        "現在値": q["c"],
+                        "前日比": round(chg, 2),
+                        "変化率(%)": round(chg_pct, 2),
+                        "高値": q.get("h", "-"),
+                        "安値": q.get("l", "-"),
+                        "始値": q.get("o", "-"),
+                    })
+
+            if quote_rows:
+                df_q = pd.DataFrame(quote_rows)
+                def _color_chg(val):
+                    if isinstance(val, float):
+                        if val > 0: return "color:#1a7f37;font-weight:bold"
+                        if val < 0: return "color:#d1242f;font-weight:bold"
+                    return ""
+                st.dataframe(
+                    df_q.style.map(_color_chg, subset=["前日比","変化率(%)"]),
+                    use_container_width=True, hide_index=True
+                )
+
+        with col_fh2:
+            st.markdown("**為替クォート (Forex)**")
+            fx_pairs = [
+                ("USD","JPY"),("EUR","JPY"),("GBP","JPY"),
+                ("EUR","USD"),("AUD","JPY"),
+            ]
+            fx_rows = []
+            for base, quote in fx_pairs:
+                d = _fh_get("/forex/rates", {"base": base})
+                rates = d.get("quote", {})
+                if quote in rates:
+                    fx_rows.append({
+                        "ペア": f"{base}/{quote}",
+                        "レート": round(float(rates[quote]), 4),
+                    })
+            if fx_rows:
+                st.dataframe(pd.DataFrame(fx_rows), use_container_width=True, hide_index=True)
+
+    # ── Tab2: 決算サプライズ ─────────────────────────────────────
+    with fh_t2:
+        st.markdown("#### 📊 決算サプライズ（EPS予想 vs 実績）")
+        eps_sym = st.text_input("銘柄コード", value="AAPL", key="fh_eps_sym").upper()
+        if eps_sym:
+            data = _fh_get("/stock/earnings", {"symbol": eps_sym, "limit": 8})
+            if data:
+                rows = []
+                for item in (data if isinstance(data, list) else []):
+                    surprise = item.get("surprise", 0) or 0
+                    rows.append({
+                        "決算期": item.get("period", ""),
+                        "EPS予想": item.get("estimate", "-"),
+                        "EPS実績": item.get("actual", "-"),
+                        "サプライズ": round(surprise, 4),
+                        "サプライズ(%)": round(item.get("surprisePercent", 0) or 0, 2),
+                    })
+                if rows:
+                    df_eps = pd.DataFrame(rows)
+                    def _color_sur(val):
+                        if isinstance(val, (int, float)):
+                            if val > 0: return "color:#1a7f37;font-weight:bold"
+                            if val < 0: return "color:#d1242f;font-weight:bold"
+                        return ""
+                    st.dataframe(
+                        df_eps.style.map(_color_sur, subset=["サプライズ","サプライズ(%)"]),
+                        use_container_width=True, hide_index=True
+                    )
+                    # サプライズ推移チャート
+                    if "サプライズ(%)" in df_eps.columns and len(df_eps) > 1:
+                        fig_eps, ax_eps = plt.subplots(figsize=(8, 3))
+                        colors = ["#1a7f37" if v >= 0 else "#d1242f"
+                                  for v in df_eps["サプライズ(%)"][::-1]]
+                        ax_eps.bar(df_eps["決算期"][::-1],
+                                   df_eps["サプライズ(%)"][::-1], color=colors)
+                        ax_eps.axhline(0, color="gray", linewidth=0.8)
+                        ax_eps.set_title(f"{eps_sym} EPS Surprise (%)", fontsize=11)
+                        ax_eps.set_ylabel("Surprise %")
+                        plt.xticks(rotation=45)
+                        plt.tight_layout()
+                        st.pyplot(fig_eps, clear_figure=True)
+                else:
+                    st.info("決算データなし")
+            else:
+                st.warning("データ取得失敗（銘柄コードを確認）")
+
+    # ── Tab3: インサイダー取引 ───────────────────────────────────
+    with fh_t3:
+        st.markdown("#### 🕵️ インサイダー取引情報")
+        ins_sym = st.text_input("銘柄コード", value="AAPL", key="fh_ins_sym").upper()
+        if ins_sym:
+            data = _fh_get("/stock/insider-transactions", {"symbol": ins_sym})
+            txns = data.get("data", [])[:20]
+            if txns:
+                rows = []
+                for t in txns:
+                    rows.append({
+                        "日付": t.get("transactionDate", ""),
+                        "氏名": t.get("name", ""),
+                        "役職": t.get("share", ""),
+                        "取引種別": t.get("transactionCode", ""),
+                        "株数": t.get("share", 0),
+                        "単価": t.get("transactionPrice", "-"),
+                        "売買区分": "買い" if str(t.get("transactionCode","")) in ["P","A"] else "売り",
+                    })
+                df_ins = pd.DataFrame(rows)
+                def _color_trade(val):
+                    if val == "買い": return "color:#1a7f37;font-weight:bold"
+                    if val == "売り": return "color:#d1242f;font-weight:bold"
+                    return ""
+                st.dataframe(
+                    df_ins.style.map(_color_trade, subset=["売買区分"]),
+                    use_container_width=True, hide_index=True
+                )
+            else:
+                st.info("インサイダー取引データなし")
+
+    # ── Tab4: 企業ニュース ───────────────────────────────────────
+    with fh_t4:
+        st.markdown("#### 📰 企業ニュースフィード")
+        news_sym = st.text_input("銘柄コード", value="AAPL", key="fh_news_sym").upper()
+        from datetime import timedelta
+        today_str = datetime.today().strftime("%Y-%m-%d")
+        week_ago  = (datetime.today() - timedelta(days=7)).strftime("%Y-%m-%d")
+
+        if news_sym:
+            items = _fh_get("/company-news", {
+                "symbol": news_sym, "from": week_ago, "to": today_str
+            })
+            if isinstance(items, list) and items:
+                for item in items[:15]:
+                    with st.expander(f"[{item.get('source','')}] {item.get('headline','')[:80]}"):
+                        st.markdown(f"**{item.get('headline','')}**")
+                        st.caption(f"📅 {item.get('datetime','')}")
+                        st.write(item.get("summary","")[:300])
+                        if item.get("url"):
+                            st.markdown(f"[🔗 記事を開く]({item['url']})")
+            else:
+                st.info("ニュースデータなし（直近7日）")
+
+
+# ─────────────────────────────────────────────────────────────────
+st.header("📈 Alpha Vantage テクニカル分析・経済指標")
+st.caption("Alpha Vantage APIによるテクニカル指標・経済指標・セクター分析")
+
+av_key = st.secrets.get("ALPHA_VANTAGE_KEY", "")
+if not av_key:
+    st.warning("⚠️ `ALPHA_VANTAGE_KEY` を Streamlit Secrets に追加してください")
+else:
+    av_t1, av_t2, av_t3 = st.tabs([
+        "📉 テクニカル指標",
+        "🌐 経済指標",
+        "🏭 セクターパフォーマンス",
+    ])
+
+    # ── Tab1: テクニカル指標 ─────────────────────────────────────
+    with av_t1:
+        st.markdown("#### 📉 テクニカル指標（RSI・MACD・ボリンジャーバンド）")
+
+        col_av1, col_av2 = st.columns(2)
+        with col_av1:
+            av_sym = st.text_input("銘柄コード", value="AAPL", key="av_sym").upper()
+        with col_av2:
+            av_interval = st.selectbox("時間足", ["daily","weekly","monthly"], key="av_int")
+
+        if av_sym:
+            st.markdown("---")
+            # RSI
+            with st.spinner("RSI取得中..."):
+                rsi_data = _av_get("RSI", {
+                    "symbol": av_sym, "interval": av_interval,
+                    "time_period": 14, "series_type": "close"
+                })
+            rsi_ts = rsi_data.get("Technical Analysis: RSI", {})
+
+            # MACD
+            with st.spinner("MACD取得中..."):
+                macd_data = _av_get("MACD", {
+                    "symbol": av_sym, "interval": av_interval,
+                    "series_type": "close"
+                })
+            macd_ts = macd_data.get("Technical Analysis: MACD", {})
+
+            # BBANDS
+            with st.spinner("ボリンジャーバンド取得中..."):
+                bb_data = _av_get("BBANDS", {
+                    "symbol": av_sym, "interval": av_interval,
+                    "time_period": 20, "series_type": "close"
+                })
+            bb_ts = bb_data.get("Technical Analysis: BBANDS", {})
+
+            if rsi_ts:
+                dates = sorted(rsi_ts.keys(), reverse=True)[:60]
+                df_rsi = pd.DataFrame({
+                    "Date": pd.to_datetime(dates),
+                    "RSI":  [float(rsi_ts[d]["RSI"]) for d in dates],
+                })
+                fig_rsi, ax_rsi = plt.subplots(figsize=(12, 3))
+                ax_rsi.plot(df_rsi["Date"], df_rsi["RSI"], color="#1565c0", linewidth=1.8)
+                ax_rsi.axhline(70, color="#d1242f", linestyle="--", alpha=0.7, label="過買い(70)")
+                ax_rsi.axhline(30, color="#1a7f37", linestyle="--", alpha=0.7, label="過売り(30)")
+                ax_rsi.fill_between(df_rsi["Date"], 70, df_rsi["RSI"].clip(lower=70),
+                                    alpha=0.15, color="#d1242f")
+                ax_rsi.fill_between(df_rsi["Date"], df_rsi["RSI"].clip(upper=30), 30,
+                                    alpha=0.15, color="#1a7f37")
+                ax_rsi.set_title(f"{av_sym} RSI(14) - {av_interval}", fontsize=11)
+                ax_rsi.set_ylim(0, 100)
+                ax_rsi.legend(fontsize=8)
+                ax_rsi.grid(True, alpha=0.25)
+                plt.xticks(rotation=45); plt.tight_layout()
+                st.pyplot(fig_rsi, clear_figure=True)
+
+                latest_rsi = float(rsi_ts[dates[0]]["RSI"])
+                if latest_rsi >= 70:
+                    st.warning(f"⚠️ RSI {latest_rsi:.1f} — 過買い圏（売り圧力に注意）")
+                elif latest_rsi <= 30:
+                    st.success(f"✅ RSI {latest_rsi:.1f} — 過売り圏（反発候補）")
+                else:
+                    st.info(f"📊 RSI {latest_rsi:.1f} — 中立圏")
+
+            if macd_ts:
+                dates_m = sorted(macd_ts.keys(), reverse=True)[:60]
+                df_macd = pd.DataFrame({
+                    "Date":     pd.to_datetime(dates_m),
+                    "MACD":     [float(macd_ts[d]["MACD"]) for d in dates_m],
+                    "Signal":   [float(macd_ts[d]["MACD_Signal"]) for d in dates_m],
+                    "Hist":     [float(macd_ts[d]["MACD_Hist"]) for d in dates_m],
+                })
+                fig_macd, (ax_m1, ax_m2) = plt.subplots(2, 1, figsize=(12, 5),
+                                                          gridspec_kw={"height_ratios": [2,1]})
+                ax_m1.plot(df_macd["Date"], df_macd["MACD"],
+                           color="#1565c0", linewidth=1.5, label="MACD")
+                ax_m1.plot(df_macd["Date"], df_macd["Signal"],
+                           color="#e91e63", linewidth=1.5, linestyle="--", label="Signal")
+                ax_m1.axhline(0, color="gray", linewidth=0.6)
+                ax_m1.legend(fontsize=8); ax_m1.grid(True, alpha=0.25)
+                ax_m1.set_title(f"{av_sym} MACD - {av_interval}", fontsize=11)
+                colors_hist = ["#1a7f37" if v >= 0 else "#d1242f" for v in df_macd["Hist"]]
+                ax_m2.bar(df_macd["Date"], df_macd["Hist"], color=colors_hist, alpha=0.8, width=2)
+                ax_m2.axhline(0, color="gray", linewidth=0.6)
+                ax_m2.set_ylabel("Histogram"); ax_m2.grid(True, alpha=0.25)
+                plt.xticks(rotation=45); plt.tight_layout()
+                st.pyplot(fig_macd, clear_figure=True)
+
+            if bb_ts:
+                dates_b = sorted(bb_ts.keys(), reverse=True)[:60]
+                df_bb = pd.DataFrame({
+                    "Date":  pd.to_datetime(dates_b),
+                    "Upper": [float(bb_ts[d]["Real Upper Band"]) for d in dates_b],
+                    "Mid":   [float(bb_ts[d]["Real Middle Band"]) for d in dates_b],
+                    "Lower": [float(bb_ts[d]["Real Lower Band"]) for d in dates_b],
+                })
+                fig_bb, ax_bb = plt.subplots(figsize=(12, 4))
+                ax_bb.plot(df_bb["Date"], df_bb["Upper"],
+                           color="#d1242f", linewidth=1.2, linestyle="--", label="Upper")
+                ax_bb.plot(df_bb["Date"], df_bb["Mid"],
+                           color="#1565c0", linewidth=1.5, label="Middle(SMA20)")
+                ax_bb.plot(df_bb["Date"], df_bb["Lower"],
+                           color="#1a7f37", linewidth=1.2, linestyle="--", label="Lower")
+                ax_bb.fill_between(df_bb["Date"], df_bb["Upper"], df_bb["Lower"],
+                                   alpha=0.07, color="#1565c0")
+                ax_bb.legend(fontsize=8); ax_bb.grid(True, alpha=0.25)
+                ax_bb.set_title(f"{av_sym} Bollinger Bands(20) - {av_interval}", fontsize=11)
+                plt.xticks(rotation=45); plt.tight_layout()
+                st.pyplot(fig_bb, clear_figure=True)
+
+            if not any([rsi_ts, macd_ts, bb_ts]):
+                st.warning("データ取得失敗（無料枠は1分5回制限。少し待ってから再試行してください）")
+
+    # ── Tab2: 経済指標 ───────────────────────────────────────────
+    with av_t2:
+        st.markdown("#### 🌐 主要経済指標")
+
+        INDICATORS = {
+            "実質GDP成長率(米)":        ("REAL_GDP",            "annualReports"),
+            "CPI（インフレ率）":         ("CPI",                 "data"),
+            "失業率":                    ("UNEMPLOYMENT",        "data"),
+            "FF金利（政策金利）":        ("FEDERAL_FUNDS_RATE",  "data"),
+            "米国小売売上高":            ("RETAIL_SALES",        "data"),
+            "消費者信頼感指数":          ("CONSUMER_CONFIDENCE", "data"),
+        }
+
+        ind_choice = st.selectbox("指標を選択", list(INDICATORS.keys()), key="av_ind")
+        func, key_path = INDICATORS[ind_choice]
+
+        with st.spinner(f"{ind_choice} 取得中..."):
+            ind_data = _av_get(func, {"interval": "monthly" if func not in ["REAL_GDP"] else "annual"})
+
+        series = ind_data.get(key_path, ind_data.get("data", []))
+        if series:
+            rows = []
+            for item in (series[:36] if isinstance(series, list) else []):
+                rows.append({
+                    "日付": item.get("date", item.get("fiscalDateEnding", "")),
+                    "値":   item.get("value", item.get("reportedEPS", "")),
+                })
+            if rows:
+                df_ind = pd.DataFrame(rows)
+                df_ind["日付"] = pd.to_datetime(df_ind["日付"], errors="coerce")
+                df_ind["値"]   = pd.to_numeric(df_ind["値"], errors="coerce")
+                df_ind = df_ind.dropna().sort_values("日付")
+
+                fig_ind, ax_ind = plt.subplots(figsize=(12, 4))
+                ax_ind.plot(df_ind["日付"], df_ind["値"],
+                            color="#1565c0", linewidth=2, marker="o", markersize=3)
+                ax_ind.fill_between(df_ind["日付"], df_ind["値"],
+                                    df_ind["値"].min(), alpha=0.1, color="#1565c0")
+                ax_ind.set_title(ind_choice, fontsize=12)
+                ax_ind.grid(True, alpha=0.25)
+                plt.xticks(rotation=45); plt.tight_layout()
+                st.pyplot(fig_ind, clear_figure=True)
+
+                latest_val = df_ind["値"].iloc[-1]
+                prev_val   = df_ind["値"].iloc[-2] if len(df_ind) >= 2 else None
+                col_i1, col_i2 = st.columns(2)
+                col_i1.metric(
+                    f"最新値（{df_ind['日付'].iloc[-1].strftime('%Y-%m')}）",
+                    f"{latest_val:.2f}",
+                    delta=f"{latest_val - prev_val:.2f}" if prev_val else None
+                )
+                col_i2.metric("直近12ヶ月平均", f"{df_ind['値'].tail(12).mean():.2f}")
+
+                with st.expander("データ一覧"):
+                    st.dataframe(df_ind.sort_values("日付", ascending=False),
+                                 use_container_width=True, hide_index=True)
+        else:
+            st.warning("データ取得失敗（無料枠は1分5回・1日25回制限）")
+
+    # ── Tab3: セクターパフォーマンス ─────────────────────────────
+    with av_t3:
+        st.markdown("#### 🏭 米国セクター別パフォーマンス")
+        st.caption("S&P500の11セクター別リターン（Alpha Vantage提供）")
+
+        with st.spinner("セクターデータ取得中..."):
+            sec_data = _av_get("SECTOR")
+
+        if sec_data:
+            periods = {
+                "1日": "Rank A: Real-Time Performance",
+                "1週": "Rank B: 1 Day Performance",
+                "1ヶ月": "Rank C: 5 Day Performance",
+                "3ヶ月": "Rank D: 1 Month Performance",
+                "1年": "Rank E: 3 Month Performance",
+                "3年": "Rank F: Year-to-Date (YTD) Performance",
+            }
+            period_sel = st.selectbox("期間", list(periods.keys()), index=1, key="av_sec_period")
+            pkey = periods[period_sel]
+
+            sec_perf = sec_data.get(pkey, {})
+            if sec_perf:
+                rows = [{"セクター": k, "リターン(%)": float(v.strip("%"))}
+                        for k, v in sec_perf.items() if v and v != "None"]
+                if rows:
+                    df_sec = pd.DataFrame(rows).sort_values("リターン(%)", ascending=True)
+                    colors = ["#d1242f" if v < 0 else "#1a7f37" for v in df_sec["リターン(%)"]]
+                    fig_sec, ax_sec = plt.subplots(figsize=(10, 6))
+                    bars = ax_sec.barh(df_sec["セクター"], df_sec["リターン(%)"],
+                                       color=colors, alpha=0.85)
+                    for bar, val in zip(bars, df_sec["リターン(%)"]):
+                        xpos = bar.get_width() + (0.05 if val >= 0 else -0.05)
+                        ha = "left" if val >= 0 else "right"
+                        ax_sec.text(xpos, bar.get_y() + bar.get_height()/2,
+                                    f"{val:+.2f}%", va="center", ha=ha, fontsize=9)
+                    ax_sec.axvline(0, color="black", linewidth=0.8)
+                    ax_sec.set_title(f"US Sector Performance ({period_sel})", fontsize=12)
+                    ax_sec.set_xlabel("Return (%)")
+                    ax_sec.grid(True, axis="x", alpha=0.25)
+                    plt.tight_layout()
+                    st.pyplot(fig_sec, clear_figure=True)
+
+                    # ベスト/ワースト
+                    best   = df_sec.iloc[-1]
+                    worst  = df_sec.iloc[0]
+                    c1, c2 = st.columns(2)
+                    c1.metric("🥇 最強セクター", best["セクター"],  f"{best['リターン(%)']:+.2f}%")
+                    c2.metric("🥈 最弱セクター", worst["セクター"], f"{worst['リターン(%)']:+.2f}%")
+            else:
+                st.warning("セクターデータが取得できませんでした")
+        else:
+            st.warning("データ取得失敗（無料枠: 1分5回・1日25回制限）")
+
+
+
+# =================================================================
+# 🔮 来期想定利益からのおすすめ銘柄スクリーニング
+# =================================================================
+
+# ─────────────────────────────────────────────────────────────────
+st.header("🔮 来期想定利益スクリーニング")
+st.caption(
+    "yfinance（forward PER・EPS予想）× J-Quants（決算短信）を組み合わせて、"
+    "**来期の利益成長が期待できる割安成長株**を抽出します。"
+)
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_forward_metrics(ticker: str) -> dict:
+    """yfinanceからforward指標を取得"""
+    try:
+        t = yf.Ticker(ticker)
+        info = t.info
+        return {
+            "ticker":            ticker,
+            "trailing_per":      info.get("trailingPE"),
+            "forward_per":       info.get("forwardPE"),
+            "trailing_eps":      info.get("trailingEps"),
+            "forward_eps":       info.get("forwardEps"),
+            "peg_ratio":         info.get("pegRatio"),
+            "revenue_growth":    info.get("revenueGrowth"),      # 売上成長率
+            "earnings_growth":   info.get("earningsGrowth"),     # 利益成長率
+            "operating_margins": info.get("operatingMargins"),   # 営業利益率
+            "profit_margins":    info.get("profitMargins"),      # 純利益率
+            "market_cap":        info.get("marketCap"),
+            "price":             info.get("currentPrice") or info.get("regularMarketPrice"),
+            "52w_high":          info.get("fiftyTwoWeekHigh"),
+            "52w_low":           info.get("fiftyTwoWeekLow"),
+        }
+    except Exception:
+        return {"ticker": ticker}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_jq_fins_summary(code: str) -> dict:
+    """J-Quantsから最新の決算短信データを取得"""
+    df = jq_fetch_fins(code)
+    if df.empty:
+        return {}
+    try:
+        latest = df.iloc[-1].to_dict()
+        prev   = df.iloc[-2].to_dict() if len(df) >= 2 else {}
+        return {"latest": latest, "prev": prev, "count": len(df)}
+    except Exception:
+        return {}
+
+
+def _safe_float(val):
+    try:
+        v = float(val)
+        return v if not (v != v) else None  # NaN check
+    except Exception:
+        return None
+
+
+def _build_forward_df(df_bulk: pd.DataFrame) -> pd.DataFrame:
+    """fetch_all_ticker_info_bulk の結果から来期スクリーニング用DataFrameを構築"""
+    rows = []
+    for _, row in df_bulk.iterrows():
+        trailing_per = _safe_float(row.get("PER"))
+        forward_per  = _safe_float(row.get("予想PER_raw"))
+        trailing_eps = _safe_float(row.get("実績EPS_raw"))
+        forward_eps  = _safe_float(row.get("予想EPS_raw"))
+        peg          = _safe_float(row.get("PEGレシオ_raw"))
+        rev_growth   = _safe_float(row.get("売上成長率_raw"))
+        earn_growth  = _safe_float(row.get("利益成長率_raw"))
+        op_margin    = _safe_float(row.get("営業利益率_raw"))
+        price        = _safe_float(row.get("現在株価_raw"))
+
+        if trailing_eps and forward_eps and trailing_eps != 0:
+            eps_growth = (forward_eps - trailing_eps) / abs(trailing_eps) * 100
+        elif earn_growth is not None:
+            eps_growth = earn_growth * 100
+        else:
+            eps_growth = None
+
+        if peg is None and forward_per and eps_growth and eps_growth > 0:
+            peg = forward_per / eps_growth
+
+        rows.append({
+            "企業名":        row.get("企業名"),
+            "業種":          row.get("業種"),
+            "ティッカー":    row.get("ティッカー"),
+            "現在株価":      round(price, 1) if price else None,
+            "実績PER":       round(trailing_per, 1) if trailing_per else None,
+            "予想PER":       round(forward_per, 1) if forward_per else None,
+            "実績EPS":       round(trailing_eps, 2) if trailing_eps else None,
+            "予想EPS":       round(forward_eps, 2) if forward_eps else None,
+            "EPS成長率(%)":  round(eps_growth, 1) if eps_growth is not None else None,
+            "売上成長率(%)": round(rev_growth * 100, 1) if rev_growth is not None else None,
+            "営業利益率(%)": round(op_margin * 100, 1) if op_margin is not None else None,
+            "PEGレシオ":     round(peg, 2) if peg is not None else None,
+        })
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_all_ticker_info_bulk(ticker_map_items: tuple) -> pd.DataFrame:
+    """全銘柄のyfinance情報を並列一括取得（factor・forward metrics統合版）。
+    yf.Ticker().info の呼び出しを225回 → 1セットの並列処理に集約する。"""
+    import concurrent.futures as _cfe
+
+    def _get_one(item):
+        ticker, (name, sector) = item
+        try:
+            info = yf.Ticker(ticker).info
+            return {
+                "企業名": name, "業種": sector, "ティッカー": ticker,
+                "時価総額":       info.get("marketCap"),
+                "PBR":            info.get("priceToBook"),
+                "PER":            info.get("trailingPE"),
+                "PSR":            info.get("priceToSalesTrailing12Months"),
+                "配当利回り(%)":  round((info.get("dividendYield") or 0) * 100, 2),
+                "ROE(%)":         round((info.get("returnOnEquity") or 0) * 100, 2),
+                "予想PER_raw":    info.get("forwardPE"),
+                "実績EPS_raw":    info.get("trailingEps"),
+                "予想EPS_raw":    info.get("forwardEps"),
+                "PEGレシオ_raw":  info.get("pegRatio"),
+                "売上成長率_raw": info.get("revenueGrowth"),
+                "利益成長率_raw": info.get("earningsGrowth"),
+                "営業利益率_raw": info.get("operatingMargins"),
+                "現在株価_raw":   info.get("currentPrice") or info.get("regularMarketPrice"),
+                "totalDebt_raw":    info.get("totalDebt"),
+                "totalCash_raw":    info.get("totalCash"),
+                "totalRevenue_raw": info.get("totalRevenue"),
+            }
+        except Exception:
+            return {"企業名": name, "業種": sector, "ティッカー": ticker}
+
+    with _cfe.ThreadPoolExecutor(max_workers=12) as ex:
+        results = list(ex.map(_get_one, ticker_map_items))
+    return pd.DataFrame(results)
+
+
+# ── サイドバー設定 ──────────────────────────────────────────────
+with st.sidebar:
+    st.divider()
+    st.markdown("### 🔮 来期スクリーニング設定")
+    fwd_per_max    = st.slider("最大 Forward PER", 5, 60, 30, key="fwd_per_max")
+    fwd_eps_growth = st.slider("最小 EPS成長率(%)", -50, 100, 10, key="fwd_eps_growth")
+    fwd_peg_max    = st.slider("最大 PEGレシオ", 0.1, 5.0, 2.0, 0.1, key="fwd_peg_max")
+    fwd_op_margin  = st.slider("最小 営業利益率(%)", 0, 40, 5, key="fwd_op_margin")
+    fwd_top_n      = st.slider("表示銘柄数", 10, 50, 20, key="fwd_top_n")
+
+st.info(
+    f"📋 スクリーニング条件: "
+    f"Forward PER ≤ {fwd_per_max} | "
+    f"EPS成長率 ≥ {fwd_eps_growth}% | "
+    f"PEGレシオ ≤ {fwd_peg_max} | "
+    f"営業利益率 ≥ {fwd_op_margin}%"
+)
+
+# ── データ取得（fetch_all_ticker_info_bulk のキャッシュを流用）──
+with st.spinner("来期指標を集計中（並列取得済みデータを使用）..."):
+    _df_bulk_fwd = fetch_all_ticker_info_bulk(tuple(ticker_name_map.items()))
+    df_fwd = _build_forward_df(_df_bulk_fwd)
+
+if df_fwd.empty:
+    st.error("データを取得できませんでした")
+else:
+    # ── スクリーニング ────────────────────────────────────────────
+    df_screen_fwd = df_fwd.copy()
+    if "予想PER" in df_screen_fwd.columns:
+        df_screen_fwd = df_screen_fwd[
+            df_screen_fwd["予想PER"].notna() &
+            (df_screen_fwd["予想PER"] > 0) &
+            (df_screen_fwd["予想PER"] <= fwd_per_max)
+        ]
+    if "EPS成長率(%)" in df_screen_fwd.columns:
+        df_screen_fwd = df_screen_fwd[
+            df_screen_fwd["EPS成長率(%)"].notna() &
+            (df_screen_fwd["EPS成長率(%)"] >= fwd_eps_growth)
+        ]
+    if "PEGレシオ" in df_screen_fwd.columns:
+        df_screen_fwd = df_screen_fwd[
+            df_screen_fwd["PEGレシオ"].notna() &
+            (df_screen_fwd["PEGレシオ"] <= fwd_peg_max) &
+            (df_screen_fwd["PEGレシオ"] > 0)
+        ]
+    if "営業利益率(%)" in df_screen_fwd.columns:
+        df_screen_fwd = df_screen_fwd[
+            df_screen_fwd["営業利益率(%)"].notna() &
+            (df_screen_fwd["営業利益率(%)"] >= fwd_op_margin)
+        ]
+
+    # PEGレシオでソート（低いほど割安成長）
+    df_screen_fwd = df_screen_fwd.sort_values("PEGレシオ", ascending=True).reset_index(drop=True)
+
+    # ── サマリーメトリクス ────────────────────────────────────────
+    sm1, sm2, sm3, sm4 = st.columns(4)
+    sm1.metric("スクリーニング通過", f"{len(df_screen_fwd)}銘柄",
+               f"全{len(df_fwd[df_fwd['予想PER'].notna()])}銘柄中")
+    if not df_screen_fwd.empty:
+        sm2.metric("平均 予想PER",
+                   f"{df_screen_fwd['予想PER'].mean():.1f}倍")
+        sm3.metric("平均 EPS成長率",
+                   f"{df_screen_fwd['EPS成長率(%)'].mean():.1f}%")
+        sm4.metric("最小 PEGレシオ（割安）",
+                   f"{df_screen_fwd['PEGレシオ'].min():.2f}",
+                   df_screen_fwd.iloc[0]["企業名"])
+
+    st.divider()
+
+    fwd_t1, fwd_t2, fwd_t3, fwd_t4 = st.tabs([
+        "💎 割安成長株ランキング（PEG）",
+        "📊 PER比較・EPS成長",
+        "📈 チャート分析",
+        "🤖 AI銘柄コメント",
+    ])
+
+    # ── Tab1: PEGランキング ──────────────────────────────────────
+    with fwd_t1:
+        st.markdown("#### 💎 PEGレシオ順 割安成長株ランキング")
+        st.caption(
+            "PEGレシオ = 予想PER ÷ EPS成長率。**1以下が割安成長株の目安**。"
+            "低いほど「成長に対して株価が安い」銘柄。"
+        )
+
+        if df_screen_fwd.empty:
+            st.warning("条件を満たす銘柄がありません。サイドバーの条件を緩めてください。")
+        else:
+            disp_cols = ["企業名", "業種", "PEGレシオ", "予想PER", "実績PER",
+                         "EPS成長率(%)", "売上成長率(%)", "営業利益率(%)", "現在株価"]
+
+            def _color_peg(val):
+                if isinstance(val, float):
+                    if val < 1.0:   return "color:#1a7f37;font-weight:bold;font-size:14px"
+                    elif val < 1.5: return "color:#1a7f37;font-weight:bold"
+                    elif val < 2.0: return "color:#f57c00"
+                    else:           return "color:#d1242f"
+                return ""
+
+            def _color_growth(val):
+                if isinstance(val, float):
+                    if val >= 30:   return "color:#1a7f37;font-weight:bold"
+                    elif val >= 10: return "color:#388e3c"
+                    elif val < 0:   return "color:#d1242f"
+                return ""
+
+            st.dataframe(
+                df_screen_fwd[disp_cols].head(fwd_top_n)
+                .style.format({
+                    "PEGレシオ":     "{:.2f}",
+                    "予想PER":       "{:.1f}倍",
+                    "実績PER":       "{:.1f}倍",
+                    "EPS成長率(%)":  "{:+.1f}%",
+                    "売上成長率(%)": "{:+.1f}%",
+                    "営業利益率(%)": "{:.1f}%",
+                    "現在株価":      "{:,.0f}円",
+                }, na_rep="N/A")
+                .map(_color_peg,    subset=["PEGレシオ"])
+                .map(_color_growth, subset=["EPS成長率(%)"]),
+                use_container_width=True, hide_index=True
+            )
+
+            # CSV DL
+            csv_fwd = df_screen_fwd[disp_cols].to_csv(index=False, encoding="utf-8-sig")
+            st.download_button(
+                "⬇️ スクリーニング結果CSV",
+                data=csv_fwd,
+                file_name=f"fwd_screen_{datetime.today().strftime('%Y%m%d')}.csv",
+                mime="text/csv", key="fwd_dl"
+            )
+
+    # ── Tab2: PER比較・EPS成長 ───────────────────────────────────
+    with fwd_t2:
+        st.markdown("#### 📊 実績PER vs 予想PER 比較 + EPS成長率")
+
+        if df_screen_fwd.empty:
+            st.warning("条件を満たす銘柄がありません")
+        else:
+            top20 = df_screen_fwd.head(20)
+
+            fig_per, axes_per = plt.subplots(1, 2, figsize=(16, 6))
+
+            # PER比較バー
+            ax_per = axes_per[0]
+            x_pos = np.arange(len(top20))
+            w = 0.35
+            ax_per.bar(x_pos - w/2, top20["実績PER"].fillna(0),
+                       width=w, label="実績PER", color="#90caf9", alpha=0.85)
+            ax_per.bar(x_pos + w/2, top20["予想PER"].fillna(0),
+                       width=w, label="予想PER", color="#1565c0", alpha=0.85)
+            ax_per.set_xticks(x_pos)
+            ax_per.set_xticklabels(top20["企業名"], rotation=45,
+                                   ha="right", fontsize=9)
+            ax_per.set_ylabel("PER（倍）")
+            ax_per.set_title("実績PER vs 予想PER（上位20銘柄）",
+                              fontsize=12, fontweight="bold")
+            ax_per.legend(fontsize=10)
+            ax_per.grid(True, axis="y", alpha=0.3)
+            ax_per.axhline(fwd_per_max, color="red", linestyle="--",
+                           alpha=0.5, label=f"PER上限({fwd_per_max})")
+
+            # EPS成長率バー
+            ax_eps = axes_per[1]
+            colors_eps = ["#1a7f37" if v >= 0 else "#d1242f"
+                          for v in top20["EPS成長率(%)"].fillna(0)]
+            ax_eps.bar(top20["企業名"], top20["EPS成長率(%)"].fillna(0),
+                       color=colors_eps, alpha=0.85)
+            ax_eps.axhline(0, color="black", linewidth=0.8)
+            ax_eps.axhline(fwd_eps_growth, color="orange", linestyle="--",
+                           alpha=0.6, label=f"最低成長率({fwd_eps_growth}%)")
+            ax_eps.set_xticklabels(top20["企業名"], rotation=45,
+                                   ha="right", fontsize=9)
+            ax_eps.set_ylabel("EPS成長率 (%)")
+            ax_eps.set_title("EPS成長率（予想 vs 実績）",
+                              fontsize=12, fontweight="bold")
+            ax_eps.legend(fontsize=9)
+            ax_eps.grid(True, axis="y", alpha=0.3)
+
+            plt.tight_layout()
+            st.pyplot(fig_per, clear_figure=True)
+
+            # 営業利益率ランキング
+            st.markdown("#### 🏭 営業利益率ランキング（スクリーニング通過銘柄）")
+            df_margin = df_screen_fwd.dropna(subset=["営業利益率(%)"])\
+                                     .sort_values("営業利益率(%)", ascending=False)\
+                                     .head(20)
+            fig_mg, ax_mg = plt.subplots(figsize=(12, 5))
+            colors_mg = ["#1565c0" if v >= 15 else "#42a5f5"
+                         for v in df_margin["営業利益率(%)"]]
+            ax_mg.barh(df_margin["企業名"][::-1],
+                       df_margin["営業利益率(%)"][::-1],
+                       color=colors_mg[::-1], alpha=0.85)
+            ax_mg.axvline(fwd_op_margin, color="red", linestyle="--",
+                          alpha=0.5, label=f"最低利益率({fwd_op_margin}%)")
+            ax_mg.axvline(15, color="green", linestyle=":",
+                          alpha=0.5, label="優良水準(15%)")
+            ax_mg.set_xlabel("営業利益率 (%)")
+            ax_mg.set_title("営業利益率ランキング", fontsize=12, fontweight="bold")
+            ax_mg.legend(fontsize=9)
+            ax_mg.grid(True, axis="x", alpha=0.3)
+            plt.tight_layout()
+            st.pyplot(fig_mg, clear_figure=True)
+
+    # ── Tab3: チャート分析 ───────────────────────────────────────
+    with fwd_t3:
+        st.markdown("#### 📈 PEGレシオ vs EPS成長率 散布図")
+        st.caption("右上ほど高成長・左下ほど割安。バブルサイズ = 営業利益率")
+
+        if df_screen_fwd.empty:
+            st.warning("条件を満たす銘柄がありません")
+        else:
+            df_plot = df_screen_fwd.dropna(
+                subset=["PEGレシオ", "EPS成長率(%)", "予想PER"]
+            ).head(40)
+
+            if not df_plot.empty:
+                fig_sc2, ax_sc2 = plt.subplots(figsize=(14, 8))
+                sectors_p = df_plot["業種"].unique()
+                cmap_p = plt.cm.get_cmap("tab20", len(sectors_p))
+                sec_c_p = {s: cmap_p(i) for i, s in enumerate(sectors_p)}
+
+                for sec in sectors_p:
+                    sub = df_plot[df_plot["業種"] == sec]
+                    size = (sub["営業利益率(%)"].fillna(5).clip(lower=1) * 15)
+                    ax_sc2.scatter(
+                        sub["EPS成長率(%)"],
+                        sub["予想PER"],
+                        s=size,
+                        color=sec_c_p[sec],
+                        label=sec, alpha=0.8,
+                        edgecolors="gray", linewidth=0.5, zorder=3
+                    )
+                    for _, row in sub.iterrows():
+                        ax_sc2.annotate(
+                            row["企業名"],
+                            (row["EPS成長率(%)"], row["予想PER"]),
+                            fontsize=7, alpha=0.9,
+                            xytext=(4, 4), textcoords="offset points"
+                        )
+
+                # PEG=1の等高線
+                x_range = np.linspace(
+                    df_plot["EPS成長率(%)"].min(),
+                    df_plot["EPS成長率(%)"].max(), 100
+                )
+                ax_sc2.plot(x_range, x_range * 1.0, "g--",
+                            alpha=0.5, linewidth=1.5, label="PEG=1（割安ライン）")
+                ax_sc2.plot(x_range, x_range * 2.0, "r--",
+                            alpha=0.5, linewidth=1.5, label="PEG=2（割高ライン）")
+
+                ax_sc2.set_xlabel("EPS成長率 (%)", fontsize=12)
+                ax_sc2.set_ylabel("予想PER（倍）", fontsize=12)
+                ax_sc2.set_title(
+                    "EPS成長率 vs 予想PER マップ\n"
+                    "（バブルサイズ=営業利益率 / 緑点線=PEG1 / 赤点線=PEG2）",
+                    fontsize=12, fontweight="bold"
+                )
+                ax_sc2.legend(bbox_to_anchor=(1.01, 1), loc="upper left",
+                              fontsize=8, framealpha=0.9)
+                ax_sc2.grid(True, alpha=0.2)
+                ax_sc2.spines["top"].set_visible(False)
+                ax_sc2.spines["right"].set_visible(False)
+                plt.tight_layout()
+                st.pyplot(fig_sc2, clear_figure=True)
+
+    # ── Tab4: AI銘柄コメント ─────────────────────────────────────
+    with fwd_t4:
+        st.markdown("#### 🤖 AI来期おすすめ銘柄コメント")
+        st.caption("スクリーニング通過上位銘柄をAIが総合評価します")
+
+        if df_screen_fwd.empty:
+            st.warning("条件を満たす銘柄がありません")
+        else:
+            top_ai = df_screen_fwd.head(10)
+            summary_str = top_ai[[
+                "企業名", "業種", "PEGレシオ", "予想PER",
+                "EPS成長率(%)", "売上成長率(%)", "営業利益率(%)"
+            ]].to_string(index=False)
+
+            prompt_fwd = f"""
+以下は日本株の来期想定利益スクリーニング結果（上位10銘柄）です。
+
+{summary_str}
+
+スクリーニング条件:
+- 予想PER ≤ {fwd_per_max}倍
+- EPS成長率 ≥ {fwd_eps_growth}%
+- PEGレシオ ≤ {fwd_peg_max}
+- 営業利益率 ≥ {fwd_op_margin}%
+
+投資家向けに以下の観点で分析してください（600文字以内）:
+1. 🏆 特に注目すべき銘柄とその理由（PEG・成長率・利益率の観点）
+2. 📊 業種・セクターの傾向（どの業種に割安成長株が集まっているか）
+3. ⚠️ 注意点・リスク（PERや成長率の信頼性など）
+4. 💡 総合的な投資戦略（時期・分散など）
+
+※ 投資判断は自己責任である旨を最後に一言付記してください。
+"""
+            with st.spinner("AI分析中..."):
+                try:
+                    ai_comment, ai_name = generate_ai_comment(prompt_fwd)
+                    st.info(f"🤖 **AI来期銘柄分析（{ai_name}）**\n\n{ai_comment}")
+                except Exception as e:
+                    st.warning(f"AI APIエラー: {e}")
+
+            # 個別銘柄の簡易コメント
+            st.markdown("---")
+            st.markdown("#### 📋 上位銘柄サマリー")
+            for _, row in top_ai.head(5).iterrows():
+                peg_val  = row.get("PEGレシオ", None)
+                per_val  = row.get("予想PER", None)
+                eps_val  = row.get("EPS成長率(%)", None)
+                op_val   = row.get("営業利益率(%)", None)
+
+                peg_str  = f"{peg_val:.2f}" if peg_val else "N/A"
+                per_str  = f"{per_val:.1f}倍" if per_val else "N/A"
+                eps_str  = f"{eps_val:+.1f}%" if eps_val else "N/A"
+                op_str   = f"{op_val:.1f}%" if op_val else "N/A"
+
+                # PEG評価
+                if peg_val and peg_val < 1.0:
+                    eval_icon = "💎 極めて割安"
+                    eval_color = "#1a7f37"
+                elif peg_val and peg_val < 1.5:
+                    eval_icon = "✅ 割安成長"
+                    eval_color = "#388e3c"
+                else:
+                    eval_icon = "📊 適正水準"
+                    eval_color = "#1565c0"
+
+                st.markdown(
+                    f'<div style="background:#f8f9fa;border-left:4px solid {eval_color};'
+                    f'border-radius:6px;padding:12px 16px;margin:8px 0;">'
+                    f'<b style="font-size:15px;color:{eval_color};">'
+                    f'{eval_icon} {row["企業名"]}（{row["業種"]}）</b><br>'
+                    f'<span style="font-size:13px;color:#555;">'
+                    f'PEGレシオ: <b>{peg_str}</b> | '
+                    f'予想PER: <b>{per_str}</b> | '
+                    f'EPS成長率: <b>{eps_str}</b> | '
+                    f'営業利益率: <b>{op_str}</b>'
+                    f'</span></div>',
+                    unsafe_allow_html=True
+                )
+
+
+# =================================================================
+# 📏 サイズファクター分析  /  💰 バリューファクター分析
+# =================================================================
+
+from datetime import timedelta as _fac_td
+
+
+def _size_label(mc):
+    if mc is None or (isinstance(mc, float) and mc != mc):
+        return "不明"
+    if mc >= 1_000_000_000_000:
+        return "大型株(>1兆)"
+    elif mc >= 100_000_000_000:
+        return "中型株(1000億-1兆)"
+    return "小型株(<1000億)"
+
+
+def _value_label(pbr):
+    if pbr is None or (isinstance(pbr, float) and pbr != pbr):
+        return "不明"
+    if pbr < 1.0:   return "割安(PBR<1)"
+    if pbr < 2.0:   return "適正(PBR 1-2)"
+    if pbr < 3.0:   return "やや割高(PBR 2-3)"
+    return "割高(PBR>3)"
+
+
+def _port_returns(tickers, start, end, max_n=20):
+    """等重みポートフォリオの日次リターンを返す"""
+    rets = []
+    for t in tickers[:max_n]:
+        df_t = _yfdownload(t, start=start, end=end, progress=False)
+        if df_t.empty or len(df_t) < 10:
+            continue
+        r = _to_series(df_t["Close"]).pct_change().dropna()
+        rets.append(r)
+    if not rets:
+        return pd.Series(dtype=float)
+    return pd.concat(rets, axis=1).mean(axis=1)
+
+
+# ─── ファクターデータ（fetch_all_ticker_info_bulk のキャッシュを流用）────
+df_factor = fetch_all_ticker_info_bulk(tuple(ticker_name_map.items()))
+
+df_factor["サイズ分類"]    = df_factor["時価総額"].apply(_size_label)
+df_factor["バリュー分類"]  = df_factor["PBR"].apply(_value_label)
+df_factor["時価総額(億円)"] = (df_factor["時価総額"].fillna(0) / 1e8).round(1)
+
+try:
+    _has_results = not df_results.empty
+except Exception:
+    _has_results = False
+
+if _has_results:
+    _perf_cols = ["企業名", "年間平均リターン(%)", "年間リスク(%)",
+                  "シャープレシオ", "アルファ(%)", "ベータ"]
+    df_factor_merged = df_factor.merge(df_results[_perf_cols], on="企業名", how="inner")
+else:
+    df_factor_merged = df_factor.copy()
+
+_SIZE_ORDER  = ["大型株(>1兆)", "中型株(1000億-1兆)", "小型株(<1000億)"]
+_VALUE_ORDER = ["割安(PBR<1)", "適正(PBR 1-2)", "やや割高(PBR 2-3)", "割高(PBR>3)"]
+
+
+# =================================================================
+# 📏 サイズファクター分析
+# =================================================================
+
+st.header("📏 サイズファクター分析")
+st.divider()
+st.caption(
+    "時価総額で銘柄を **大型・中型・小型** に分類し、リターン・リスク・シャープレシオを比較します。"
+    "**SMBファクター**（Small Minus Big）で小型株プレミアムを検証します。"
+)
+
+sz_t1, sz_t2, sz_t3, sz_t4 = st.tabs([
+    "📊 時価総額分布",
+    "📈 サイズ別パフォーマンス",
+    "📉 SMBファクター",
+    "🗺️ 時価総額×アルファ",
+])
+
+with sz_t1:
+    df_mc_v = df_factor.dropna(subset=["時価総額"])
+    sc = df_mc_v["サイズ分類"].value_counts()
+    cols_sc = st.columns(3)
+    for i, (lbl, col) in enumerate(zip(_SIZE_ORDER, cols_sc)):
+        col.metric(lbl, f"{int(sc.get(lbl, 0))}銘柄")
+
+    col_pie, col_hist = st.columns(2)
+    with col_pie:
+        labels_p = [l for l in _SIZE_ORDER if l in sc.index]
+        fig_pie, ax_pie = plt.subplots(figsize=(5, 4))
+        ax_pie.pie([sc[l] for l in labels_p], labels=labels_p,
+                   colors=["#1565c0", "#42a5f5", "#90caf9"],
+                   autopct="%1.1f%%", startangle=90,
+                   wedgeprops=dict(edgecolor="white", linewidth=1.5))
+        ax_pie.set_title("サイズ分類の割合", fontsize=12, fontweight="bold")
+        plt.tight_layout()
+        st.pyplot(fig_pie, clear_figure=True)
+
+    with col_hist:
+        mc_log = np.log10(df_mc_v[df_mc_v["時価総額(億円)"] > 0]["時価総額(億円)"] + 1)
+        fig_hist, ax_hist = plt.subplots(figsize=(5, 4))
+        ax_hist.hist(mc_log, bins=30, color="#1565c0", alpha=0.75, edgecolor="white")
+        ax_hist.axvline(np.log10(1000), color="#f57c00", linestyle="--",
+                        alpha=0.8, label="1000億円")
+        ax_hist.axvline(np.log10(10000), color="#d1242f", linestyle="--",
+                        alpha=0.8, label="1兆円")
+        ax_hist.set_xlabel("log10(時価総額・億円)", fontsize=10)
+        ax_hist.set_ylabel("銘柄数", fontsize=10)
+        ax_hist.set_title("時価総額分布（対数）", fontsize=12, fontweight="bold")
+        ax_hist.legend(fontsize=8); ax_hist.grid(True, alpha=0.2)
+        plt.tight_layout()
+        st.pyplot(fig_hist, clear_figure=True)
+
+    col_top20, col_bot20 = st.columns(2)
+    with col_top20:
+        st.markdown("**時価総額 上位20銘柄**")
+        st.dataframe(
+            df_mc_v.nlargest(20, "時価総額")[
+                ["企業名", "業種", "サイズ分類", "時価総額(億円)"]
+            ].reset_index(drop=True)
+            .style.format({"時価総額(億円)": "{:,.0f}"}),
+            use_container_width=True, hide_index=True,
+        )
+    with col_bot20:
+        st.markdown("**時価総額 下位20銘柄**")
+        st.dataframe(
+            df_mc_v.nsmallest(20, "時価総額")[
+                ["企業名", "業種", "サイズ分類", "時価総額(億円)"]
+            ].reset_index(drop=True)
+            .style.format({"時価総額(億円)": "{:,.0f}"}),
+            use_container_width=True, hide_index=True,
+        )
+
+with sz_t2:
+    if not _has_results:
+        st.info("上部の「パフォーマンス分析」が自動実行後に表示されます")
+    else:
+        df_sz_p = df_factor_merged.dropna(subset=["シャープレシオ", "サイズ分類"])
+        sz_agg = df_sz_p.groupby("サイズ分類").agg(
+            銘柄数=("企業名", "count"),
+            平均リターン=("年間平均リターン(%)", "mean"),
+            平均リスク=("年間リスク(%)", "mean"),
+            平均シャープレシオ=("シャープレシオ", "mean"),
+            平均アルファ=("アルファ(%)", "mean"),
+        ).round(3).reset_index()
+        sz_agg["_o"] = sz_agg["サイズ分類"].map({s: i for i, s in enumerate(_SIZE_ORDER)})
+        sz_agg = sz_agg.sort_values("_o").drop("_o", axis=1)
+
+        cols_m = st.columns(len(sz_agg))
+        for i, (_, row) in enumerate(sz_agg.iterrows()):
+            cols_m[i].metric(row["サイズ分類"],
+                             f"SR: {row['平均シャープレシオ']:.2f}",
+                             f"α: {row['平均アルファ']:+.2f}%")
+
+        st.dataframe(sz_agg.style.format({
+            "平均リターン": "{:+.2f}%", "平均リスク": "{:.2f}%",
+            "平均シャープレシオ": "{:.3f}", "平均アルファ": "{:+.2f}%",
+        }), use_container_width=True, hide_index=True)
+
+        fig_sz, axes_sz = plt.subplots(1, 3, figsize=(15, 5))
+        for ax, metric, title in zip(
+            axes_sz,
+            ["平均シャープレシオ", "平均リターン", "平均アルファ"],
+            ["平均シャープレシオ", "平均リターン(%)", "平均アルファ(%)"],
+        ):
+            vld = sz_agg.dropna(subset=[metric])
+            ax.bar(vld["サイズ分類"], vld[metric],
+                   color=["#1a7f37" if v >= 0 else "#d1242f" for v in vld[metric]],
+                   alpha=0.85)
+            ax.axhline(0, color="gray", linewidth=0.8)
+            ax.set_title(title, fontsize=11, fontweight="bold")
+            ax.tick_params(axis="x", rotation=15, labelsize=9)
+            ax.grid(True, axis="y", alpha=0.3)
+        plt.tight_layout()
+        st.pyplot(fig_sz, clear_figure=True)
+
+        box_sz = [df_sz_p[df_sz_p["サイズ分類"] == s]["シャープレシオ"].dropna().values
+                  for s in _SIZE_ORDER if s in df_sz_p["サイズ分類"].values]
+        box_sz_lbl = [s for s in _SIZE_ORDER if s in df_sz_p["サイズ分類"].values]
+        if any(len(d) > 0 for d in box_sz):
+            fig_bx, ax_bx = plt.subplots(figsize=(9, 5))
+            bp = ax_bx.boxplot([d for d in box_sz if len(d) > 0],
+                               labels=[l for l, d in zip(box_sz_lbl, box_sz) if len(d) > 0],
+                               patch_artist=True,
+                               medianprops=dict(color="black", linewidth=2))
+            for patch, color in zip(bp["boxes"], ["#1565c0", "#42a5f5", "#90caf9"]):
+                patch.set_facecolor(color); patch.set_alpha(0.7)
+            ax_bx.axhline(0, color="gray", linestyle="--", alpha=0.5)
+            ax_bx.set_ylabel("シャープレシオ", fontsize=12)
+            ax_bx.set_title("サイズ別シャープレシオ分布", fontsize=12, fontweight="bold")
+            ax_bx.grid(True, axis="y", alpha=0.3)
+            plt.tight_layout()
+            st.pyplot(fig_bx, clear_figure=True)
+
+with sz_t3:
+    smb_days  = st.slider("分析期間（日）", 30, 250, 120, key="smb_days")
+    end_smb   = datetime.today()
+    start_smb = end_smb - _fac_td(days=smb_days + 10)
+
+    df_mc_s = df_factor.dropna(subset=["時価総額"]).sort_values("時価総額")
+    n_s = max(int(len(df_mc_s) * 0.3), 5)
+
+    with st.spinner("SMBファクター計算中..."):
+        small_ret = _port_returns(df_mc_s.head(n_s)["ティッカー"].tolist(), start_smb, end_smb)
+        large_ret = _port_returns(df_mc_s.tail(n_s)["ティッカー"].tolist(), start_smb, end_smb)
+
+    if small_ret.empty or large_ret.empty:
+        st.warning("SMBデータ取得に失敗しました")
+    else:
+        idx_s   = small_ret.index.intersection(large_ret.index)
+        smb_d   = small_ret.loc[idx_s] - large_ret.loc[idx_s]
+        smb_cum = (1 + smb_d).cumprod() - 1
+        s_cum   = (1 + small_ret.loc[idx_s]).cumprod() - 1
+        l_cum   = (1 + large_ret.loc[idx_s]).cumprod() - 1
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("小型株 累積リターン",  f"{s_cum.iloc[-1]*100:+.2f}%")
+        c2.metric("大型株 累積リターン",  f"{l_cum.iloc[-1]*100:+.2f}%")
+        c3.metric("SMBスプレッド", f"{smb_cum.iloc[-1]*100:+.2f}%",
+                  "小型株プレミアム" if smb_cum.iloc[-1] > 0 else "大型株優位")
+
+        fig_smb, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8),
+                                            gridspec_kw={"height_ratios": [2, 1]})
+        ax1.plot(s_cum.index, s_cum * 100, label="小型株", color="#1a7f37", linewidth=2)
+        ax1.plot(l_cum.index, l_cum * 100, label="大型株", color="#1565c0", linewidth=2)
+        ax1.axhline(0, color="gray", linestyle="--", linewidth=0.7)
+        ax1.set_ylabel("累積リターン (%)"); ax1.legend(fontsize=10)
+        ax1.set_title("小型株 vs 大型株 累積リターン", fontsize=12, fontweight="bold")
+        ax1.grid(True, alpha=0.2); ax1.tick_params(axis="x", rotation=30)
+        ax2.bar(smb_cum.index, smb_cum * 100,
+                color=["#1a7f37" if v >= 0 else "#d1242f" for v in smb_cum],
+                alpha=0.7, width=1.5)
+        ax2.axhline(0, color="gray", linewidth=0.7)
+        ax2.set_ylabel("SMB (%)"); ax2.set_title("SMBファクター", fontsize=11)
+        ax2.grid(True, alpha=0.2); ax2.tick_params(axis="x", rotation=30)
+        plt.tight_layout()
+        st.pyplot(fig_smb, clear_figure=True)
+
+        prompt_smb = (
+            f"日本株の過去{smb_days}日間SMBファクター: "
+            f"小型株{s_cum.iloc[-1]*100:+.2f}%、大型株{l_cum.iloc[-1]*100:+.2f}%、"
+            f"スプレッド{smb_cum.iloc[-1]*100:+.2f}%。"
+            "投資家向け200文字以内: 1)サイズプレミアムの現状 2)投資戦略への示唆"
+        )
+        with st.spinner("AI解説中..."):
+            try:
+                comment, ai_name = generate_ai_comment(prompt_smb)
+                st.info(f"🤖 **AI解説（{ai_name}）**\n\n{comment}")
+            except Exception as e:
+                st.warning(f"AI APIエラー: {e}")
+
+with sz_t4:
+    if not _has_results:
+        st.info("上部の「パフォーマンス分析」が自動実行後に表示されます")
+    else:
+        df_sc = df_factor_merged.dropna(subset=["時価総額", "アルファ(%)"]).copy()
+        df_sc = df_sc[df_sc["時価総額(億円)"] > 0]
+        df_sc["log時価総額"] = np.log10(df_sc["時価総額(億円)"])
+        try:
+            import plotly.express as px
+            fig_szsc = px.scatter(
+                df_sc, x="log時価総額", y="アルファ(%)",
+                color="サイズ分類",
+                size=df_sc["シャープレシオ"].clip(lower=0.1),
+                hover_name="企業名",
+                hover_data={"業種": True, "時価総額(億円)": ":.0f",
+                            "アルファ(%)": ":.2f", "シャープレシオ": ":.2f"},
+                title="時価総額 vs アルファ（バブルサイズ=シャープレシオ）",
+                height=600,
+                color_discrete_map={
+                    "大型株(>1兆)": "#1565c0",
+                    "中型株(1000億-1兆)": "#42a5f5",
+                    "小型株(<1000億)": "#90caf9",
+                },
+            )
+            fig_szsc.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
+            fig_szsc.update_layout(xaxis_title="log10(時価総額・億円)",
+                                   yaxis_title="アルファ (%)", plot_bgcolor="white")
+            st.plotly_chart(fig_szsc, use_container_width=True)
+        except ImportError:
+            fig_szsc2, ax_sz = plt.subplots(figsize=(12, 7))
+            for size_cat, color in zip(_SIZE_ORDER, ["#1565c0", "#42a5f5", "#90caf9"]):
+                sub = df_sc[df_sc["サイズ分類"] == size_cat]
+                ax_sz.scatter(sub["log時価総額"], sub["アルファ(%)"],
+                              label=size_cat, color=color, s=60, alpha=0.75)
+            ax_sz.axhline(0, color="gray", linewidth=0.8, linestyle="--")
+            ax_sz.set_xlabel("log10(時価総額・億円)", fontsize=12)
+            ax_sz.set_ylabel("アルファ (%)", fontsize=12)
+            ax_sz.set_title("時価総額 vs アルファ", fontsize=12, fontweight="bold")
+            ax_sz.legend(fontsize=10); ax_sz.grid(True, alpha=0.2)
+            plt.tight_layout()
+            st.pyplot(fig_szsc2, clear_figure=True)
+
+
+# =================================================================
+# 💰 バリューファクター分析
+# =================================================================
+
+st.header("💰 バリューファクター分析")
+st.divider()
+st.caption(
+    "PBR（株価純資産倍率）・PER・PSR・ROEで **割安株（バリュー）と割高株（グロース）** を分類・比較します。"
+    "**HMLファクター**（High Minus Low PBR）でバリュープレミアムを検証します。"
+)
+
+vl_t1, vl_t2, vl_t3, vl_t4 = st.tabs([
+    "💎 低PBR スクリーニング",
+    "📊 バリュー別パフォーマンス",
+    "📉 HMLファクター",
+    "🗺️ PBR×アルファ散布図",
+])
+
+with vl_t1:
+    col_v1, col_v2 = st.columns(2)
+    with col_v1:
+        pbr_max_vl = st.slider("最大PBR", 0.3, 5.0, 1.5, 0.1, key="vl_pbr_max")
+    with col_v2:
+        per_max_vl = st.slider("最大PER", 5, 80, 30, key="vl_per_max")
+
+    df_vl_s = df_factor.dropna(subset=["PBR", "PER"])
+    df_vl_s = df_vl_s[
+        (df_vl_s["PBR"] > 0) & (df_vl_s["PBR"] <= pbr_max_vl) &
+        (df_vl_s["PER"] > 0) & (df_vl_s["PER"] <= per_max_vl)
+    ].sort_values("PBR").reset_index(drop=True)
+
+    st.markdown(f"**{len(df_vl_s)}銘柄** が条件を満たしています"
+                f"（PBR≤{pbr_max_vl} & PER≤{per_max_vl}）")
+
+    if not df_vl_s.empty:
+        disp_vl = [c for c in
+                   ["企業名", "業種", "サイズ分類", "PBR", "PER", "PSR",
+                    "配当利回り(%)", "ROE(%)"]
+                   if c in df_vl_s.columns]
+
+        def _color_pbr(val):
+            if isinstance(val, float):
+                if val < 0.5: return "color:#1a7f37;font-weight:bold;font-size:14px"
+                if val < 1.0: return "color:#1a7f37;font-weight:bold"
+                if val < 1.5: return "color:#388e3c"
+            return ""
+
+        st.dataframe(
+            df_vl_s[disp_vl].head(40)
+            .style.format({
+                "PBR": "{:.2f}", "PER": "{:.1f}", "PSR": "{:.2f}",
+                "配当利回り(%)": "{:.2f}%", "ROE(%)": "{:.1f}%",
+            }, na_rep="N/A")
+            .map(_color_pbr, subset=["PBR"]),
+            use_container_width=True, hide_index=True,
+        )
+        csv_vl = df_vl_s[disp_vl].to_csv(index=False, encoding="utf-8-sig")
+        st.download_button(
+            "⬇️ CSVダウンロード", data=csv_vl,
+            file_name=f"value_screen_{datetime.today().strftime('%Y%m%d')}.csv",
+            mime="text/csv", key="vl_dl",
+        )
+
+    df_pbr_all = df_factor.dropna(subset=["PBR"])
+    df_pbr_all = df_pbr_all[df_pbr_all["PBR"].between(0, 10)]
+    fig_pbr_d, ax_pd = plt.subplots(figsize=(10, 4))
+    ax_pd.hist(df_pbr_all["PBR"], bins=40, color="#1565c0", alpha=0.75, edgecolor="white")
+    ax_pd.axvline(1.0, color="#1a7f37", linestyle="--", linewidth=1.5, label="PBR=1.0")
+    ax_pd.axvline(pbr_max_vl, color="#f57c00", linestyle="--",
+                  linewidth=1.5, label=f"上限({pbr_max_vl})")
+    ax_pd.set_xlabel("PBR", fontsize=11); ax_pd.set_ylabel("銘柄数", fontsize=11)
+    ax_pd.set_title("PBR分布（全銘柄）", fontsize=12, fontweight="bold")
+    ax_pd.legend(fontsize=9); ax_pd.grid(True, alpha=0.2)
+    plt.tight_layout()
+    st.pyplot(fig_pbr_d, clear_figure=True)
+
+with vl_t2:
+    if not _has_results:
+        st.info("上部の「パフォーマンス分析」が自動実行後に表示されます")
+    else:
+        df_vp = df_factor_merged.dropna(subset=["PBR", "シャープレシオ"]).copy()
+        df_vp["バリュー分類"] = df_vp["PBR"].apply(_value_label)
+
+        vl_agg = df_vp.groupby("バリュー分類").agg(
+            銘柄数=("企業名", "count"),
+            平均PBR=("PBR", "mean"),
+            平均リターン=("年間平均リターン(%)", "mean"),
+            平均リスク=("年間リスク(%)", "mean"),
+            平均シャープレシオ=("シャープレシオ", "mean"),
+            平均アルファ=("アルファ(%)", "mean"),
+        ).round(3).reset_index()
+        vl_agg["_o"] = vl_agg["バリュー分類"].map(
+            {v: i for i, v in enumerate(_VALUE_ORDER)}
+        )
+        vl_agg = vl_agg.sort_values("_o").drop("_o", axis=1)
+
+        st.dataframe(vl_agg.style.format({
+            "平均PBR": "{:.2f}", "平均リターン": "{:+.2f}%",
+            "平均リスク": "{:.2f}%", "平均シャープレシオ": "{:.3f}",
+            "平均アルファ": "{:+.2f}%",
+        }), use_container_width=True, hide_index=True)
+
+        fig_vp, axes_vp = plt.subplots(1, 3, figsize=(15, 5))
+        for ax_vp, metric, title in zip(
+            axes_vp,
+            ["平均シャープレシオ", "平均リターン", "平均アルファ"],
+            ["平均シャープレシオ", "平均リターン(%)", "平均アルファ(%)"],
+        ):
+            vld_vp = vl_agg.dropna(subset=[metric])
+            ax_vp.bar(vld_vp["バリュー分類"], vld_vp[metric],
+                      color=["#1a7f37" if v >= 0 else "#d1242f" for v in vld_vp[metric]],
+                      alpha=0.85)
+            ax_vp.axhline(0, color="gray", linewidth=0.8)
+            ax_vp.set_title(title, fontsize=11, fontweight="bold")
+            ax_vp.tick_params(axis="x", rotation=15, labelsize=8)
+            ax_vp.grid(True, axis="y", alpha=0.3)
+        plt.tight_layout()
+        st.pyplot(fig_vp, clear_figure=True)
+
+        box_vl = [df_vp[df_vp["バリュー分類"] == v]["シャープレシオ"].dropna().values
+                  for v in _VALUE_ORDER if v in df_vp["バリュー分類"].values]
+        box_vl_lbl = [v for v in _VALUE_ORDER if v in df_vp["バリュー分類"].values]
+        if any(len(d) > 0 for d in box_vl):
+            fig_vbx, ax_vbx = plt.subplots(figsize=(9, 5))
+            bpv = ax_vbx.boxplot(
+                [d for d in box_vl if len(d) > 0],
+                labels=[l for l, d in zip(box_vl_lbl, box_vl) if len(d) > 0],
+                patch_artist=True,
+                medianprops=dict(color="black", linewidth=2),
+            )
+            for patch, color in zip(bpv["boxes"],
+                                    ["#1a7f37", "#42a5f5", "#f57c00", "#d1242f"]):
+                patch.set_facecolor(color); patch.set_alpha(0.65)
+            ax_vbx.axhline(0, color="gray", linestyle="--", alpha=0.5)
+            ax_vbx.set_ylabel("シャープレシオ", fontsize=12)
+            ax_vbx.set_title("バリュー分類別シャープレシオ分布",
+                              fontsize=12, fontweight="bold")
+            ax_vbx.grid(True, axis="y", alpha=0.3)
+            plt.tight_layout()
+            st.pyplot(fig_vbx, clear_figure=True)
+
+with vl_t3:
+    hml_days  = st.slider("分析期間（日）", 30, 250, 120, key="hml_days")
+    end_hml   = datetime.today()
+    start_hml = end_hml - _fac_td(days=hml_days + 10)
+
+    df_pbr_s = df_factor.dropna(subset=["PBR"])
+    df_pbr_s = df_pbr_s[df_pbr_s["PBR"] > 0].sort_values("PBR")
+    n_h = max(int(len(df_pbr_s) * 0.3), 5)
+
+    with st.spinner("HMLファクター計算中..."):
+        low_ret  = _port_returns(df_pbr_s.head(n_h)["ティッカー"].tolist(), start_hml, end_hml)
+        high_ret = _port_returns(df_pbr_s.tail(n_h)["ティッカー"].tolist(), start_hml, end_hml)
+
+    if low_ret.empty or high_ret.empty:
+        st.warning("HMLデータ取得に失敗しました")
+    else:
+        idx_h   = low_ret.index.intersection(high_ret.index)
+        hml_d   = low_ret.loc[idx_h] - high_ret.loc[idx_h]
+        hml_cum = (1 + hml_d).cumprod() - 1
+        l_cum_h = (1 + low_ret.loc[idx_h]).cumprod() - 1
+        h_cum_h = (1 + high_ret.loc[idx_h]).cumprod() - 1
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("低PBR（割安）累積リターン", f"{l_cum_h.iloc[-1]*100:+.2f}%")
+        c2.metric("高PBR（割高）累積リターン", f"{h_cum_h.iloc[-1]*100:+.2f}%")
+        c3.metric("HMLスプレッド", f"{hml_cum.iloc[-1]*100:+.2f}%",
+                  "バリュープレミアム" if hml_cum.iloc[-1] > 0 else "グロース優位")
+
+        fig_hml, (ax_h1, ax_h2) = plt.subplots(2, 1, figsize=(12, 8),
+                                                gridspec_kw={"height_ratios": [2, 1]})
+        ax_h1.plot(l_cum_h.index, l_cum_h * 100,
+                   label="低PBR（バリュー）", color="#1a7f37", linewidth=2)
+        ax_h1.plot(h_cum_h.index, h_cum_h * 100,
+                   label="高PBR（グロース）", color="#d1242f", linewidth=2)
+        ax_h1.axhline(0, color="gray", linestyle="--", linewidth=0.7)
+        ax_h1.set_ylabel("累積リターン (%)"); ax_h1.legend(fontsize=10)
+        ax_h1.set_title("低PBR（バリュー）vs 高PBR（グロース）累積リターン",
+                        fontsize=12, fontweight="bold")
+        ax_h1.grid(True, alpha=0.2); ax_h1.tick_params(axis="x", rotation=30)
+        ax_h2.bar(hml_cum.index, hml_cum * 100,
+                  color=["#1a7f37" if v >= 0 else "#d1242f" for v in hml_cum],
+                  alpha=0.7, width=1.5)
+        ax_h2.axhline(0, color="gray", linewidth=0.7)
+        ax_h2.set_ylabel("HML (%)"); ax_h2.set_title("HMLファクター（バリュープレミアム）",
+                                                      fontsize=11)
+        ax_h2.grid(True, alpha=0.2); ax_h2.tick_params(axis="x", rotation=30)
+        plt.tight_layout()
+        st.pyplot(fig_hml, clear_figure=True)
+
+        prompt_hml = (
+            f"日本株の過去{hml_days}日間HMLファクター: "
+            f"低PBR（割安）{l_cum_h.iloc[-1]*100:+.2f}%、"
+            f"高PBR（グロース）{h_cum_h.iloc[-1]*100:+.2f}%、"
+            f"スプレッド{hml_cum.iloc[-1]*100:+.2f}%。"
+            "投資家向け200文字以内: 1)バリュープレミアムの現状 2)バリュー投資戦略への示唆"
+        )
+        with st.spinner("AI解説中..."):
+            try:
+                comment, ai_name = generate_ai_comment(prompt_hml)
+                st.info(f"🤖 **AI解説（{ai_name}）**\n\n{comment}")
+            except Exception as e:
+                st.warning(f"AI APIエラー: {e}")
+
+with vl_t4:
+    if not _has_results:
+        st.info("上部の「パフォーマンス分析」が自動実行後に表示されます")
+    else:
+        df_vsc = df_factor_merged.dropna(subset=["PBR", "アルファ(%)"]).copy()
+        df_vsc = df_vsc[df_vsc["PBR"].between(0.1, 15)]
+        df_vsc["バリュー分類"] = df_vsc["PBR"].apply(_value_label)
+        try:
+            import plotly.express as px
+            fig_vsc = px.scatter(
+                df_vsc, x="PBR", y="アルファ(%)",
+                color="バリュー分類",
+                size=df_vsc["シャープレシオ"].clip(lower=0.1),
+                hover_name="企業名",
+                hover_data={"業種": True, "PBR": ":.2f",
+                            "アルファ(%)": ":.2f", "シャープレシオ": ":.2f"},
+                title="PBR vs アルファ（バブルサイズ=シャープレシオ）",
+                height=600,
+                color_discrete_map={
+                    "割安(PBR<1)":       "#1a7f37",
+                    "適正(PBR 1-2)":     "#42a5f5",
+                    "やや割高(PBR 2-3)": "#f57c00",
+                    "割高(PBR>3)":       "#d1242f",
+                },
+            )
+            fig_vsc.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
+            fig_vsc.add_vline(x=1.0, line_dash="dash", line_color="#1a7f37",
+                              opacity=0.5, annotation_text="PBR=1")
+            fig_vsc.update_layout(xaxis_title="PBR（株価純資産倍率）",
+                                  yaxis_title="アルファ (%)", plot_bgcolor="white")
+            st.plotly_chart(fig_vsc, use_container_width=True)
+        except ImportError:
+            fig_vsc2, ax_vs = plt.subplots(figsize=(12, 7))
+            for cat, color in zip(_VALUE_ORDER,
+                                  ["#1a7f37", "#42a5f5", "#f57c00", "#d1242f"]):
+                sub = df_vsc[df_vsc["バリュー分類"] == cat]
+                if not sub.empty:
+                    ax_vs.scatter(sub["PBR"], sub["アルファ(%)"],
+                                  label=cat, color=color, s=60, alpha=0.8)
+                    for _, row in sub.iterrows():
+                        if abs(row["アルファ(%)"]) > df_vsc["アルファ(%)"].std() * 1.5:
+                            ax_vs.annotate(row["企業名"],
+                                          (row["PBR"], row["アルファ(%)"]),
+                                          fontsize=7, alpha=0.9,
+                                          xytext=(4, 4), textcoords="offset points")
+            ax_vs.axhline(0, color="gray", linewidth=0.8, linestyle="--")
+            ax_vs.axvline(1.0, color="#1a7f37", linewidth=1.0,
+                          linestyle="--", alpha=0.6, label="PBR=1.0")
+            ax_vs.set_xlabel("PBR（株価純資産倍率）", fontsize=12)
+            ax_vs.set_ylabel("アルファ (%)", fontsize=12)
+            ax_vs.set_title("PBR vs アルファ分析マップ", fontsize=12, fontweight="bold")
+            ax_vs.legend(fontsize=9); ax_vs.grid(True, alpha=0.2)
+            plt.tight_layout()
+            st.pyplot(fig_vsc2, clear_figure=True)
+
+
+
+# =================================================================
+# 🌟 バリューファクターによる価値創造分析
+# =================================================================
+
+_ERP_JAPAN = 0.05  # 日本株式リスクプレミアム想定（5%）
+
+st.header("🌟 バリューファクターによる価値創造分析")
+st.divider()
+st.caption(
+    "**価値創造（Value Creation）= ROE > 資本コスト（CoE）**。"
+    "CAPMで推定した資本コストとROEを比較し、企業が株主価値を創造しているかを判定します。"
+    "伊藤レポートが提唱するROE 8%基準・PBR-ROEマトリクスで「割安の価値創造企業」を発掘します。"
+)
+
+try:
+    _vc_ok = not df_results.empty and not df_factor.empty
+except Exception:
+    _vc_ok = False
+
+if not _vc_ok:
+    st.info("上部の「パフォーマンス分析」が自動実行後に表示されます")
+else:
+    df_vc = df_factor_merged.dropna(subset=["ROE(%)", "ベータ", "PBR"]).copy()
+    df_vc = df_vc[df_vc["ROE(%)"].abs() < 200]  # 異常値除去
+
+    _rf_pct = risk_free_rate * 100
+    df_vc["資本コスト(%)"]        = (_rf_pct + df_vc["ベータ"] * _ERP_JAPAN * 100).round(2)
+    df_vc["価値創造スプレッド(%)"] = (df_vc["ROE(%)"] - df_vc["資本コスト(%)"]).round(2)
+    df_vc["価値創造判定"]          = df_vc["価値創造スプレッド(%)"].apply(
+        lambda x: "✅ 価値創造" if x > 0 else "❌ 価値破壊"
+    )
+    _avg_coe = df_vc["資本コスト(%)"].mean()
+    df_vc["理論PBR"] = (
+        df_vc["ROE(%)"] / df_vc["資本コスト(%)"].replace(0, np.nan)
+    ).round(2)
+
+    _creators  = (df_vc["価値創造スプレッド(%)"] > 0).sum()
+    _destroyers = (df_vc["価値創造スプレッド(%)"] <= 0).sum()
+    _ito_pass  = (df_vc["ROE(%)"] >= 8).sum()
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("✅ 価値創造企業", f"{_creators}社", f"全{_creators+_destroyers}社中")
+    m2.metric("❌ 価値破壊企業", f"{_destroyers}社")
+    m3.metric("平均スプレッド（ROE−CoE）", f"{df_vc['価値創造スプレッド(%)'].mean():+.2f}%")
+    m4.metric("伊藤レポート ROE≥8%", f"{_ito_pass}社")
+
+    st.divider()
+
+    vc_t1, vc_t2, vc_t3, vc_t4, vc_t5 = st.tabs([
+        "🏆 価値創造ランキング",
+        "🗺️ PBR-ROEマトリクス",
+        "📊 価値創造スコアカード",
+        "🤖 AI価値創造分析",
+        "🔬 ROIC-WACC分析",
+    ])
+
+    with vc_t1:
+        st.markdown("#### 🏆 価値創造スプレッドランキング（ROE − 資本コスト）")
+        st.caption(
+            f"資本コスト = 無リスク金利（{_rf_pct:.1f}%）"
+            f" + β × 株式リスクプレミアム（{_ERP_JAPAN*100:.0f}%）"
+        )
+
+        col_cr, col_ds = st.columns(2)
+        with col_cr:
+            st.markdown("**✅ 価値創造企業 上位30（ROE > CoE）**")
+            top_vc = df_vc[df_vc["価値創造スプレッド(%)"] > 0].nlargest(
+                30, "価値創造スプレッド(%)")
+
+            def _color_spread(val):
+                if isinstance(val, float):
+                    if val >= 20: return "color:#1a7f37;font-weight:bold;font-size:14px"
+                    if val >= 10: return "color:#1a7f37;font-weight:bold"
+                    if val > 0:   return "color:#388e3c"
+                return ""
+
+            st.dataframe(
+                top_vc[["企業名", "業種", "ROE(%)", "資本コスト(%)",
+                         "価値創造スプレッド(%)", "PBR", "アルファ(%)"]].reset_index(drop=True)
+                .style.format({
+                    "ROE(%)": "{:.1f}%", "資本コスト(%)": "{:.1f}%",
+                    "価値創造スプレッド(%)": "{:+.2f}%",
+                    "PBR": "{:.2f}", "アルファ(%)": "{:+.2f}%",
+                })
+                .map(_color_spread, subset=["価値創造スプレッド(%)"]),
+                use_container_width=True, hide_index=True,
+            )
+
+        with col_ds:
+            st.markdown("**❌ 価値破壊企業 下位20（ROE < CoE）**")
+            bot_vc = df_vc[df_vc["価値創造スプレッド(%)"] <= 0].nsmallest(
+                20, "価値創造スプレッド(%)")
+
+            def _color_neg(val):
+                if isinstance(val, float):
+                    if val <= -20: return "color:#d1242f;font-weight:bold;font-size:14px"
+                    if val <= -10: return "color:#d1242f;font-weight:bold"
+                    if val < 0:    return "color:#e57373"
+                return ""
+
+            st.dataframe(
+                bot_vc[["企業名", "業種", "ROE(%)", "資本コスト(%)",
+                         "価値創造スプレッド(%)", "PBR"]].reset_index(drop=True)
+                .style.format({
+                    "ROE(%)": "{:.1f}%", "資本コスト(%)": "{:.1f}%",
+                    "価値創造スプレッド(%)": "{:+.2f}%", "PBR": "{:.2f}",
+                })
+                .map(_color_neg, subset=["価値創造スプレッド(%)"]),
+                use_container_width=True, hide_index=True,
+            )
+
+        top20_sp = df_vc.nlargest(20, "価値創造スプレッド(%)")
+        fig_sp, ax_sp = plt.subplots(figsize=(14, 6))
+        ax_sp.bar(top20_sp["企業名"], top20_sp["価値創造スプレッド(%)"],
+                  color=["#1a7f37" if v > 0 else "#d1242f"
+                         for v in top20_sp["価値創造スプレッド(%)"]],
+                  alpha=0.85)
+        ax_sp.axhline(0, color="black", linewidth=0.8)
+        ax_sp.axhline(8 - _rf_pct, color="orange", linestyle="--",
+                      alpha=0.7, label="伊藤レポート基準（ROE8%相当）")
+        ax_sp.set_title("価値創造スプレッド 上位20銘柄（ROE − 資本コスト）",
+                        fontsize=12, fontweight="bold")
+        ax_sp.set_ylabel("スプレッド (%)")
+        ax_sp.tick_params(axis="x", rotation=45, labelsize=9)
+        ax_sp.legend(fontsize=9); ax_sp.grid(True, axis="y", alpha=0.3)
+        plt.tight_layout()
+        st.pyplot(fig_sp, clear_figure=True)
+
+        csv_vc = df_vc.sort_values("価値創造スプレッド(%)", ascending=False)[[
+            "企業名", "業種", "ROE(%)", "資本コスト(%)",
+            "価値創造スプレッド(%)", "価値創造判定", "PBR", "理論PBR", "アルファ(%)"
+        ]].to_csv(index=False, encoding="utf-8-sig")
+        st.download_button(
+            "⬇️ 価値創造分析CSV", data=csv_vc,
+            file_name=f"value_creation_{datetime.today().strftime('%Y%m%d')}.csv",
+            mime="text/csv", key="vc_dl",
+        )
+
+    with vc_t2:
+        st.markdown("#### 🗺️ PBR-ROEマトリクス（価値創造マップ）")
+        st.caption(
+            "**理論値**: PBR ≈ ROE ÷ 資本コスト（成長ゼロ仮定）。"
+            " **💎左上**（高ROE・低PBR）= 割安の価値創造企業（投資好機候補）"
+        )
+
+        df_pbr_roe = df_vc.dropna(subset=["PBR", "ROE(%)"])
+        df_pbr_roe = df_pbr_roe[df_pbr_roe["PBR"].between(0.1, 15)].copy()
+
+        try:
+            import plotly.express as px
+            df_pbr_roe["_dist2"] = np.sqrt(
+                (df_pbr_roe["ROE(%)"] - df_pbr_roe["ROE(%)"].mean())**2 +
+                (df_pbr_roe["PBR"] - df_pbr_roe["PBR"].mean())**2
+            )
+            top_idx2 = df_pbr_roe.nlargest(20, "_dist2").index
+            df_pbr_roe["_label2"] = ""
+            df_pbr_roe.loc[top_idx2, "_label2"] = df_pbr_roe.loc[top_idx2, "企業名"]
+
+            fig_pr = px.scatter(
+                df_pbr_roe,
+                x="ROE(%)", y="PBR",
+                color="価値創造判定",
+                text="_label2",
+                size=df_pbr_roe["時価総額(億円)"].clip(lower=100),
+                hover_name="企業名",
+                hover_data={
+                    "業種": True, "ROE(%)": ":.1f", "PBR": ":.2f",
+                    "価値創造スプレッド(%)": ":.2f",
+                    "資本コスト(%)": ":.1f", "理論PBR": ":.2f",
+                    "時価総額(億円)": ":.0f",
+                    "_label2": False, "_dist2": False,
+                },
+                title="PBR-ROEマトリクス（バブルサイズ=時価総額、ラベル=注目銘柄）",
+                height=680,
+                color_discrete_map={
+                    "✅ 価値創造": "#1a7f37",
+                    "❌ 価値破壊": "#d1242f",
+                },
+            )
+            roe_line = np.linspace(
+                max(df_pbr_roe["ROE(%)"].min(), -5),
+                min(df_pbr_roe["ROE(%)"].max(), 60), 100
+            )
+            fig_pr.add_scatter(
+                x=roe_line, y=roe_line / _avg_coe,
+                mode="lines",
+                name=f"理論PBRライン（CoE≈{_avg_coe:.1f}%）",
+                line=dict(color="#f57c00", dash="dash", width=2),
+            )
+            fig_pr.add_hline(y=1.0, line_dash="dot", line_color="gray",
+                             opacity=0.5, annotation_text="PBR=1")
+            fig_pr.add_vline(x=8.0, line_dash="dot", line_color="orange",
+                             opacity=0.5, annotation_text="ROE=8%（伊藤）")
+            fig_pr.add_vline(x=_rf_pct, line_dash="dot", line_color="#1565c0",
+                             opacity=0.3, annotation_text=f"rf={_rf_pct:.1f}%")
+            fig_pr.update_traces(
+                textposition="top center",
+                textfont=dict(size=8, color="rgba(0,0,0,0.72)"),
+            )
+            fig_pr.update_layout(
+                xaxis_title="ROE (%)", yaxis_title="PBR（株価純資産倍率）",
+                plot_bgcolor="white",
+                hoverlabel=dict(bgcolor="white", font_size=12, namelength=-1),
+            )
+            st.plotly_chart(fig_pr, use_container_width=True)
+
+        except ImportError:
+            fig_pr2, ax_pr = plt.subplots(figsize=(12, 8))
+            for verdict, color in [("✅ 価値創造", "#1a7f37"), ("❌ 価値破壊", "#d1242f")]:
+                sub = df_pbr_roe[df_pbr_roe["価値創造判定"] == verdict]
+                ax_pr.scatter(sub["ROE(%)"], sub["PBR"],
+                              label=verdict, color=color, s=60, alpha=0.75)
+                for _, row in sub.iterrows():
+                    if abs(row["価値創造スプレッド(%)"]) > df_vc["価値創造スプレッド(%)"].std() * 1.5:
+                        ax_pr.annotate(row["企業名"], (row["ROE(%)"], row["PBR"]),
+                                      fontsize=7, xytext=(4, 4),
+                                      textcoords="offset points")
+            roe_r = np.linspace(df_pbr_roe["ROE(%)"].min(),
+                                df_pbr_roe["ROE(%)"].max(), 100)
+            ax_pr.plot(roe_r, roe_r / _avg_coe, "r--", alpha=0.5,
+                      label=f"理論PBR（CoE≈{_avg_coe:.1f}%）")
+            ax_pr.axhline(1.0, color="gray", linestyle=":", alpha=0.5)
+            ax_pr.axvline(8.0, color="orange", linestyle=":", alpha=0.5,
+                         label="ROE=8%")
+            ax_pr.set_xlabel("ROE (%)"); ax_pr.set_ylabel("PBR")
+            ax_pr.set_title("PBR-ROEマトリクス", fontsize=12, fontweight="bold")
+            ax_pr.legend(fontsize=9); ax_pr.grid(True, alpha=0.2)
+            plt.tight_layout()
+            st.pyplot(fig_pr2, clear_figure=True)
+
+        st.markdown("#### 📋 4象限サマリー")
+        _med_roe = df_pbr_roe["ROE(%)"].median()
+        _med_pbr = df_pbr_roe["PBR"].median()
+        q1 = df_pbr_roe[(df_pbr_roe["ROE(%)"] >= _med_roe) & (df_pbr_roe["PBR"] < _med_pbr)]
+        q2 = df_pbr_roe[(df_pbr_roe["ROE(%)"] >= _med_roe) & (df_pbr_roe["PBR"] >= _med_pbr)]
+        q3 = df_pbr_roe[(df_pbr_roe["ROE(%)"] < _med_roe)  & (df_pbr_roe["PBR"] < _med_pbr)]
+        q4 = df_pbr_roe[(df_pbr_roe["ROE(%)"] < _med_roe)  & (df_pbr_roe["PBR"] >= _med_pbr)]
+
+        cq1, cq2, cq3, cq4 = st.columns(4)
+        cq1.metric("💎 高ROE・低PBR（割安価値創造）", f"{len(q1)}社")
+        cq2.metric("🚀 高ROE・高PBR（成長期待）",     f"{len(q2)}社")
+        cq3.metric("⚠️ 低ROE・低PBR（バリュートラップ）", f"{len(q3)}社")
+        cq4.metric("🔴 低ROE・高PBR（割高・価値破壊）", f"{len(q4)}社")
+
+        if not q1.empty:
+            st.markdown("**💎 割安の価値創造企業（高ROE・低PBR）上位10銘柄**")
+            st.dataframe(
+                q1.nlargest(10, "価値創造スプレッド(%)")[
+                    ["企業名", "業種", "ROE(%)", "PBR", "価値創造スプレッド(%)", "アルファ(%)"]
+                ].reset_index(drop=True)
+                .style.format({
+                    "ROE(%)": "{:.1f}%", "PBR": "{:.2f}",
+                    "価値創造スプレッド(%)": "{:+.2f}%", "アルファ(%)": "{:+.2f}%",
+                }),
+                use_container_width=True, hide_index=True,
+            )
+
+    with vc_t3:
+        st.markdown("#### 📊 価値創造スコアカード（マルチファクター総合評価）")
+        st.caption(
+            "価値創造スプレッド・PBR割安度・α・シャープレシオの4軸を"
+            "0〜25点に正規化して合算した総合スコア（最高100点）でランキングします。"
+        )
+
+        df_score = df_vc.copy()
+
+        def _norm(series, reverse=False, pts=25):
+            mn, mx = series.min(), series.max()
+            if mx == mn:
+                return pd.Series(pts / 2, index=series.index)
+            n = (series - mn) / (mx - mn) * pts
+            return (pts - n) if reverse else n
+
+        df_score["S_spread"] = _norm(df_score["価値創造スプレッド(%)"])
+        df_score["S_pbr"]    = _norm(df_score["PBR"], reverse=True)
+        df_score["S_alpha"]  = _norm(df_score["アルファ(%)"])
+        df_score["S_sr"]     = _norm(df_score["シャープレシオ"])
+        df_score["総合スコア"] = (
+            df_score["S_spread"] + df_score["S_pbr"] +
+            df_score["S_alpha"]  + df_score["S_sr"]
+        ).round(1)
+        df_score = df_score.sort_values("総合スコア", ascending=False).reset_index(drop=True)
+
+        def _color_sc(val):
+            if isinstance(val, float):
+                if val >= 80: return "color:#1a7f37;font-weight:bold;font-size:14px"
+                if val >= 60: return "color:#1a7f37;font-weight:bold"
+                if val >= 40: return "color:#f57c00"
+            return ""
+
+        st.dataframe(
+            df_score.head(30)[[
+                "企業名", "業種", "総合スコア", "価値創造スプレッド(%)",
+                "PBR", "アルファ(%)", "シャープレシオ", "ROE(%)", "価値創造判定"
+            ]].style.format({
+                "総合スコア": "{:.1f}", "価値創造スプレッド(%)": "{:+.2f}%",
+                "PBR": "{:.2f}", "アルファ(%)": "{:+.2f}%",
+                "シャープレシオ": "{:.2f}", "ROE(%)": "{:.1f}%",
+            }).map(_color_sc, subset=["総合スコア"]),
+            use_container_width=True, hide_index=True,
+        )
+
+        st.markdown("#### 🕸️ 上位5銘柄 レーダーチャート")
+        top5_r = df_score.head(5)
+        _rcols  = ["S_spread", "S_pbr", "S_alpha", "S_sr"]
+        _rlabels = ["価値創造\nスプレッド", "割安度\n(低PBR)", "アルファ", "シャープ\nレシオ"]
+        angles  = np.linspace(0, 2 * np.pi, len(_rcols), endpoint=False).tolist()
+        angles += angles[:1]
+        colors_r = ["#1565c0", "#1a7f37", "#f57c00", "#7b1fa2", "#d32f2f"]
+
+        fig_r, ax_r = plt.subplots(figsize=(9, 8), subplot_kw=dict(polar=True))
+        for i, (_, row) in enumerate(top5_r.iterrows()):
+            vals = [row[c] for c in _rcols] + [row[_rcols[0]]]
+            ax_r.plot(angles, vals, "o-", linewidth=2,
+                     color=colors_r[i], label=row["企業名"])
+            ax_r.fill(angles, vals, alpha=0.08, color=colors_r[i])
+        ax_r.set_xticks(angles[:-1])
+        ax_r.set_xticklabels(_rlabels, fontsize=10)
+        ax_r.set_ylim(0, 25)
+        ax_r.set_title("価値創造 上位5銘柄 マルチファクター評価",
+                       fontsize=12, fontweight="bold", pad=20)
+        ax_r.legend(loc="upper right", bbox_to_anchor=(1.35, 1.1), fontsize=9)
+        ax_r.grid(True, alpha=0.3)
+        plt.tight_layout()
+        st.pyplot(fig_r, clear_figure=True)
+
+    with vc_t4:
+        st.markdown("#### 🤖 AI価値創造企業 投資テーゼ分析")
+
+        top10_ai = df_score.head(10)
+        _vc_sum = top10_ai[[
+            "企業名", "業種", "総合スコア", "価値創造スプレッド(%)",
+            "PBR", "ROE(%)", "アルファ(%)"
+        ]].to_string(index=False)
+
+        _top1 = df_vc.nlargest(1, "価値創造スプレッド(%)").iloc[0]
+        _q1_top = q1.nlargest(3, "価値創造スプレッド(%)")[
+            ["企業名", "ROE(%)", "PBR"]
+        ].to_string(index=False) if not q1.empty else "該当なし"
+
+        _prompt_vc = f"""
+あなたは日本株の機関投資家向けバリュー分析ストラテジストです。
+
+【価値創造分析 前提条件】
+- 無リスク金利: {_rf_pct:.1f}%  株式リスクプレミアム: {_ERP_JAPAN*100:.0f}%
+- 平均資本コスト（CoE）: {_avg_coe:.1f}%
+- 価値創造企業: {_creators}社 / 全{_creators+_destroyers}社
+- 伊藤レポート ROE8%達成: {_ito_pass}社
+
+【総合スコア上位10銘柄】
+{_vc_sum}
+
+【最高スプレッド企業】
+{_top1["企業名"]}（ROE {_top1["ROE(%)"]:.1f}%、CoE {_top1["資本コスト(%)"]:.1f}%、スプレッド {_top1["価値創造スプレッド(%)"]:.1f}%）
+
+【割安の価値創造候補（高ROE・低PBR）上位3社】
+{_q1_top}
+
+以下の観点で600文字以内で分析してください:
+1. 🏆 特に注目すべき価値創造企業とその投資テーゼ
+2. 📊 日本市場全体の価値創造状況（ROE vs CoEの現状評価）
+3. 💎 割安の価値創造企業（高ROE・低PBR）への戦略的アプローチ
+4. ⚠️ バリュートラップを避けるための注意点
+5. 💡 伊藤レポート・東証改革の観点からの総合評価
+
+※ 投資判断は自己責任である旨を最後に一言付記してください。
+"""
+        with st.spinner("AI価値創造分析中..."):
+            try:
+                comment, ai_name = generate_ai_comment(_prompt_vc)
+                st.info(f"🤖 **AI価値創造分析（{ai_name}）**\n\n{comment}")
+            except Exception as e:
+                st.warning(f"AI APIエラー: {e}")
+
+    with vc_t5:
+        st.markdown("#### 🔬 ROIC-WACC 分析（投下資本 vs 加重平均資本コスト）")
+        st.caption(
+            "**ROIC（Return on Invested Capital）> WACC（Weighted Average Cost of Capital）** = 真の価値創造。"
+            "ROE-CoEが株主目線のみなのに対し、**ROIC-WACCは負債コストも含む資本全体**に対するリターンを評価します。"
+        )
+        st.info(
+            f"⚙️ **前提**: 法人税率 30% ／ 負債コスト = 無リスク金利({risk_free_rate*100:.1f}%) + 2.5%（日本IG格クレジットスプレッド）"
+            f" ／ CoE = CAPM（β × ERP {_ERP_JAPAN*100:.0f}%）"
+        )
+
+        _TAX_JP = 0.30
+        _COD    = risk_free_rate + 0.025
+
+        df_rw = df_factor_merged.copy()
+
+        # Revenue: totalRevenue 優先、なければ 時価総額/PSR
+        df_rw["Revenue_est"] = np.where(
+            df_rw["totalRevenue_raw"].notna() & (df_rw["totalRevenue_raw"] > 0),
+            df_rw["totalRevenue_raw"],
+            np.where(
+                df_rw["PSR"].notna() & (df_rw["PSR"] > 0),
+                df_rw["時価総額"] / df_rw["PSR"],
+                np.nan,
+            ),
+        )
+
+        # NOPAT = Revenue × 営業利益率 × (1 - t)
+        df_rw["NOPAT"] = (
+            df_rw["Revenue_est"] *
+            df_rw["営業利益率_raw"].fillna(0) *
+            (1 - _TAX_JP)
+        )
+
+        # 投下資本 IC = 簿価株主資本 + 有利子負債 - 現金
+        df_rw["BookEq"]    = df_rw["時価総額"] / df_rw["PBR"].replace(0, np.nan)
+        df_rw["TotalDebt"] = df_rw["totalDebt_raw"].fillna(0)
+        df_rw["TotalCash"] = df_rw["totalCash_raw"].fillna(0)
+        df_rw["IC"]        = df_rw["BookEq"] + df_rw["TotalDebt"] - df_rw["TotalCash"]
+
+        # ROIC
+        df_rw["ROIC(%)"] = (df_rw["NOPAT"] / df_rw["IC"].replace(0, np.nan) * 100).round(2)
+
+        # WACC
+        df_rw["CoE_w(%)"] = (_rf_pct + df_rw["ベータ"] * _ERP_JAPAN * 100).round(2)
+        df_rw["TC"]   = (df_rw["時価総額"] + df_rw["TotalDebt"]).replace(0, np.nan)
+        df_rw["W_E"]  = (df_rw["時価総額"] / df_rw["TC"]).clip(0, 1)
+        df_rw["W_D"]  = (df_rw["TotalDebt"] / df_rw["TC"]).clip(0, 1)
+        df_rw["WACC(%)"] = (
+            df_rw["W_E"] * df_rw["CoE_w(%)"] +
+            df_rw["W_D"] * (_COD * 100) * (1 - _TAX_JP)
+        ).round(2)
+
+        # ROIC-WACC スプレッド
+        df_rw["ROIC-WACC(%)"] = (df_rw["ROIC(%)"] - df_rw["WACC(%)"]).round(2)
+
+        # 有効データのみ残す
+        df_rw = df_rw.dropna(subset=["ROIC(%)", "WACC(%)", "ROIC-WACC(%)"])
+        df_rw = df_rw[df_rw["ROIC(%)"].between(-100, 200) & df_rw["WACC(%)"].between(0, 50)]
+        df_rw["価値創造_RW"] = df_rw["ROIC-WACC(%)"].apply(
+            lambda x: "✅ 価値創造" if x > 0 else "❌ 価値破壊"
+        )
+
+        _rw_n      = len(df_rw)
+        _rw_pos    = (df_rw["ROIC-WACC(%)"] > 0).sum()
+        _avg_roic  = df_rw["ROIC(%)"].mean()
+        _avg_wacc  = df_rw["WACC(%)"].mean()
+
+        mm1, mm2, mm3, mm4 = st.columns(4)
+        mm1.metric("✅ ROIC>WACC企業", f"{_rw_pos}社", f"全{_rw_n}社中")
+        mm2.metric("平均ROIC", f"{_avg_roic:.1f}%")
+        mm3.metric("平均WACC", f"{_avg_wacc:.1f}%")
+        mm4.metric("平均スプレッド", f"{df_rw['ROIC-WACC(%)'].mean():+.2f}%")
+
+        st.divider()
+
+        rw_t1, rw_t2, rw_t3 = st.tabs(["🏆 ランキング", "🗺️ ROIC-WACCマップ", "🏭 業種別分析"])
+
+        with rw_t1:
+            col_rw1, col_rw2 = st.columns(2)
+            with col_rw1:
+                st.markdown("**✅ 価値創造企業 上位30（ROIC > WACC）**")
+                top_rw = df_rw[df_rw["ROIC-WACC(%)"] > 0].nlargest(30, "ROIC-WACC(%)")
+
+                def _col_rw(v):
+                    if not isinstance(v, float): return ""
+                    if v >= 15: return "color:#1a7f37;font-weight:bold;font-size:14px"
+                    if v >= 5:  return "color:#1a7f37;font-weight:bold"
+                    if v > 0:   return "color:#388e3c"
+                    return ""
+
+                st.dataframe(
+                    top_rw[["企業名", "業種", "ROIC(%)", "WACC(%)", "ROIC-WACC(%)", "PBR"]]
+                    .reset_index(drop=True)
+                    .style.format({
+                        "ROIC(%)": "{:.1f}%", "WACC(%)": "{:.1f}%",
+                        "ROIC-WACC(%)": "{:+.2f}%", "PBR": "{:.2f}",
+                    }).map(_col_rw, subset=["ROIC-WACC(%)"]),
+                    use_container_width=True, hide_index=True,
+                )
+
+            with col_rw2:
+                st.markdown("**❌ 価値破壊企業 下位20（ROIC < WACC）**")
+                bot_rw = df_rw[df_rw["ROIC-WACC(%)"] <= 0].nsmallest(20, "ROIC-WACC(%)")
+
+                def _col_rw_neg(v):
+                    if not isinstance(v, float): return ""
+                    if v <= -15: return "color:#d1242f;font-weight:bold;font-size:14px"
+                    if v <= -5:  return "color:#d1242f;font-weight:bold"
+                    if v < 0:    return "color:#e57373"
+                    return ""
+
+                st.dataframe(
+                    bot_rw[["企業名", "業種", "ROIC(%)", "WACC(%)", "ROIC-WACC(%)", "PBR"]]
+                    .reset_index(drop=True)
+                    .style.format({
+                        "ROIC(%)": "{:.1f}%", "WACC(%)": "{:.1f}%",
+                        "ROIC-WACC(%)": "{:+.2f}%", "PBR": "{:.2f}",
+                    }).map(_col_rw_neg, subset=["ROIC-WACC(%)"]),
+                    use_container_width=True, hide_index=True,
+                )
+
+            csv_rw = df_rw.sort_values("ROIC-WACC(%)", ascending=False)[[
+                "企業名", "業種", "ROIC(%)", "WACC(%)", "ROIC-WACC(%)", "CoE_w(%)", "PBR", "価値創造_RW"
+            ]].to_csv(index=False, encoding="utf-8-sig")
+            st.download_button(
+                "⬇️ ROIC-WACC分析CSV", data=csv_rw,
+                file_name=f"roic_wacc_{datetime.today().strftime('%Y%m%d')}.csv",
+                mime="text/csv", key="rw_dl",
+            )
+
+        with rw_t2:
+            st.markdown("#### 🗺️ ROIC vs WACC マップ")
+            st.caption("対角線（ROIC = WACC）の**上方** = 価値創造、**下方** = 価値破壊。バブルサイズ = 時価総額")
+
+            try:
+                import plotly.express as px
+                df_rw_p = df_rw.copy()
+                df_rw_p["_abs_sp"] = df_rw_p["ROIC-WACC(%)"].abs()
+                _top_idx = df_rw_p.nlargest(20, "_abs_sp").index
+                df_rw_p["_lbl"] = ""
+                df_rw_p.loc[_top_idx, "_lbl"] = df_rw_p.loc[_top_idx, "企業名"]
+
+                fig_rw = px.scatter(
+                    df_rw_p, x="WACC(%)", y="ROIC(%)",
+                    color="価値創造_RW", text="_lbl",
+                    size=df_rw_p["時価総額(億円)"].clip(lower=100),
+                    hover_name="企業名",
+                    hover_data={
+                        "業種": True, "ROIC(%)": ":.1f", "WACC(%)": ":.1f",
+                        "ROIC-WACC(%)": ":.2f", "PBR": ":.2f",
+                        "_lbl": False, "_abs_sp": False,
+                    },
+                    title="ROIC vs WACC マップ（対角線 = 損益分岐点）",
+                    height=680,
+                    color_discrete_map={"✅ 価値創造": "#1a7f37", "❌ 価値破壊": "#d1242f"},
+                )
+                _w_rng = np.linspace(
+                    max(df_rw["WACC(%)"].min() - 1, 0),
+                    min(df_rw["WACC(%)"].max() + 1, 30), 50,
+                )
+                fig_rw.add_scatter(
+                    x=_w_rng, y=_w_rng, mode="lines",
+                    name="ROIC = WACC（損益分岐）",
+                    line=dict(color="gray", dash="dash", width=2),
+                )
+                fig_rw.add_hline(y=0, line_dash="dot", line_color="lightgray", opacity=0.4)
+                fig_rw.update_traces(
+                    textposition="top center",
+                    textfont=dict(size=8, color="rgba(0,0,0,0.72)"),
+                )
+                fig_rw.update_layout(
+                    xaxis_title="WACC (%)", yaxis_title="ROIC (%)",
+                    plot_bgcolor="white",
+                    hoverlabel=dict(bgcolor="white", font_size=12, namelength=-1),
+                )
+                st.plotly_chart(fig_rw, use_container_width=True)
+
+            except Exception as _e_rw:
+                st.error(f"チャート描画エラー: {_e_rw}")
+
+        with rw_t3:
+            st.markdown("#### 🏭 業種別 ROIC-WACC 分析")
+
+            df_sec_rw = df_rw.groupby("業種").agg(
+                ROIC平均=("ROIC(%)", "mean"),
+                WACC平均=("WACC(%)", "mean"),
+                スプレッド平均=("ROIC-WACC(%)", "mean"),
+                価値創造企業数=("ROIC-WACC(%)", lambda x: (x > 0).sum()),
+                銘柄数=("ROIC-WACC(%)", "count"),
+            ).reset_index()
+            df_sec_rw["価値創造率(%)"] = (
+                df_sec_rw["価値創造企業数"] / df_sec_rw["銘柄数"] * 100
+            ).round(1)
+            df_sec_rw = df_sec_rw.sort_values("スプレッド平均", ascending=False)
+
+            def _col_sec(v):
+                if not isinstance(v, float): return ""
+                if v > 5:  return "color:#1a7f37;font-weight:bold"
+                if v > 0:  return "color:#388e3c"
+                if v < 0:  return "color:#d1242f"
+                return ""
+
+            st.dataframe(
+                df_sec_rw.style.format({
+                    "ROIC平均": "{:.1f}%", "WACC平均": "{:.1f}%",
+                    "スプレッド平均": "{:+.2f}%", "価値創造率(%)": "{:.0f}%",
+                }).map(_col_sec, subset=["スプレッド平均"]),
+                use_container_width=True, hide_index=True,
+            )
+
+            fig_sec, ax_sec = plt.subplots(figsize=(12, 6))
+            _sec_colors = ["#1a7f37" if v > 0 else "#d1242f"
+                           for v in df_sec_rw["スプレッド平均"]]
+            ax_sec.bar(df_sec_rw["業種"], df_sec_rw["スプレッド平均"],
+                       color=_sec_colors, alpha=0.85)
+            ax_sec.axhline(0, color="black", linewidth=0.8)
+            ax_sec.set_title("業種別 平均 ROIC-WACC スプレッド", fontsize=12, fontweight="bold")
+            ax_sec.set_ylabel("スプレッド (%)")
+            ax_sec.tick_params(axis="x", rotation=45, labelsize=9)
+            ax_sec.grid(True, axis="y", alpha=0.3)
+            plt.tight_layout()
+            st.pyplot(fig_sec, clear_figure=True)
+
+
+st.divider()
+st.caption("データソース: Yahoo Finance / J-Quants / Finnhub / Alpha Vantage / TDnet / 株探 / みんかぶ / 日経 | 投資判断は自己責任で")

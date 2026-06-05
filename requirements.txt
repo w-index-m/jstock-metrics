@@ -1,0 +1,11 @@
+streamlit
+google-generativeai
+yfinance
+pandas
+numpy
+matplotlib
+python-dateutil
+groq
+pdfplumber
+beautifulsoup4
+feedparser
