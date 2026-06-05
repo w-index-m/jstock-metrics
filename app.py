@@ -1307,6 +1307,65 @@ def get_price(ticker, start, end):
 def get_benchmark(start, end):
     return _yfdownload("^N225", start=start, end=end)
 
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def compute_sharpe_all(
+    ticker_map_items: tuple, start_str: str, end_str: str, rfr: float
+) -> pd.DataFrame:
+    """全銘柄のシャープレシオ・ベータ・アルファをバッチダウンロードで一括計算。
+    225銘柄の個別ダウンロードを1回のyf.downloadに集約し初回ロードを高速化する。"""
+    tickers  = [t for t, _ in ticker_map_items]
+    name_map = {t: info for t, info in ticker_map_items}
+    try:
+        raw = yf.download(
+            tickers + ["^N225"], start=start_str, end=end_str,
+            progress=False, auto_adjust=True, threads=True,
+        )
+    except Exception:
+        return pd.DataFrame()
+    if raw.empty:
+        return pd.DataFrame()
+    close_all = raw["Close"] if isinstance(raw.columns, pd.MultiIndex) else raw
+    if "^N225" not in close_all.columns:
+        return pd.DataFrame()
+    market_ret = close_all["^N225"].dropna().pct_change().dropna()
+    market_annual = float(market_ret.mean()) * 252
+    results = []
+    for ticker in tickers:
+        if ticker not in close_all.columns:
+            continue
+        name, sector = name_map[ticker]
+        close = close_all[ticker].dropna()
+        if len(close) < 2:
+            continue
+        ret = close.pct_change().dropna()
+        common = ret.index.intersection(market_ret.index)
+        if len(common) < 30:
+            continue
+        x = ret.loc[common].to_numpy(dtype=float)
+        y = market_ret.loc[common].to_numpy(dtype=float)
+        annual_return = x.mean() * 252
+        annual_vol    = x.std() * np.sqrt(252)
+        if annual_vol == 0:
+            continue
+        try:
+            beta = np.cov(x, y)[0][1] / np.var(y)
+        except Exception:
+            beta = 0.0
+        results.append({
+            "企業名":              name,
+            "業種":                sector,
+            "年間平均リターン(%)": round(annual_return * 100, 2),
+            "年間リスク(%)":       round(annual_vol * 100, 2),
+            "シャープレシオ":      round((annual_return - rfr) / annual_vol, 4),
+            "ベータ":              round(beta, 4),
+            "アルファ(%)":         round((annual_return - beta * market_annual) * 100, 2),
+        })
+    df = pd.DataFrame(results)
+    if not df.empty:
+        df = df.sort_values("シャープレシオ", ascending=False).reset_index(drop=True)
+    return df
+
 # ================================================================
 # メインタブ
 # ================================================================
@@ -1323,121 +1382,70 @@ start_date = end_date - relativedelta(years=3)  # デフォルト3年
 # ─────────────────────────────────────────────────────────────────
 st.header("📊 パフォーマンス分析")
 st.divider()
-if True:  # 自動実行
+with st.spinner("全銘柄データを一括取得・計算中（初回のみ時間がかかります）..."):
+    df_results = compute_sharpe_all(
+        tuple(ticker_name_map.items()),
+        start_date.strftime("%Y-%m-%d"),
+        end_date.strftime("%Y-%m-%d"),
+        risk_free_rate,
+    )
 
-    with st.spinner("市場データ（日経225）を取得中..."):
-        benchmark = get_benchmark(start_date, end_date)
+if df_results.empty:
+    st.warning("分析データが取得できませんでした。しばらく後に再度お試しください。")
+else:
+    st.subheader("📋 分析結果一覧")
 
-    if benchmark.empty:
-        st.error("市場データ（日経225）取得失敗。しばらく待って再読み込みしてください。")
-    else:
+    def _color_alpha_cell(val):
+        if isinstance(val, float):
+            if val > 5:  return "color:#1a7f37;font-weight:bold"
+            elif val > 0: return "color:#388e3c"
+            elif val < 0: return "color:#d1242f"
+        return ""
 
-        _bench_close = _to_series(benchmark["Close"])
-        market_returns = _bench_close.pct_change().dropna()
-        results = []
-        progress    = st.progress(0)
-        status_text = st.empty()
+    st.dataframe(
+        df_results.style.format({
+            "年間平均リターン(%)": "{:.2f}",
+            "年間リスク(%)": "{:.2f}",
+            "シャープレシオ": "{:.2f}",
+            "ベータ": "{:.2f}",
+            "アルファ(%)": "{:+.2f}",
+        }).map(_color_alpha_cell, subset=["アルファ(%)"]),
+        use_container_width=True,
+    )
 
-        for i, (ticker, (name, sector)) in enumerate(ticker_name_map.items()):
-            status_text.text(f"取得中: {name} ({ticker})")
-            df = get_price(ticker, start_date, end_date)
-            progress.progress((i + 1) / len(ticker_name_map))
-            if df.empty:
-                continue
-            close = _to_series(df["Close"])
-            returns = close.pct_change().dropna()
-            common  = returns.index.intersection(market_returns.index)
-            if len(common) < 30:
-                continue
-            x = np.array(returns.loc[common], dtype=float).flatten()
-            y = np.array(market_returns.loc[common], dtype=float).flatten()
-            if x.ndim != 1 or y.ndim != 1 or len(x) != len(y) or len(x) == 0:
-                continue
-            annual_return = x.mean() * 252
-            annual_vol    = x.std() * np.sqrt(252)
-            if annual_vol == 0:
-                continue
-            try:
-                beta = np.cov(x, y)[0][1] / np.var(y)
-            except Exception:
-                beta = 0.0
-            sharpe = (annual_return - risk_free_rate) / annual_vol
-            # α = 銘柄年間リターン - β × 市場年間リターン
-            # yは市場リターン(日次)なので252倍で年率化
-            market_annual_ret = float(np.array(market_returns, dtype=float).mean()) * 252
-            alpha = (annual_return - beta * market_annual_ret) * 100
-            results.append({
-                "企業名":              name,
-                "業種":                sector,
-                "年間平均リターン(%)": round(annual_return * 100, 2),
-                "年間リスク(%)":       round(annual_vol * 100, 2),
-                "シャープレシオ":      round(sharpe, 4),
-                "ベータ":              round(beta, 4),
-                "アルファ(%)":         round(alpha, 2),
-            })
+    top_n_disp = int(top_n)
+    top_stocks = df_results.head(top_n_disp)
 
-        progress.empty()
-        status_text.empty()
+    fig1, ax1 = plt.subplots(figsize=(14, 6))
+    ax1.bar(top_stocks["企業名"], top_stocks["シャープレシオ"], color="green")
+    ax1.set_title(f"シャープレシオ 上位{top_n_disp}社")
+    ax1.set_ylabel("シャープレシオ")
+    ax1.tick_params(axis="x", rotation=45)
+    plt.tight_layout()
+    st.pyplot(fig1)
+    plt.close(fig1)
 
-        df_results = pd.DataFrame(results)
-        if df_results.empty:
-            st.warning("分析データが取得できませんでした。しばらく後に再度お試しください。")
-        else:
-            df_results = df_results.sort_values("シャープレシオ", ascending=False)
+    fig2, ax2 = plt.subplots(figsize=(14, 6))
+    ax2.bar(top_stocks["企業名"], top_stocks["年間平均リターン(%)"], color="steelblue")
+    ax2.set_title(f"年間平均リターン(%) 上位{top_n_disp}社")
+    ax2.set_ylabel("年間平均リターン(%)")
+    ax2.tick_params(axis="x", rotation=45)
+    plt.tight_layout()
+    st.pyplot(fig2)
+    plt.close(fig2)
 
-            st.subheader("📋 分析結果一覧")
-
-            def _color_alpha_cell(val):
-                if isinstance(val, float):
-                    if val > 5:  return "color:#1a7f37;font-weight:bold"
-                    elif val > 0: return "color:#388e3c"
-                    elif val < 0: return "color:#d1242f"
-                return ""
-
-            st.dataframe(
-                df_results.style.format({
-                    "年間平均リターン(%)": "{:.2f}",
-                    "年間リスク(%)": "{:.2f}",
-                    "シャープレシオ": "{:.2f}",
-                    "ベータ": "{:.2f}",
-                    "アルファ(%)": "{:+.2f}",
-                }).map(_color_alpha_cell, subset=["アルファ(%)"]),
-                use_container_width=True,
-            )
-
-            top_n_disp = int(top_n)
-            top_stocks = df_results.head(top_n_disp)
-
-            fig1, ax1 = plt.subplots(figsize=(14, 6))
-            ax1.bar(top_stocks["企業名"], top_stocks["シャープレシオ"], color="green")
-            ax1.set_title(f"シャープレシオ 上位{top_n_disp}社")
-            ax1.set_ylabel("シャープレシオ")
-            ax1.tick_params(axis="x", rotation=45)
-            plt.tight_layout()
-            st.pyplot(fig1)
-            plt.close(fig1)
-
-            fig2, ax2 = plt.subplots(figsize=(14, 6))
-            ax2.bar(top_stocks["企業名"], top_stocks["年間平均リターン(%)"], color="steelblue")
-            ax2.set_title(f"年間平均リターン(%) 上位{top_n_disp}社")
-        ax2.set_ylabel("年間平均リターン(%)")
-        ax2.tick_params(axis="x", rotation=45)
-        plt.tight_layout()
-        st.pyplot(fig2)
-        plt.close(fig2)
-
-        summary = top_stocks.head(5).to_string()
-        prompt = (
-            "以下は日本株のリスク・リターン分析結果です。\n"
-            "投資家向けに簡潔に300文字以内で評価してください。\n\n"
-            f"{summary}\n"
-        )
-        try:
-            comment, ai_name = generate_ai_comment(prompt)
-            st.subheader(f"🤖 AIコメント（{ai_name}）")
-            st.write(comment)
-        except Exception as e:
-            st.warning(f"AI APIエラー: {e}")
+    summary = top_stocks.head(5).to_string()
+    prompt = (
+        "以下は日本株のリスク・リターン分析結果です。\n"
+        "投資家向けに簡潔に300文字以内で評価してください。\n\n"
+        f"{summary}\n"
+    )
+    try:
+        comment, ai_name = generate_ai_comment(prompt)
+        st.subheader(f"🤖 AIコメント（{ai_name}）")
+        st.write(comment)
+    except Exception as e:
+        st.warning(f"AI APIエラー: {e}")
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -3136,6 +3144,47 @@ def _safe_float(val):
         return None
 
 
+def _build_forward_df(df_bulk: pd.DataFrame) -> pd.DataFrame:
+    """fetch_all_ticker_info_bulk の結果から来期スクリーニング用DataFrameを構築"""
+    rows = []
+    for _, row in df_bulk.iterrows():
+        trailing_per = _safe_float(row.get("PER"))
+        forward_per  = _safe_float(row.get("予想PER_raw"))
+        trailing_eps = _safe_float(row.get("実績EPS_raw"))
+        forward_eps  = _safe_float(row.get("予想EPS_raw"))
+        peg          = _safe_float(row.get("PEGレシオ_raw"))
+        rev_growth   = _safe_float(row.get("売上成長率_raw"))
+        earn_growth  = _safe_float(row.get("利益成長率_raw"))
+        op_margin    = _safe_float(row.get("営業利益率_raw"))
+        price        = _safe_float(row.get("現在株価_raw"))
+
+        if trailing_eps and forward_eps and trailing_eps != 0:
+            eps_growth = (forward_eps - trailing_eps) / abs(trailing_eps) * 100
+        elif earn_growth is not None:
+            eps_growth = earn_growth * 100
+        else:
+            eps_growth = None
+
+        if peg is None and forward_per and eps_growth and eps_growth > 0:
+            peg = forward_per / eps_growth
+
+        rows.append({
+            "企業名":        row.get("企業名"),
+            "業種":          row.get("業種"),
+            "ティッカー":    row.get("ティッカー"),
+            "現在株価":      round(price, 1) if price else None,
+            "実績PER":       round(trailing_per, 1) if trailing_per else None,
+            "予想PER":       round(forward_per, 1) if forward_per else None,
+            "実績EPS":       round(trailing_eps, 2) if trailing_eps else None,
+            "予想EPS":       round(forward_eps, 2) if forward_eps else None,
+            "EPS成長率(%)":  round(eps_growth, 1) if eps_growth is not None else None,
+            "売上成長率(%)": round(rev_growth * 100, 1) if rev_growth is not None else None,
+            "営業利益率(%)": round(op_margin * 100, 1) if op_margin is not None else None,
+            "PEGレシオ":     round(peg, 2) if peg is not None else None,
+        })
+    return pd.DataFrame(rows)
+
+
 # ── サイドバー設定 ──────────────────────────────────────────────
 with st.sidebar:
     st.divider()
@@ -3154,61 +3203,10 @@ st.info(
     f"営業利益率 ≥ {fwd_op_margin}%"
 )
 
-# ── データ取得 ──────────────────────────────────────────────────
-with st.spinner(f"来期指標を取得中（{len(ticker_name_map)}銘柄）..."):
-    fwd_results = []
-    fwd_progress = st.progress(0)
-    fwd_status   = st.empty()
-
-    for idx, (ticker, (name, sector)) in enumerate(ticker_name_map.items()):
-        fwd_status.text(f"取得中: {name} ({ticker})")
-        fwd_progress.progress((idx + 1) / len(ticker_name_map))
-
-        m = fetch_forward_metrics(ticker)
-        if not m:
-            continue
-
-        trailing_per   = _safe_float(m.get("trailing_per"))
-        forward_per    = _safe_float(m.get("forward_per"))
-        trailing_eps   = _safe_float(m.get("trailing_eps"))
-        forward_eps    = _safe_float(m.get("forward_eps"))
-        peg            = _safe_float(m.get("peg_ratio"))
-        rev_growth     = _safe_float(m.get("revenue_growth"))
-        earn_growth    = _safe_float(m.get("earnings_growth"))
-        op_margin      = _safe_float(m.get("operating_margins"))
-        price          = _safe_float(m.get("price"))
-
-        # EPS成長率（yfinance）
-        if trailing_eps and forward_eps and trailing_eps != 0:
-            eps_growth_yf = (forward_eps - trailing_eps) / abs(trailing_eps) * 100
-        elif earn_growth is not None:
-            eps_growth_yf = earn_growth * 100
-        else:
-            eps_growth_yf = None
-
-        # PEG計算（なければ自前計算）
-        if peg is None and forward_per and eps_growth_yf and eps_growth_yf > 0:
-            peg = forward_per / eps_growth_yf
-
-        fwd_results.append({
-            "企業名":          name,
-            "業種":            sector,
-            "ティッカー":      ticker,
-            "現在株価":        round(price, 1) if price else None,
-            "実績PER":         round(trailing_per, 1) if trailing_per else None,
-            "予想PER":         round(forward_per, 1) if forward_per else None,
-            "実績EPS":         round(trailing_eps, 2) if trailing_eps else None,
-            "予想EPS":         round(forward_eps, 2) if forward_eps else None,
-            "EPS成長率(%)":    round(eps_growth_yf, 1) if eps_growth_yf is not None else None,
-            "売上成長率(%)":   round(rev_growth * 100, 1) if rev_growth is not None else None,
-            "営業利益率(%)":   round(op_margin * 100, 1) if op_margin is not None else None,
-            "PEGレシオ":       round(peg, 2) if peg is not None else None,
-        })
-
-    fwd_progress.empty()
-    fwd_status.empty()
-
-df_fwd = pd.DataFrame(fwd_results)
+# ── データ取得（fetch_all_ticker_info_bulk のキャッシュを流用）──
+with st.spinner("来期指標を集計中（並列取得済みデータを使用）..."):
+    _df_bulk_fwd = fetch_all_ticker_info_bulk(tuple(ticker_name_map.items()))
+    df_fwd = _build_forward_df(_df_bulk_fwd)
 
 if df_fwd.empty:
     st.error("データを取得できませんでした")
@@ -3538,30 +3536,37 @@ else:
 from datetime import timedelta as _fac_td
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_factor_metrics(ticker_name_map: dict) -> pd.DataFrame:
-    """時価総額・PBR・PER等のファクターデータを並列取得"""
+def fetch_all_ticker_info_bulk(ticker_map_items: tuple) -> pd.DataFrame:
+    """全銘柄のyfinance情報を並列一括取得（factor・forward metrics統合版）。
+    yf.Ticker().info の呼び出しを225回 → 1セットの並列処理に集約する。"""
     import concurrent.futures as _cfe
 
-    def _get(item):
+    def _get_one(item):
         ticker, (name, sector) = item
         try:
             info = yf.Ticker(ticker).info
             return {
                 "企業名": name, "業種": sector, "ティッカー": ticker,
-                "時価総額":      info.get("marketCap"),
-                "PBR":           info.get("priceToBook"),
-                "PER":           info.get("trailingPE"),
-                "PSR":           info.get("priceToSalesTrailing12Months"),
-                "配当利回り(%)": round((info.get("dividendYield") or 0) * 100, 2),
-                "ROE(%)":        round((info.get("returnOnEquity") or 0) * 100, 2),
+                "時価総額":       info.get("marketCap"),
+                "PBR":            info.get("priceToBook"),
+                "PER":            info.get("trailingPE"),
+                "PSR":            info.get("priceToSalesTrailing12Months"),
+                "配当利回り(%)":  round((info.get("dividendYield") or 0) * 100, 2),
+                "ROE(%)":         round((info.get("returnOnEquity") or 0) * 100, 2),
+                "予想PER_raw":    info.get("forwardPE"),
+                "実績EPS_raw":    info.get("trailingEps"),
+                "予想EPS_raw":    info.get("forwardEps"),
+                "PEGレシオ_raw":  info.get("pegRatio"),
+                "売上成長率_raw": info.get("revenueGrowth"),
+                "利益成長率_raw": info.get("earningsGrowth"),
+                "営業利益率_raw": info.get("operatingMargins"),
+                "現在株価_raw":   info.get("currentPrice") or info.get("regularMarketPrice"),
             }
         except Exception:
-            return {"企業名": name, "業種": sector, "ティッカー": ticker,
-                    "時価総額": None, "PBR": None, "PER": None,
-                    "PSR": None, "配当利回り(%)": None, "ROE(%)": None}
+            return {"企業名": name, "業種": sector, "ティッカー": ticker}
 
     with _cfe.ThreadPoolExecutor(max_workers=12) as ex:
-        results = list(ex.map(_get, ticker_name_map.items()))
+        results = list(ex.map(_get_one, ticker_map_items))
     return pd.DataFrame(results)
 
 
@@ -3598,9 +3603,8 @@ def _port_returns(tickers, start, end, max_n=20):
     return pd.concat(rets, axis=1).mean(axis=1)
 
 
-# ─── ファクターデータ一括取得 ────────────────────────────────────
-with st.spinner(f"サイズ・バリューファクターデータ取得中（{len(ticker_name_map)}銘柄）..."):
-    df_factor = fetch_factor_metrics(ticker_name_map)
+# ─── ファクターデータ（fetch_all_ticker_info_bulk のキャッシュを流用）────
+df_factor = fetch_all_ticker_info_bulk(tuple(ticker_name_map.items()))
 
 df_factor["サイズ分類"]    = df_factor["時価総額"].apply(_size_label)
 df_factor["バリュー分類"]  = df_factor["PBR"].apply(_value_label)
