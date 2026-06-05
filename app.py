@@ -661,12 +661,14 @@ def get_price_volume_scatter(ticker_name_map: dict, days: int = 20) -> pd.DataFr
     for ticker, (name, sector) in ticker_name_map.items():
         try:
             df = _yfdownload(ticker, start=start_date, end=end_date, progress=False)
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.droplevel(1)
             if df.empty or len(df) < 5:
                 continue
-            price_chg = (df["Close"].iloc[-1] - df["Close"].iloc[0]) / df["Close"].iloc[0] * 100
-            vol_chg   = (df["Volume"].iloc[-5:].mean() - df["Volume"].iloc[:5].mean()) / (df["Volume"].iloc[:5].mean() + 1) * 100
+            close  = _to_series(df["Close"]).dropna()
+            volume = _to_series(df["Volume"]).dropna()
+            if len(close) < 5 or len(volume) < 10:
+                continue
+            price_chg = (close.iloc[-1] - close.iloc[0]) / close.iloc[0] * 100
+            vol_chg   = (volume.iloc[-5:].mean() - volume.iloc[:5].mean()) / (volume.iloc[:5].mean() + 1) * 100
             results.append({
                 "企業名": name, "業種": sector,
                 "株価騰落率(%)": round(float(price_chg), 2),
@@ -773,6 +775,14 @@ def plot_pv_scatter(df: pd.DataFrame) -> None:
 
     except ImportError:
         # plotlyが無い場合はmatplotlibにフォールバック
+        pass
+    except Exception as _pv_err:
+        st.error(f"チャート描画エラー: {_pv_err}")
+        return
+    else:
+        return  # plotly成功時はここで終了
+
+    # matplotlib fallback（plotly未インストール時のみ到達）
         sectors = df["業種"].unique()
         cmap = plt.cm.get_cmap("tab20", len(sectors))
         sector_color = {sec: cmap(i) for i, sec in enumerate(sectors)}
@@ -1943,7 +1953,9 @@ if run_volume:
     with st.spinner("散布図データ取得中..."):
         df_pv = get_price_volume_scatter(ticker_name_map, days=pv_days)
 
-    if not df_pv.empty:
+    if df_pv.empty:
+        st.info("散布図データを取得できませんでした。しばらく待って再読み込みしてください。")
+    else:
         plot_pv_scatter(df_pv)
 
         q1 = df_pv[(df_pv["株価騰落率(%)"] > 0) & (df_pv["出来高変化率(%)"] > 0)]
@@ -3185,6 +3197,41 @@ def _build_forward_df(df_bulk: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_all_ticker_info_bulk(ticker_map_items: tuple) -> pd.DataFrame:
+    """全銘柄のyfinance情報を並列一括取得（factor・forward metrics統合版）。
+    yf.Ticker().info の呼び出しを225回 → 1セットの並列処理に集約する。"""
+    import concurrent.futures as _cfe
+
+    def _get_one(item):
+        ticker, (name, sector) = item
+        try:
+            info = yf.Ticker(ticker).info
+            return {
+                "企業名": name, "業種": sector, "ティッカー": ticker,
+                "時価総額":       info.get("marketCap"),
+                "PBR":            info.get("priceToBook"),
+                "PER":            info.get("trailingPE"),
+                "PSR":            info.get("priceToSalesTrailing12Months"),
+                "配当利回り(%)":  round((info.get("dividendYield") or 0) * 100, 2),
+                "ROE(%)":         round((info.get("returnOnEquity") or 0) * 100, 2),
+                "予想PER_raw":    info.get("forwardPE"),
+                "実績EPS_raw":    info.get("trailingEps"),
+                "予想EPS_raw":    info.get("forwardEps"),
+                "PEGレシオ_raw":  info.get("pegRatio"),
+                "売上成長率_raw": info.get("revenueGrowth"),
+                "利益成長率_raw": info.get("earningsGrowth"),
+                "営業利益率_raw": info.get("operatingMargins"),
+                "現在株価_raw":   info.get("currentPrice") or info.get("regularMarketPrice"),
+            }
+        except Exception:
+            return {"企業名": name, "業種": sector, "ティッカー": ticker}
+
+    with _cfe.ThreadPoolExecutor(max_workers=12) as ex:
+        results = list(ex.map(_get_one, ticker_map_items))
+    return pd.DataFrame(results)
+
+
 # ── サイドバー設定 ──────────────────────────────────────────────
 with st.sidebar:
     st.divider()
@@ -3534,40 +3581,6 @@ else:
 # =================================================================
 
 from datetime import timedelta as _fac_td
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_all_ticker_info_bulk(ticker_map_items: tuple) -> pd.DataFrame:
-    """全銘柄のyfinance情報を並列一括取得（factor・forward metrics統合版）。
-    yf.Ticker().info の呼び出しを225回 → 1セットの並列処理に集約する。"""
-    import concurrent.futures as _cfe
-
-    def _get_one(item):
-        ticker, (name, sector) = item
-        try:
-            info = yf.Ticker(ticker).info
-            return {
-                "企業名": name, "業種": sector, "ティッカー": ticker,
-                "時価総額":       info.get("marketCap"),
-                "PBR":            info.get("priceToBook"),
-                "PER":            info.get("trailingPE"),
-                "PSR":            info.get("priceToSalesTrailing12Months"),
-                "配当利回り(%)":  round((info.get("dividendYield") or 0) * 100, 2),
-                "ROE(%)":         round((info.get("returnOnEquity") or 0) * 100, 2),
-                "予想PER_raw":    info.get("forwardPE"),
-                "実績EPS_raw":    info.get("trailingEps"),
-                "予想EPS_raw":    info.get("forwardEps"),
-                "PEGレシオ_raw":  info.get("pegRatio"),
-                "売上成長率_raw": info.get("revenueGrowth"),
-                "利益成長率_raw": info.get("earningsGrowth"),
-                "営業利益率_raw": info.get("operatingMargins"),
-                "現在株価_raw":   info.get("currentPrice") or info.get("regularMarketPrice"),
-            }
-        except Exception:
-            return {"企業名": name, "業種": sector, "ティッカー": ticker}
-
-    with _cfe.ThreadPoolExecutor(max_workers=12) as ex:
-        results = list(ex.map(_get_one, ticker_map_items))
-    return pd.DataFrame(results)
 
 
 def _size_label(mc):
