@@ -1387,6 +1387,13 @@ end_date   = datetime.today()
 start_date = end_date - relativedelta(years=3)  # デフォルト3年
 
 
+
+st.markdown("""
+<div style="background-color:#1565c0;color:white;padding:14px 24px;border-radius:10px;margin:32px 0 6px 0;font-size:20px;font-weight:bold;">
+📊&nbsp; A.&nbsp;コア分析&emsp;<span style="font-size:13px;font-weight:400;opacity:0.88">シャープレシオ・アルファ・ベータ</span>
+</div>
+""", unsafe_allow_html=True)
+
 # ─── Tab1: パフォーマンス分析 ────────────────────────────────────
 
 # ─────────────────────────────────────────────────────────────────
@@ -1734,6 +1741,13 @@ else:
 
 
 # ─── Tab2: セクターローテーション ────────────────────────────────
+
+st.markdown("""
+<div style="background-color:#2e7d32;color:white;padding:14px 24px;border-radius:10px;margin:32px 0 6px 0;font-size:20px;font-weight:bold;">
+📈&nbsp; B.&nbsp;テクニカル・需給分析&emsp;<span style="font-size:13px;font-weight:400;opacity:0.88">価格パターン / 需給 / モメンタム / セクター / J-Quants</span>
+</div>
+""", unsafe_allow_html=True)
+
 
 # ─────────────────────────────────────────────────────────────────
 st.header("🔄 セクターローテーション")
@@ -2222,136 +2236,6 @@ else:
     )
 
 
-# ─── Tab6: 銘柄別ニュース ─────────────────────────────────────────
-
-# ─────────────────────────────────────────────────────────────────
-st.header("📰 銘柄別ニュース")
-st.divider()
-st.subheader("📰 銘柄別ニュース・適時開示")
-
-ticker_options = {f"{name}（{t}）": t for t, (name, _) in ticker_name_map.items()}
-selected_label = st.selectbox(
-    "銘柄を選択", list(ticker_options.keys()),
-    index=list(ticker_options.keys()).index("トヨタ（7203.T）")
-    if "トヨタ（7203.T）" in ticker_options else 0
-)
-selected_ticker = ticker_options[selected_label]
-selected_name   = ticker_name_map[selected_ticker][0]
-
-col_btn1, col_btn2 = st.columns([1, 4])
-with col_btn1:
-    run_news = True  # 自動実行
-with col_btn2:
-    run_ai   = st.checkbox("🤖 AIによる要約・センチメント分析も行う", value=True)
-
-if run_news:
-    with st.spinner(f"{selected_name} のニュースを全ソースから取得中..."):
-        all_news = fetch_all_news(selected_ticker, news_max_per_source)
-
-    filtered = [n for n in all_news if n["source"] in show_news_sources] if show_news_sources else all_news
-
-    if not filtered:
-        st.warning("ニュースが取得できませんでした（ソース設定を確認してください）")
-    else:
-        source_colors = {
-            "Yahoo!Finance JP":  "🟦",
-            "株探(Kabutan)":     "🟩",
-            "みんかぶ":          "🟨",
-            "TDnet（適時開示）": "🟥",
-            "日経新聞":          "⬛",
-            "Reuters JP":        "🟫",
-        }
-
-        from collections import Counter
-        src_counts = Counter(n["source"] for n in filtered)
-        cols_stat  = st.columns(len(src_counts))
-        for i, (src, cnt) in enumerate(src_counts.items()):
-            icon = source_colors.get(src, "⚪")
-            cols_stat[i].metric(f"{icon} {src}", f"{cnt}件")
-
-        st.divider()
-
-        for item in filtered:
-            icon = source_colors.get(item["source"], "⚪")
-            with st.expander(f"{icon} [{item['source']}] {item['title'][:60]}{'...' if len(item['title'])>60 else ''}"):
-                c1, c2 = st.columns([3, 1])
-                with c1:
-                    st.markdown(f"**{item['title']}**")
-                    if item.get("summary"):
-                        st.caption(item["summary"])
-                with c2:
-                    if item.get("date"):
-                        st.caption(f"📅 {item['date']}")
-                    if item.get("link"):
-                        st.markdown(f"[🔗 記事を開く]({item['link']})")
-
-        if run_ai:
-            st.divider()
-            st.subheader("🤖 AI ニュース分析（センチメント）")
-            with st.spinner("AI分析中..."):
-                ai_result = ai_news_summary(filtered, selected_name, selected_ticker)
-            st.info(ai_result)
-
-
-# ─── Tab7: 市場全体ニュース ──────────────────────────────────────
-
-# ─────────────────────────────────────────────────────────────────
-st.header("🌐 市場全体ニュース")
-st.divider()
-st.subheader("🌐 市場全体ニュース（日経・Reuters）")
-
-if True:  # 自動実行
-    import concurrent.futures
-
-    with st.spinner("市場ニュースを取得中..."):
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
-            f_nikkei  = ex.submit(fetch_nikkei_market_rss, 10)
-            f_reuters = ex.submit(fetch_reuters_jp_rss, 10)
-            nikkei_news  = f_nikkei.result()
-            reuters_news = f_reuters.result()
-
-    col_n, col_r = st.columns(2)
-
-    with col_n:
-        st.markdown("### ⬛ 日経新聞 マーケットニュース")
-        if nikkei_news:
-            for item in nikkei_news:
-                st.markdown(f"- [{item['title']}]({item['link']})")
-                if item.get("date"):
-                    st.caption(f"  📅 {item['date']}")
-        else:
-            st.info("取得できませんでした（日経新聞RSSは会員制の場合があります）")
-
-    with col_r:
-        st.markdown("### 🟫 Reuters Japan ビジネスニュース")
-        if reuters_news:
-            for item in reuters_news:
-                st.markdown(f"- [{item['title']}]({item['link']})")
-                if item.get("date"):
-                    st.caption(f"  📅 {item['date']}")
-        else:
-            st.info("取得できませんでした")
-
-    all_market = nikkei_news + reuters_news
-    if all_market and st.checkbox("🤖 市場全体のAI要約を表示", value=True):
-        headlines = "\n".join(f"[{n['source']}] {n['title']}" for n in all_market[:12])
-        prompt = (
-            "以下は本日の日本株マーケット関連ニュースです。\n\n"
-            f"{headlines}\n\n"
-            "投資家向けに300文字以内でまとめてください:\n"
-            "1. 本日の市場全体のセンチメント\n"
-            "2. 注目テーマ・セクター\n"
-            "3. 今後の注意点\n"
-        )
-        with st.spinner("AI要約中..."):
-            try:
-                comment, ai_name = generate_ai_comment(prompt)
-                st.subheader(f"🤖 市場全体AI要約（{ai_name}）")
-                st.info(comment)
-            except Exception as e:
-                st.warning(f"AI APIエラー: {e}")
-
-
 # ================================================================
 # J-Quants APIクライアント（V2対応）
 # ================================================================
@@ -2680,422 +2564,12 @@ def _av_get(func: str, params: dict = {}) -> dict:
         return {}
 
 
-# ─────────────────────────────────────────────────────────────────
-st.header("📡 Finnhub リアルタイム情報")
-st.caption("Finnhub APIによるリアルタイム株価・決算・インサイダー・ニュース")
 
-fh_key = st.secrets.get("FINNHUB_API_KEY", "")
-if not fh_key:
-    st.warning("⚠️ `FINNHUB_API_KEY` を Streamlit Secrets に追加してください")
-else:
-    fh_t1, fh_t2, fh_t3, fh_t4 = st.tabs([
-        "💹 リアルタイム株価",
-        "📊 決算サプライズ",
-        "🕵️ インサイダー取引",
-        "📰 企業ニュース",
-    ])
-
-    # ── Tab1: リアルタイム株価・為替 ────────────────────────────
-    with fh_t1:
-        st.markdown("#### 💹 リアルタイム株価・為替クォート")
-
-        col_fh1, col_fh2 = st.columns(2)
-        with col_fh1:
-            st.markdown("**米国株 (例: AAPL, TSLA, NVDA)**")
-            us_syms = st.text_input(
-                "ティッカー（カンマ区切り）",
-                value="AAPL,TSLA,NVDA,MSFT,GOOGL",
-                key="fh_us_syms"
-            ).upper().split(",")
-
-            quote_rows = []
-            for sym in [s.strip() for s in us_syms if s.strip()]:
-                q = _fh_get("/quote", {"symbol": sym})
-                if q.get("c"):
-                    chg = q["c"] - q["pc"]
-                    chg_pct = chg / q["pc"] * 100 if q["pc"] else 0
-                    quote_rows.append({
-                        "銘柄": sym,
-                        "現在値": q["c"],
-                        "前日比": round(chg, 2),
-                        "変化率(%)": round(chg_pct, 2),
-                        "高値": q.get("h", "-"),
-                        "安値": q.get("l", "-"),
-                        "始値": q.get("o", "-"),
-                    })
-
-            if quote_rows:
-                df_q = pd.DataFrame(quote_rows)
-                def _color_chg(val):
-                    if isinstance(val, float):
-                        if val > 0: return "color:#1a7f37;font-weight:bold"
-                        if val < 0: return "color:#d1242f;font-weight:bold"
-                    return ""
-                st.dataframe(
-                    df_q.style.map(_color_chg, subset=["前日比","変化率(%)"]),
-                    use_container_width=True, hide_index=True
-                )
-
-        with col_fh2:
-            st.markdown("**為替クォート (Forex)**")
-            fx_pairs = [
-                ("USD","JPY"),("EUR","JPY"),("GBP","JPY"),
-                ("EUR","USD"),("AUD","JPY"),
-            ]
-            fx_rows = []
-            for base, quote in fx_pairs:
-                d = _fh_get("/forex/rates", {"base": base})
-                rates = d.get("quote", {})
-                if quote in rates:
-                    fx_rows.append({
-                        "ペア": f"{base}/{quote}",
-                        "レート": round(float(rates[quote]), 4),
-                    })
-            if fx_rows:
-                st.dataframe(pd.DataFrame(fx_rows), use_container_width=True, hide_index=True)
-
-    # ── Tab2: 決算サプライズ ─────────────────────────────────────
-    with fh_t2:
-        st.markdown("#### 📊 決算サプライズ（EPS予想 vs 実績）")
-        eps_sym = st.text_input("銘柄コード", value="AAPL", key="fh_eps_sym").upper()
-        if eps_sym:
-            data = _fh_get("/stock/earnings", {"symbol": eps_sym, "limit": 8})
-            if data:
-                rows = []
-                for item in (data if isinstance(data, list) else []):
-                    surprise = item.get("surprise", 0) or 0
-                    rows.append({
-                        "決算期": item.get("period", ""),
-                        "EPS予想": item.get("estimate", "-"),
-                        "EPS実績": item.get("actual", "-"),
-                        "サプライズ": round(surprise, 4),
-                        "サプライズ(%)": round(item.get("surprisePercent", 0) or 0, 2),
-                    })
-                if rows:
-                    df_eps = pd.DataFrame(rows)
-                    def _color_sur(val):
-                        if isinstance(val, (int, float)):
-                            if val > 0: return "color:#1a7f37;font-weight:bold"
-                            if val < 0: return "color:#d1242f;font-weight:bold"
-                        return ""
-                    st.dataframe(
-                        df_eps.style.map(_color_sur, subset=["サプライズ","サプライズ(%)"]),
-                        use_container_width=True, hide_index=True
-                    )
-                    # サプライズ推移チャート
-                    if "サプライズ(%)" in df_eps.columns and len(df_eps) > 1:
-                        fig_eps, ax_eps = plt.subplots(figsize=(8, 3))
-                        colors = ["#1a7f37" if v >= 0 else "#d1242f"
-                                  for v in df_eps["サプライズ(%)"][::-1]]
-                        ax_eps.bar(df_eps["決算期"][::-1],
-                                   df_eps["サプライズ(%)"][::-1], color=colors)
-                        ax_eps.axhline(0, color="gray", linewidth=0.8)
-                        ax_eps.set_title(f"{eps_sym} EPS Surprise (%)", fontsize=11)
-                        ax_eps.set_ylabel("Surprise %")
-                        plt.xticks(rotation=45)
-                        plt.tight_layout()
-                        st.pyplot(fig_eps, clear_figure=True)
-                else:
-                    st.info("決算データなし")
-            else:
-                st.warning("データ取得失敗（銘柄コードを確認）")
-
-    # ── Tab3: インサイダー取引 ───────────────────────────────────
-    with fh_t3:
-        st.markdown("#### 🕵️ インサイダー取引情報")
-        ins_sym = st.text_input("銘柄コード", value="AAPL", key="fh_ins_sym").upper()
-        if ins_sym:
-            data = _fh_get("/stock/insider-transactions", {"symbol": ins_sym})
-            txns = data.get("data", [])[:20]
-            if txns:
-                rows = []
-                for t in txns:
-                    rows.append({
-                        "日付": t.get("transactionDate", ""),
-                        "氏名": t.get("name", ""),
-                        "役職": t.get("share", ""),
-                        "取引種別": t.get("transactionCode", ""),
-                        "株数": t.get("share", 0),
-                        "単価": t.get("transactionPrice", "-"),
-                        "売買区分": "買い" if str(t.get("transactionCode","")) in ["P","A"] else "売り",
-                    })
-                df_ins = pd.DataFrame(rows)
-                def _color_trade(val):
-                    if val == "買い": return "color:#1a7f37;font-weight:bold"
-                    if val == "売り": return "color:#d1242f;font-weight:bold"
-                    return ""
-                st.dataframe(
-                    df_ins.style.map(_color_trade, subset=["売買区分"]),
-                    use_container_width=True, hide_index=True
-                )
-            else:
-                st.info("インサイダー取引データなし")
-
-    # ── Tab4: 企業ニュース ───────────────────────────────────────
-    with fh_t4:
-        st.markdown("#### 📰 企業ニュースフィード")
-        news_sym = st.text_input("銘柄コード", value="AAPL", key="fh_news_sym").upper()
-        from datetime import timedelta
-        today_str = datetime.today().strftime("%Y-%m-%d")
-        week_ago  = (datetime.today() - timedelta(days=7)).strftime("%Y-%m-%d")
-
-        if news_sym:
-            items = _fh_get("/company-news", {
-                "symbol": news_sym, "from": week_ago, "to": today_str
-            })
-            if isinstance(items, list) and items:
-                for item in items[:15]:
-                    with st.expander(f"[{item.get('source','')}] {item.get('headline','')[:80]}"):
-                        st.markdown(f"**{item.get('headline','')}**")
-                        st.caption(f"📅 {item.get('datetime','')}")
-                        st.write(item.get("summary","")[:300])
-                        if item.get("url"):
-                            st.markdown(f"[🔗 記事を開く]({item['url']})")
-            else:
-                st.info("ニュースデータなし（直近7日）")
-
-
-# ─────────────────────────────────────────────────────────────────
-st.header("📈 Alpha Vantage テクニカル分析・経済指標")
-st.caption("Alpha Vantage APIによるテクニカル指標・経済指標・セクター分析")
-
-av_key = st.secrets.get("ALPHA_VANTAGE_KEY", "")
-if not av_key:
-    st.warning("⚠️ `ALPHA_VANTAGE_KEY` を Streamlit Secrets に追加してください")
-else:
-    av_t1, av_t2, av_t3 = st.tabs([
-        "📉 テクニカル指標",
-        "🌐 経済指標",
-        "🏭 セクターパフォーマンス",
-    ])
-
-    # ── Tab1: テクニカル指標 ─────────────────────────────────────
-    with av_t1:
-        st.markdown("#### 📉 テクニカル指標（RSI・MACD・ボリンジャーバンド）")
-
-        col_av1, col_av2 = st.columns(2)
-        with col_av1:
-            av_sym = st.text_input("銘柄コード", value="AAPL", key="av_sym").upper()
-        with col_av2:
-            av_interval = st.selectbox("時間足", ["daily","weekly","monthly"], key="av_int")
-
-        if av_sym:
-            st.markdown("---")
-            # RSI
-            with st.spinner("RSI取得中..."):
-                rsi_data = _av_get("RSI", {
-                    "symbol": av_sym, "interval": av_interval,
-                    "time_period": 14, "series_type": "close"
-                })
-            rsi_ts = rsi_data.get("Technical Analysis: RSI", {})
-
-            # MACD
-            with st.spinner("MACD取得中..."):
-                macd_data = _av_get("MACD", {
-                    "symbol": av_sym, "interval": av_interval,
-                    "series_type": "close"
-                })
-            macd_ts = macd_data.get("Technical Analysis: MACD", {})
-
-            # BBANDS
-            with st.spinner("ボリンジャーバンド取得中..."):
-                bb_data = _av_get("BBANDS", {
-                    "symbol": av_sym, "interval": av_interval,
-                    "time_period": 20, "series_type": "close"
-                })
-            bb_ts = bb_data.get("Technical Analysis: BBANDS", {})
-
-            if rsi_ts:
-                dates = sorted(rsi_ts.keys(), reverse=True)[:60]
-                df_rsi = pd.DataFrame({
-                    "Date": pd.to_datetime(dates),
-                    "RSI":  [float(rsi_ts[d]["RSI"]) for d in dates],
-                })
-                fig_rsi, ax_rsi = plt.subplots(figsize=(12, 3))
-                ax_rsi.plot(df_rsi["Date"], df_rsi["RSI"], color="#1565c0", linewidth=1.8)
-                ax_rsi.axhline(70, color="#d1242f", linestyle="--", alpha=0.7, label="過買い(70)")
-                ax_rsi.axhline(30, color="#1a7f37", linestyle="--", alpha=0.7, label="過売り(30)")
-                ax_rsi.fill_between(df_rsi["Date"], 70, df_rsi["RSI"].clip(lower=70),
-                                    alpha=0.15, color="#d1242f")
-                ax_rsi.fill_between(df_rsi["Date"], df_rsi["RSI"].clip(upper=30), 30,
-                                    alpha=0.15, color="#1a7f37")
-                ax_rsi.set_title(f"{av_sym} RSI(14) - {av_interval}", fontsize=11)
-                ax_rsi.set_ylim(0, 100)
-                ax_rsi.legend(fontsize=8)
-                ax_rsi.grid(True, alpha=0.25)
-                plt.xticks(rotation=45); plt.tight_layout()
-                st.pyplot(fig_rsi, clear_figure=True)
-
-                latest_rsi = float(rsi_ts[dates[0]]["RSI"])
-                if latest_rsi >= 70:
-                    st.warning(f"⚠️ RSI {latest_rsi:.1f} — 過買い圏（売り圧力に注意）")
-                elif latest_rsi <= 30:
-                    st.success(f"✅ RSI {latest_rsi:.1f} — 過売り圏（反発候補）")
-                else:
-                    st.info(f"📊 RSI {latest_rsi:.1f} — 中立圏")
-
-            if macd_ts:
-                dates_m = sorted(macd_ts.keys(), reverse=True)[:60]
-                df_macd = pd.DataFrame({
-                    "Date":     pd.to_datetime(dates_m),
-                    "MACD":     [float(macd_ts[d]["MACD"]) for d in dates_m],
-                    "Signal":   [float(macd_ts[d]["MACD_Signal"]) for d in dates_m],
-                    "Hist":     [float(macd_ts[d]["MACD_Hist"]) for d in dates_m],
-                })
-                fig_macd, (ax_m1, ax_m2) = plt.subplots(2, 1, figsize=(12, 5),
-                                                          gridspec_kw={"height_ratios": [2,1]})
-                ax_m1.plot(df_macd["Date"], df_macd["MACD"],
-                           color="#1565c0", linewidth=1.5, label="MACD")
-                ax_m1.plot(df_macd["Date"], df_macd["Signal"],
-                           color="#e91e63", linewidth=1.5, linestyle="--", label="Signal")
-                ax_m1.axhline(0, color="gray", linewidth=0.6)
-                ax_m1.legend(fontsize=8); ax_m1.grid(True, alpha=0.25)
-                ax_m1.set_title(f"{av_sym} MACD - {av_interval}", fontsize=11)
-                colors_hist = ["#1a7f37" if v >= 0 else "#d1242f" for v in df_macd["Hist"]]
-                ax_m2.bar(df_macd["Date"], df_macd["Hist"], color=colors_hist, alpha=0.8, width=2)
-                ax_m2.axhline(0, color="gray", linewidth=0.6)
-                ax_m2.set_ylabel("Histogram"); ax_m2.grid(True, alpha=0.25)
-                plt.xticks(rotation=45); plt.tight_layout()
-                st.pyplot(fig_macd, clear_figure=True)
-
-            if bb_ts:
-                dates_b = sorted(bb_ts.keys(), reverse=True)[:60]
-                df_bb = pd.DataFrame({
-                    "Date":  pd.to_datetime(dates_b),
-                    "Upper": [float(bb_ts[d]["Real Upper Band"]) for d in dates_b],
-                    "Mid":   [float(bb_ts[d]["Real Middle Band"]) for d in dates_b],
-                    "Lower": [float(bb_ts[d]["Real Lower Band"]) for d in dates_b],
-                })
-                fig_bb, ax_bb = plt.subplots(figsize=(12, 4))
-                ax_bb.plot(df_bb["Date"], df_bb["Upper"],
-                           color="#d1242f", linewidth=1.2, linestyle="--", label="Upper")
-                ax_bb.plot(df_bb["Date"], df_bb["Mid"],
-                           color="#1565c0", linewidth=1.5, label="Middle(SMA20)")
-                ax_bb.plot(df_bb["Date"], df_bb["Lower"],
-                           color="#1a7f37", linewidth=1.2, linestyle="--", label="Lower")
-                ax_bb.fill_between(df_bb["Date"], df_bb["Upper"], df_bb["Lower"],
-                                   alpha=0.07, color="#1565c0")
-                ax_bb.legend(fontsize=8); ax_bb.grid(True, alpha=0.25)
-                ax_bb.set_title(f"{av_sym} Bollinger Bands(20) - {av_interval}", fontsize=11)
-                plt.xticks(rotation=45); plt.tight_layout()
-                st.pyplot(fig_bb, clear_figure=True)
-
-            if not any([rsi_ts, macd_ts, bb_ts]):
-                st.warning("データ取得失敗（無料枠は1分5回制限。少し待ってから再試行してください）")
-
-    # ── Tab2: 経済指標 ───────────────────────────────────────────
-    with av_t2:
-        st.markdown("#### 🌐 主要経済指標")
-
-        INDICATORS = {
-            "実質GDP成長率(米)":        ("REAL_GDP",            "annualReports"),
-            "CPI（インフレ率）":         ("CPI",                 "data"),
-            "失業率":                    ("UNEMPLOYMENT",        "data"),
-            "FF金利（政策金利）":        ("FEDERAL_FUNDS_RATE",  "data"),
-            "米国小売売上高":            ("RETAIL_SALES",        "data"),
-            "消費者信頼感指数":          ("CONSUMER_CONFIDENCE", "data"),
-        }
-
-        ind_choice = st.selectbox("指標を選択", list(INDICATORS.keys()), key="av_ind")
-        func, key_path = INDICATORS[ind_choice]
-
-        with st.spinner(f"{ind_choice} 取得中..."):
-            ind_data = _av_get(func, {"interval": "monthly" if func not in ["REAL_GDP"] else "annual"})
-
-        series = ind_data.get(key_path, ind_data.get("data", []))
-        if series:
-            rows = []
-            for item in (series[:36] if isinstance(series, list) else []):
-                rows.append({
-                    "日付": item.get("date", item.get("fiscalDateEnding", "")),
-                    "値":   item.get("value", item.get("reportedEPS", "")),
-                })
-            if rows:
-                df_ind = pd.DataFrame(rows)
-                df_ind["日付"] = pd.to_datetime(df_ind["日付"], errors="coerce")
-                df_ind["値"]   = pd.to_numeric(df_ind["値"], errors="coerce")
-                df_ind = df_ind.dropna().sort_values("日付")
-
-                fig_ind, ax_ind = plt.subplots(figsize=(12, 4))
-                ax_ind.plot(df_ind["日付"], df_ind["値"],
-                            color="#1565c0", linewidth=2, marker="o", markersize=3)
-                ax_ind.fill_between(df_ind["日付"], df_ind["値"],
-                                    df_ind["値"].min(), alpha=0.1, color="#1565c0")
-                ax_ind.set_title(ind_choice, fontsize=12)
-                ax_ind.grid(True, alpha=0.25)
-                plt.xticks(rotation=45); plt.tight_layout()
-                st.pyplot(fig_ind, clear_figure=True)
-
-                latest_val = df_ind["値"].iloc[-1]
-                prev_val   = df_ind["値"].iloc[-2] if len(df_ind) >= 2 else None
-                col_i1, col_i2 = st.columns(2)
-                col_i1.metric(
-                    f"最新値（{df_ind['日付'].iloc[-1].strftime('%Y-%m')}）",
-                    f"{latest_val:.2f}",
-                    delta=f"{latest_val - prev_val:.2f}" if prev_val else None
-                )
-                col_i2.metric("直近12ヶ月平均", f"{df_ind['値'].tail(12).mean():.2f}")
-
-                with st.expander("データ一覧"):
-                    st.dataframe(df_ind.sort_values("日付", ascending=False),
-                                 use_container_width=True, hide_index=True)
-        else:
-            st.warning("データ取得失敗（無料枠は1分5回・1日25回制限）")
-
-    # ── Tab3: セクターパフォーマンス ─────────────────────────────
-    with av_t3:
-        st.markdown("#### 🏭 米国セクター別パフォーマンス")
-        st.caption("S&P500の11セクター別リターン（Alpha Vantage提供）")
-
-        with st.spinner("セクターデータ取得中..."):
-            sec_data = _av_get("SECTOR")
-
-        if sec_data:
-            periods = {
-                "1日": "Rank A: Real-Time Performance",
-                "1週": "Rank B: 1 Day Performance",
-                "1ヶ月": "Rank C: 5 Day Performance",
-                "3ヶ月": "Rank D: 1 Month Performance",
-                "1年": "Rank E: 3 Month Performance",
-                "3年": "Rank F: Year-to-Date (YTD) Performance",
-            }
-            period_sel = st.selectbox("期間", list(periods.keys()), index=1, key="av_sec_period")
-            pkey = periods[period_sel]
-
-            sec_perf = sec_data.get(pkey, {})
-            if sec_perf:
-                rows = [{"セクター": k, "リターン(%)": float(v.strip("%"))}
-                        for k, v in sec_perf.items() if v and v != "None"]
-                if rows:
-                    df_sec = pd.DataFrame(rows).sort_values("リターン(%)", ascending=True)
-                    colors = ["#d1242f" if v < 0 else "#1a7f37" for v in df_sec["リターン(%)"]]
-                    fig_sec, ax_sec = plt.subplots(figsize=(10, 6))
-                    bars = ax_sec.barh(df_sec["セクター"], df_sec["リターン(%)"],
-                                       color=colors, alpha=0.85)
-                    for bar, val in zip(bars, df_sec["リターン(%)"]):
-                        xpos = bar.get_width() + (0.05 if val >= 0 else -0.05)
-                        ha = "left" if val >= 0 else "right"
-                        ax_sec.text(xpos, bar.get_y() + bar.get_height()/2,
-                                    f"{val:+.2f}%", va="center", ha=ha, fontsize=9)
-                    ax_sec.axvline(0, color="black", linewidth=0.8)
-                    ax_sec.set_title(f"US Sector Performance ({period_sel})", fontsize=12)
-                    ax_sec.set_xlabel("Return (%)")
-                    ax_sec.grid(True, axis="x", alpha=0.25)
-                    plt.tight_layout()
-                    st.pyplot(fig_sec, clear_figure=True)
-
-                    # ベスト/ワースト
-                    best   = df_sec.iloc[-1]
-                    worst  = df_sec.iloc[0]
-                    c1, c2 = st.columns(2)
-                    c1.metric("🥇 最強セクター", best["セクター"],  f"{best['リターン(%)']:+.2f}%")
-                    c2.metric("🥈 最弱セクター", worst["セクター"], f"{worst['リターン(%)']:+.2f}%")
-            else:
-                st.warning("セクターデータが取得できませんでした")
-        else:
-            st.warning("データ取得失敗（無料枠: 1分5回・1日25回制限）")
-
-
+st.markdown("""
+<div style="background-color:#6a1b9a;color:white;padding:14px 24px;border-radius:10px;margin:32px 0 6px 0;font-size:20px;font-weight:bold;">
+💰&nbsp; C.&nbsp;ファンダメンタルズ&emsp;<span style="font-size:13px;font-weight:400;opacity:0.88">来期業績スクリーニング / サイズ・バリューファクター / 価値創造</span>
+</div>
+""", unsafe_allow_html=True)
 
 # =================================================================
 # 🔮 来期想定利益からのおすすめ銘柄スクリーニング
@@ -4737,3 +4211,556 @@ else:
 
 st.divider()
 st.caption("データソース: Yahoo Finance / J-Quants / Finnhub / Alpha Vantage / TDnet / 株探 / みんかぶ / 日経 | 投資判断は自己責任で")
+st.markdown("""
+<div style="background-color:#bf360c;color:white;padding:14px 24px;border-radius:10px;margin:32px 0 6px 0;font-size:20px;font-weight:bold;">
+🗞️&nbsp; D.&nbsp;情報・外部データ&emsp;<span style="font-size:13px;font-weight:400;opacity:0.88">Finnhub / Alpha Vantage / 銘柄別ニュース / 市場ニュース</span>
+</div>
+""", unsafe_allow_html=True)
+
+# ─────────────────────────────────────────────────────────────────
+st.header("📡 Finnhub リアルタイム情報")
+st.caption("Finnhub APIによるリアルタイム株価・決算・インサイダー・ニュース")
+
+fh_key = st.secrets.get("FINNHUB_API_KEY", "")
+if not fh_key:
+    st.warning("⚠️ `FINNHUB_API_KEY` を Streamlit Secrets に追加してください")
+else:
+    fh_t1, fh_t2, fh_t3, fh_t4 = st.tabs([
+        "💹 リアルタイム株価",
+        "📊 決算サプライズ",
+        "🕵️ インサイダー取引",
+        "📰 企業ニュース",
+    ])
+
+    # ── Tab1: リアルタイム株価・為替 ────────────────────────────
+    with fh_t1:
+        st.markdown("#### 💹 リアルタイム株価・為替クォート")
+
+        col_fh1, col_fh2 = st.columns(2)
+        with col_fh1:
+            st.markdown("**米国株 (例: AAPL, TSLA, NVDA)**")
+            us_syms = st.text_input(
+                "ティッカー（カンマ区切り）",
+                value="AAPL,TSLA,NVDA,MSFT,GOOGL",
+                key="fh_us_syms"
+            ).upper().split(",")
+
+            quote_rows = []
+            for sym in [s.strip() for s in us_syms if s.strip()]:
+                q = _fh_get("/quote", {"symbol": sym})
+                if q.get("c"):
+                    chg = q["c"] - q["pc"]
+                    chg_pct = chg / q["pc"] * 100 if q["pc"] else 0
+                    quote_rows.append({
+                        "銘柄": sym,
+                        "現在値": q["c"],
+                        "前日比": round(chg, 2),
+                        "変化率(%)": round(chg_pct, 2),
+                        "高値": q.get("h", "-"),
+                        "安値": q.get("l", "-"),
+                        "始値": q.get("o", "-"),
+                    })
+
+            if quote_rows:
+                df_q = pd.DataFrame(quote_rows)
+                def _color_chg(val):
+                    if isinstance(val, float):
+                        if val > 0: return "color:#1a7f37;font-weight:bold"
+                        if val < 0: return "color:#d1242f;font-weight:bold"
+                    return ""
+                st.dataframe(
+                    df_q.style.map(_color_chg, subset=["前日比","変化率(%)"]),
+                    use_container_width=True, hide_index=True
+                )
+
+        with col_fh2:
+            st.markdown("**為替クォート (Forex)**")
+            fx_pairs = [
+                ("USD","JPY"),("EUR","JPY"),("GBP","JPY"),
+                ("EUR","USD"),("AUD","JPY"),
+            ]
+            fx_rows = []
+            for base, quote in fx_pairs:
+                d = _fh_get("/forex/rates", {"base": base})
+                rates = d.get("quote", {})
+                if quote in rates:
+                    fx_rows.append({
+                        "ペア": f"{base}/{quote}",
+                        "レート": round(float(rates[quote]), 4),
+                    })
+            if fx_rows:
+                st.dataframe(pd.DataFrame(fx_rows), use_container_width=True, hide_index=True)
+
+    # ── Tab2: 決算サプライズ ─────────────────────────────────────
+    with fh_t2:
+        st.markdown("#### 📊 決算サプライズ（EPS予想 vs 実績）")
+        eps_sym = st.text_input("銘柄コード", value="AAPL", key="fh_eps_sym").upper()
+        if eps_sym:
+            data = _fh_get("/stock/earnings", {"symbol": eps_sym, "limit": 8})
+            if data:
+                rows = []
+                for item in (data if isinstance(data, list) else []):
+                    surprise = item.get("surprise", 0) or 0
+                    rows.append({
+                        "決算期": item.get("period", ""),
+                        "EPS予想": item.get("estimate", "-"),
+                        "EPS実績": item.get("actual", "-"),
+                        "サプライズ": round(surprise, 4),
+                        "サプライズ(%)": round(item.get("surprisePercent", 0) or 0, 2),
+                    })
+                if rows:
+                    df_eps = pd.DataFrame(rows)
+                    def _color_sur(val):
+                        if isinstance(val, (int, float)):
+                            if val > 0: return "color:#1a7f37;font-weight:bold"
+                            if val < 0: return "color:#d1242f;font-weight:bold"
+                        return ""
+                    st.dataframe(
+                        df_eps.style.map(_color_sur, subset=["サプライズ","サプライズ(%)"]),
+                        use_container_width=True, hide_index=True
+                    )
+                    # サプライズ推移チャート
+                    if "サプライズ(%)" in df_eps.columns and len(df_eps) > 1:
+                        fig_eps, ax_eps = plt.subplots(figsize=(8, 3))
+                        colors = ["#1a7f37" if v >= 0 else "#d1242f"
+                                  for v in df_eps["サプライズ(%)"][::-1]]
+                        ax_eps.bar(df_eps["決算期"][::-1],
+                                   df_eps["サプライズ(%)"][::-1], color=colors)
+                        ax_eps.axhline(0, color="gray", linewidth=0.8)
+                        ax_eps.set_title(f"{eps_sym} EPS Surprise (%)", fontsize=11)
+                        ax_eps.set_ylabel("Surprise %")
+                        plt.xticks(rotation=45)
+                        plt.tight_layout()
+                        st.pyplot(fig_eps, clear_figure=True)
+                else:
+                    st.info("決算データなし")
+            else:
+                st.warning("データ取得失敗（銘柄コードを確認）")
+
+    # ── Tab3: インサイダー取引 ───────────────────────────────────
+    with fh_t3:
+        st.markdown("#### 🕵️ インサイダー取引情報")
+        ins_sym = st.text_input("銘柄コード", value="AAPL", key="fh_ins_sym").upper()
+        if ins_sym:
+            data = _fh_get("/stock/insider-transactions", {"symbol": ins_sym})
+            txns = data.get("data", [])[:20]
+            if txns:
+                rows = []
+                for t in txns:
+                    rows.append({
+                        "日付": t.get("transactionDate", ""),
+                        "氏名": t.get("name", ""),
+                        "役職": t.get("share", ""),
+                        "取引種別": t.get("transactionCode", ""),
+                        "株数": t.get("share", 0),
+                        "単価": t.get("transactionPrice", "-"),
+                        "売買区分": "買い" if str(t.get("transactionCode","")) in ["P","A"] else "売り",
+                    })
+                df_ins = pd.DataFrame(rows)
+                def _color_trade(val):
+                    if val == "買い": return "color:#1a7f37;font-weight:bold"
+                    if val == "売り": return "color:#d1242f;font-weight:bold"
+                    return ""
+                st.dataframe(
+                    df_ins.style.map(_color_trade, subset=["売買区分"]),
+                    use_container_width=True, hide_index=True
+                )
+            else:
+                st.info("インサイダー取引データなし")
+
+    # ── Tab4: 企業ニュース ───────────────────────────────────────
+    with fh_t4:
+        st.markdown("#### 📰 企業ニュースフィード")
+        news_sym = st.text_input("銘柄コード", value="AAPL", key="fh_news_sym").upper()
+        from datetime import timedelta
+        today_str = datetime.today().strftime("%Y-%m-%d")
+        week_ago  = (datetime.today() - timedelta(days=7)).strftime("%Y-%m-%d")
+
+        if news_sym:
+            items = _fh_get("/company-news", {
+                "symbol": news_sym, "from": week_ago, "to": today_str
+            })
+            if isinstance(items, list) and items:
+                for item in items[:15]:
+                    with st.expander(f"[{item.get('source','')}] {item.get('headline','')[:80]}"):
+                        st.markdown(f"**{item.get('headline','')}**")
+                        st.caption(f"📅 {item.get('datetime','')}")
+                        st.write(item.get("summary","")[:300])
+                        if item.get("url"):
+                            st.markdown(f"[🔗 記事を開く]({item['url']})")
+            else:
+                st.info("ニュースデータなし（直近7日）")
+
+
+# ─────────────────────────────────────────────────────────────────
+st.header("📈 Alpha Vantage テクニカル分析・経済指標")
+st.caption("Alpha Vantage APIによるテクニカル指標・経済指標・セクター分析")
+
+av_key = st.secrets.get("ALPHA_VANTAGE_KEY", "")
+if not av_key:
+    st.warning("⚠️ `ALPHA_VANTAGE_KEY` を Streamlit Secrets に追加してください")
+else:
+    av_t1, av_t2, av_t3 = st.tabs([
+        "📉 テクニカル指標",
+        "🌐 経済指標",
+        "🏭 セクターパフォーマンス",
+    ])
+
+    # ── Tab1: テクニカル指標 ─────────────────────────────────────
+    with av_t1:
+        st.markdown("#### 📉 テクニカル指標（RSI・MACD・ボリンジャーバンド）")
+
+        col_av1, col_av2 = st.columns(2)
+        with col_av1:
+            av_sym = st.text_input("銘柄コード", value="AAPL", key="av_sym").upper()
+        with col_av2:
+            av_interval = st.selectbox("時間足", ["daily","weekly","monthly"], key="av_int")
+
+        if av_sym:
+            st.markdown("---")
+            # RSI
+            with st.spinner("RSI取得中..."):
+                rsi_data = _av_get("RSI", {
+                    "symbol": av_sym, "interval": av_interval,
+                    "time_period": 14, "series_type": "close"
+                })
+            rsi_ts = rsi_data.get("Technical Analysis: RSI", {})
+
+            # MACD
+            with st.spinner("MACD取得中..."):
+                macd_data = _av_get("MACD", {
+                    "symbol": av_sym, "interval": av_interval,
+                    "series_type": "close"
+                })
+            macd_ts = macd_data.get("Technical Analysis: MACD", {})
+
+            # BBANDS
+            with st.spinner("ボリンジャーバンド取得中..."):
+                bb_data = _av_get("BBANDS", {
+                    "symbol": av_sym, "interval": av_interval,
+                    "time_period": 20, "series_type": "close"
+                })
+            bb_ts = bb_data.get("Technical Analysis: BBANDS", {})
+
+            if rsi_ts:
+                dates = sorted(rsi_ts.keys(), reverse=True)[:60]
+                df_rsi = pd.DataFrame({
+                    "Date": pd.to_datetime(dates),
+                    "RSI":  [float(rsi_ts[d]["RSI"]) for d in dates],
+                })
+                fig_rsi, ax_rsi = plt.subplots(figsize=(12, 3))
+                ax_rsi.plot(df_rsi["Date"], df_rsi["RSI"], color="#1565c0", linewidth=1.8)
+                ax_rsi.axhline(70, color="#d1242f", linestyle="--", alpha=0.7, label="過買い(70)")
+                ax_rsi.axhline(30, color="#1a7f37", linestyle="--", alpha=0.7, label="過売り(30)")
+                ax_rsi.fill_between(df_rsi["Date"], 70, df_rsi["RSI"].clip(lower=70),
+                                    alpha=0.15, color="#d1242f")
+                ax_rsi.fill_between(df_rsi["Date"], df_rsi["RSI"].clip(upper=30), 30,
+                                    alpha=0.15, color="#1a7f37")
+                ax_rsi.set_title(f"{av_sym} RSI(14) - {av_interval}", fontsize=11)
+                ax_rsi.set_ylim(0, 100)
+                ax_rsi.legend(fontsize=8)
+                ax_rsi.grid(True, alpha=0.25)
+                plt.xticks(rotation=45); plt.tight_layout()
+                st.pyplot(fig_rsi, clear_figure=True)
+
+                latest_rsi = float(rsi_ts[dates[0]]["RSI"])
+                if latest_rsi >= 70:
+                    st.warning(f"⚠️ RSI {latest_rsi:.1f} — 過買い圏（売り圧力に注意）")
+                elif latest_rsi <= 30:
+                    st.success(f"✅ RSI {latest_rsi:.1f} — 過売り圏（反発候補）")
+                else:
+                    st.info(f"📊 RSI {latest_rsi:.1f} — 中立圏")
+
+            if macd_ts:
+                dates_m = sorted(macd_ts.keys(), reverse=True)[:60]
+                df_macd = pd.DataFrame({
+                    "Date":     pd.to_datetime(dates_m),
+                    "MACD":     [float(macd_ts[d]["MACD"]) for d in dates_m],
+                    "Signal":   [float(macd_ts[d]["MACD_Signal"]) for d in dates_m],
+                    "Hist":     [float(macd_ts[d]["MACD_Hist"]) for d in dates_m],
+                })
+                fig_macd, (ax_m1, ax_m2) = plt.subplots(2, 1, figsize=(12, 5),
+                                                          gridspec_kw={"height_ratios": [2,1]})
+                ax_m1.plot(df_macd["Date"], df_macd["MACD"],
+                           color="#1565c0", linewidth=1.5, label="MACD")
+                ax_m1.plot(df_macd["Date"], df_macd["Signal"],
+                           color="#e91e63", linewidth=1.5, linestyle="--", label="Signal")
+                ax_m1.axhline(0, color="gray", linewidth=0.6)
+                ax_m1.legend(fontsize=8); ax_m1.grid(True, alpha=0.25)
+                ax_m1.set_title(f"{av_sym} MACD - {av_interval}", fontsize=11)
+                colors_hist = ["#1a7f37" if v >= 0 else "#d1242f" for v in df_macd["Hist"]]
+                ax_m2.bar(df_macd["Date"], df_macd["Hist"], color=colors_hist, alpha=0.8, width=2)
+                ax_m2.axhline(0, color="gray", linewidth=0.6)
+                ax_m2.set_ylabel("Histogram"); ax_m2.grid(True, alpha=0.25)
+                plt.xticks(rotation=45); plt.tight_layout()
+                st.pyplot(fig_macd, clear_figure=True)
+
+            if bb_ts:
+                dates_b = sorted(bb_ts.keys(), reverse=True)[:60]
+                df_bb = pd.DataFrame({
+                    "Date":  pd.to_datetime(dates_b),
+                    "Upper": [float(bb_ts[d]["Real Upper Band"]) for d in dates_b],
+                    "Mid":   [float(bb_ts[d]["Real Middle Band"]) for d in dates_b],
+                    "Lower": [float(bb_ts[d]["Real Lower Band"]) for d in dates_b],
+                })
+                fig_bb, ax_bb = plt.subplots(figsize=(12, 4))
+                ax_bb.plot(df_bb["Date"], df_bb["Upper"],
+                           color="#d1242f", linewidth=1.2, linestyle="--", label="Upper")
+                ax_bb.plot(df_bb["Date"], df_bb["Mid"],
+                           color="#1565c0", linewidth=1.5, label="Middle(SMA20)")
+                ax_bb.plot(df_bb["Date"], df_bb["Lower"],
+                           color="#1a7f37", linewidth=1.2, linestyle="--", label="Lower")
+                ax_bb.fill_between(df_bb["Date"], df_bb["Upper"], df_bb["Lower"],
+                                   alpha=0.07, color="#1565c0")
+                ax_bb.legend(fontsize=8); ax_bb.grid(True, alpha=0.25)
+                ax_bb.set_title(f"{av_sym} Bollinger Bands(20) - {av_interval}", fontsize=11)
+                plt.xticks(rotation=45); plt.tight_layout()
+                st.pyplot(fig_bb, clear_figure=True)
+
+            if not any([rsi_ts, macd_ts, bb_ts]):
+                st.warning("データ取得失敗（無料枠は1分5回制限。少し待ってから再試行してください）")
+
+    # ── Tab2: 経済指標 ───────────────────────────────────────────
+    with av_t2:
+        st.markdown("#### 🌐 主要経済指標")
+
+        INDICATORS = {
+            "実質GDP成長率(米)":        ("REAL_GDP",            "annualReports"),
+            "CPI（インフレ率）":         ("CPI",                 "data"),
+            "失業率":                    ("UNEMPLOYMENT",        "data"),
+            "FF金利（政策金利）":        ("FEDERAL_FUNDS_RATE",  "data"),
+            "米国小売売上高":            ("RETAIL_SALES",        "data"),
+            "消費者信頼感指数":          ("CONSUMER_CONFIDENCE", "data"),
+        }
+
+        ind_choice = st.selectbox("指標を選択", list(INDICATORS.keys()), key="av_ind")
+        func, key_path = INDICATORS[ind_choice]
+
+        with st.spinner(f"{ind_choice} 取得中..."):
+            ind_data = _av_get(func, {"interval": "monthly" if func not in ["REAL_GDP"] else "annual"})
+
+        series = ind_data.get(key_path, ind_data.get("data", []))
+        if series:
+            rows = []
+            for item in (series[:36] if isinstance(series, list) else []):
+                rows.append({
+                    "日付": item.get("date", item.get("fiscalDateEnding", "")),
+                    "値":   item.get("value", item.get("reportedEPS", "")),
+                })
+            if rows:
+                df_ind = pd.DataFrame(rows)
+                df_ind["日付"] = pd.to_datetime(df_ind["日付"], errors="coerce")
+                df_ind["値"]   = pd.to_numeric(df_ind["値"], errors="coerce")
+                df_ind = df_ind.dropna().sort_values("日付")
+
+                fig_ind, ax_ind = plt.subplots(figsize=(12, 4))
+                ax_ind.plot(df_ind["日付"], df_ind["値"],
+                            color="#1565c0", linewidth=2, marker="o", markersize=3)
+                ax_ind.fill_between(df_ind["日付"], df_ind["値"],
+                                    df_ind["値"].min(), alpha=0.1, color="#1565c0")
+                ax_ind.set_title(ind_choice, fontsize=12)
+                ax_ind.grid(True, alpha=0.25)
+                plt.xticks(rotation=45); plt.tight_layout()
+                st.pyplot(fig_ind, clear_figure=True)
+
+                latest_val = df_ind["値"].iloc[-1]
+                prev_val   = df_ind["値"].iloc[-2] if len(df_ind) >= 2 else None
+                col_i1, col_i2 = st.columns(2)
+                col_i1.metric(
+                    f"最新値（{df_ind['日付'].iloc[-1].strftime('%Y-%m')}）",
+                    f"{latest_val:.2f}",
+                    delta=f"{latest_val - prev_val:.2f}" if prev_val else None
+                )
+                col_i2.metric("直近12ヶ月平均", f"{df_ind['値'].tail(12).mean():.2f}")
+
+                with st.expander("データ一覧"):
+                    st.dataframe(df_ind.sort_values("日付", ascending=False),
+                                 use_container_width=True, hide_index=True)
+        else:
+            st.warning("データ取得失敗（無料枠は1分5回・1日25回制限）")
+
+    # ── Tab3: セクターパフォーマンス ─────────────────────────────
+    with av_t3:
+        st.markdown("#### 🏭 米国セクター別パフォーマンス")
+        st.caption("S&P500の11セクター別リターン（Alpha Vantage提供）")
+
+        with st.spinner("セクターデータ取得中..."):
+            sec_data = _av_get("SECTOR")
+
+        if sec_data:
+            periods = {
+                "1日": "Rank A: Real-Time Performance",
+                "1週": "Rank B: 1 Day Performance",
+                "1ヶ月": "Rank C: 5 Day Performance",
+                "3ヶ月": "Rank D: 1 Month Performance",
+                "1年": "Rank E: 3 Month Performance",
+                "3年": "Rank F: Year-to-Date (YTD) Performance",
+            }
+            period_sel = st.selectbox("期間", list(periods.keys()), index=1, key="av_sec_period")
+            pkey = periods[period_sel]
+
+            sec_perf = sec_data.get(pkey, {})
+            if sec_perf:
+                rows = [{"セクター": k, "リターン(%)": float(v.strip("%"))}
+                        for k, v in sec_perf.items() if v and v != "None"]
+                if rows:
+                    df_sec = pd.DataFrame(rows).sort_values("リターン(%)", ascending=True)
+                    colors = ["#d1242f" if v < 0 else "#1a7f37" for v in df_sec["リターン(%)"]]
+                    fig_sec, ax_sec = plt.subplots(figsize=(10, 6))
+                    bars = ax_sec.barh(df_sec["セクター"], df_sec["リターン(%)"],
+                                       color=colors, alpha=0.85)
+                    for bar, val in zip(bars, df_sec["リターン(%)"]):
+                        xpos = bar.get_width() + (0.05 if val >= 0 else -0.05)
+                        ha = "left" if val >= 0 else "right"
+                        ax_sec.text(xpos, bar.get_y() + bar.get_height()/2,
+                                    f"{val:+.2f}%", va="center", ha=ha, fontsize=9)
+                    ax_sec.axvline(0, color="black", linewidth=0.8)
+                    ax_sec.set_title(f"US Sector Performance ({period_sel})", fontsize=12)
+                    ax_sec.set_xlabel("Return (%)")
+                    ax_sec.grid(True, axis="x", alpha=0.25)
+                    plt.tight_layout()
+                    st.pyplot(fig_sec, clear_figure=True)
+
+                    # ベスト/ワースト
+                    best   = df_sec.iloc[-1]
+                    worst  = df_sec.iloc[0]
+                    c1, c2 = st.columns(2)
+                    c1.metric("🥇 最強セクター", best["セクター"],  f"{best['リターン(%)']:+.2f}%")
+                    c2.metric("🥈 最弱セクター", worst["セクター"], f"{worst['リターン(%)']:+.2f}%")
+            else:
+                st.warning("セクターデータが取得できませんでした")
+        else:
+            st.warning("データ取得失敗（無料枠: 1分5回・1日25回制限）")
+
+
+
+# ─── Tab6: 銘柄別ニュース ─────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────
+st.header("📰 銘柄別ニュース")
+st.divider()
+st.subheader("📰 銘柄別ニュース・適時開示")
+
+ticker_options = {f"{name}（{t}）": t for t, (name, _) in ticker_name_map.items()}
+selected_label = st.selectbox(
+    "銘柄を選択", list(ticker_options.keys()),
+    index=list(ticker_options.keys()).index("トヨタ（7203.T）")
+    if "トヨタ（7203.T）" in ticker_options else 0
+)
+selected_ticker = ticker_options[selected_label]
+selected_name   = ticker_name_map[selected_ticker][0]
+
+col_btn1, col_btn2 = st.columns([1, 4])
+with col_btn1:
+    run_news = True  # 自動実行
+with col_btn2:
+    run_ai   = st.checkbox("🤖 AIによる要約・センチメント分析も行う", value=True)
+
+if run_news:
+    with st.spinner(f"{selected_name} のニュースを全ソースから取得中..."):
+        all_news = fetch_all_news(selected_ticker, news_max_per_source)
+
+    filtered = [n for n in all_news if n["source"] in show_news_sources] if show_news_sources else all_news
+
+    if not filtered:
+        st.warning("ニュースが取得できませんでした（ソース設定を確認してください）")
+    else:
+        source_colors = {
+            "Yahoo!Finance JP":  "🟦",
+            "株探(Kabutan)":     "🟩",
+            "みんかぶ":          "🟨",
+            "TDnet（適時開示）": "🟥",
+            "日経新聞":          "⬛",
+            "Reuters JP":        "🟫",
+        }
+
+        from collections import Counter
+        src_counts = Counter(n["source"] for n in filtered)
+        cols_stat  = st.columns(len(src_counts))
+        for i, (src, cnt) in enumerate(src_counts.items()):
+            icon = source_colors.get(src, "⚪")
+            cols_stat[i].metric(f"{icon} {src}", f"{cnt}件")
+
+        st.divider()
+
+        for item in filtered:
+            icon = source_colors.get(item["source"], "⚪")
+            with st.expander(f"{icon} [{item['source']}] {item['title'][:60]}{'...' if len(item['title'])>60 else ''}"):
+                c1, c2 = st.columns([3, 1])
+                with c1:
+                    st.markdown(f"**{item['title']}**")
+                    if item.get("summary"):
+                        st.caption(item["summary"])
+                with c2:
+                    if item.get("date"):
+                        st.caption(f"📅 {item['date']}")
+                    if item.get("link"):
+                        st.markdown(f"[🔗 記事を開く]({item['link']})")
+
+        if run_ai:
+            st.divider()
+            st.subheader("🤖 AI ニュース分析（センチメント）")
+            with st.spinner("AI分析中..."):
+                ai_result = ai_news_summary(filtered, selected_name, selected_ticker)
+            st.info(ai_result)
+
+
+# ─── Tab7: 市場全体ニュース ──────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────
+st.header("🌐 市場全体ニュース")
+st.divider()
+st.subheader("🌐 市場全体ニュース（日経・Reuters）")
+
+if True:  # 自動実行
+    import concurrent.futures
+
+    with st.spinner("市場ニュースを取得中..."):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+            f_nikkei  = ex.submit(fetch_nikkei_market_rss, 10)
+            f_reuters = ex.submit(fetch_reuters_jp_rss, 10)
+            nikkei_news  = f_nikkei.result()
+            reuters_news = f_reuters.result()
+
+    col_n, col_r = st.columns(2)
+
+    with col_n:
+        st.markdown("### ⬛ 日経新聞 マーケットニュース")
+        if nikkei_news:
+            for item in nikkei_news:
+                st.markdown(f"- [{item['title']}]({item['link']})")
+                if item.get("date"):
+                    st.caption(f"  📅 {item['date']}")
+        else:
+            st.info("取得できませんでした（日経新聞RSSは会員制の場合があります）")
+
+    with col_r:
+        st.markdown("### 🟫 Reuters Japan ビジネスニュース")
+        if reuters_news:
+            for item in reuters_news:
+                st.markdown(f"- [{item['title']}]({item['link']})")
+                if item.get("date"):
+                    st.caption(f"  📅 {item['date']}")
+        else:
+            st.info("取得できませんでした")
+
+    all_market = nikkei_news + reuters_news
+    if all_market and st.checkbox("🤖 市場全体のAI要約を表示", value=True):
+        headlines = "\n".join(f"[{n['source']}] {n['title']}" for n in all_market[:12])
+        prompt = (
+            "以下は本日の日本株マーケット関連ニュースです。\n\n"
+            f"{headlines}\n\n"
+            "投資家向けに300文字以内でまとめてください:\n"
+            "1. 本日の市場全体のセンチメント\n"
+            "2. 注目テーマ・セクター\n"
+            "3. 今後の注意点\n"
+        )
+        with st.spinner("AI要約中..."):
+            try:
+                comment, ai_name = generate_ai_comment(prompt)
+                st.subheader(f"🤖 市場全体AI要約（{ai_name}）")
+                st.info(comment)
+            except Exception as e:
+                st.warning(f"AI APIエラー: {e}")
+
+
