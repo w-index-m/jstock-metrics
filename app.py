@@ -2359,6 +2359,341 @@ if True:  # 自動実行
 
 
 # ================================================================
+# 📋 適時開示・EDINET AI分析 ヘルパー関数
+# ================================================================
+
+EDINET_API_BASE = "https://disclosure.edinet-api.go.jp/api/v2"
+TDNET_BASE      = "https://www.release.tdnet.info/inbs"
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_tdnet_week(code_map: dict, days: int = 7) -> list:
+    """TDnetから過去N営業日の適時開示を取得（対象225銘柄のみ）"""
+    from bs4 import BeautifulSoup as _BS
+    from datetime import timedelta as _td
+    code4_map = {}
+    for ticker, (name, sector) in code_map.items():
+        c4 = ticker.replace(".T", "").zfill(4)
+        code4_map[c4] = (name, sector)
+    results = []
+    today = datetime.today()
+    checked, d = 0, 0
+    while checked < days and d < 20:
+        target = today - _td(days=d); d += 1
+        if target.weekday() >= 5:
+            continue
+        checked += 1
+        date_str = target.strftime("%Y%m%d")
+        for page in range(1, 8):
+            url = f"{TDNET_BASE}/I_list_{page:03d}_{date_str}.html"
+            try:
+                r = requests.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
+                if r.status_code != 200:
+                    break
+                r.encoding = r.apparent_encoding or "utf-8"
+                soup = _BS(r.text, "html.parser")
+                rows = soup.find_all("tr")
+                found_any = False
+                for row in rows:
+                    cells = row.find_all("td")
+                    if len(cells) < 4:
+                        continue
+                    texts = [c.get_text(strip=True) for c in cells]
+                    code = next((t for t in texts[:3] if t.isdigit() and len(t) == 4), None)
+                    if not code or code not in code4_map:
+                        continue
+                    found_any = True
+                    # タイトルはコードより後の列
+                    ci = texts.index(code)
+                    title = texts[ci + 2] if ci + 2 < len(texts) else texts[-1]
+                    name, sector = code4_map[code]
+                    results.append({
+                        "日付": target.strftime("%Y-%m-%d"),
+                        "コード": code,
+                        "企業名": name,
+                        "業種": sector,
+                        "タイトル": title,
+                    })
+                if not found_any and page > 1:
+                    break
+            except Exception:
+                break
+    return results
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_edinet_docs(days: int = 7, doc_type_filter: str = "") -> list:
+    """EDINET APIから過去N営業日の書類一覧を取得"""
+    from datetime import timedelta as _td
+    results = []
+    today = datetime.today()
+    for d in range(days + 5):
+        target = today - _td(days=d)
+        if target.weekday() >= 5:
+            continue
+        if sum(1 for r in results if r["日付"] == target.strftime("%Y-%m-%d")) > 0:
+            continue
+        if len({r["日付"] for r in results}) >= days:
+            break
+        date_str = target.strftime("%Y-%m-%d")
+        try:
+            r = requests.get(
+                f"{EDINET_API_BASE}/documents.json",
+                params={"date": date_str, "type": 2},
+                timeout=12,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            if r.status_code != 200:
+                continue
+            for doc in r.json().get("results", []):
+                desc = doc.get("docDescription", "")
+                if doc_type_filter and doc_type_filter not in desc:
+                    continue
+                results.append({
+                    "日付": date_str,
+                    "docID": doc.get("docID", ""),
+                    "企業名": doc.get("filerName", ""),
+                    "書類種別": desc,
+                    "証券コード": doc.get("secCode", "")[:4],
+                })
+        except Exception:
+            continue
+    return results
+
+
+@st.cache_data(ttl=7200, show_spinner=False)
+def fetch_edinet_pdf_text(doc_id: str) -> str:
+    """EDINETから決算短信PDFを取得しテキスト抽出（先頭4ページ）"""
+    try:
+        import pdfplumber, io
+        r = requests.get(
+            f"{EDINET_API_BASE}/documents/{doc_id}",
+            params={"type": 4},
+            timeout=40,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        if r.status_code != 200:
+            return f"[HTTP {r.status_code}]"
+        ct = r.headers.get("Content-Type", "")
+        if "pdf" not in ct.lower() and len(r.content) < 1000:
+            return "[PDFが返されませんでした]"
+        with pdfplumber.open(io.BytesIO(r.content)) as pdf:
+            text = "\n".join(p.extract_text() or "" for p in pdf.pages[:4])
+        return text or "[テキスト抽出失敗]"
+    except Exception as e:
+        return f"[取得エラー: {e}]"
+
+
+# ─────────────────────────────────────────────────────────────────
+st.header("📋 適時開示・EDINET AI分析")
+st.divider()
+st.caption(
+    "TDnet（東証 適時開示）と EDINET（金融庁）の公式データを活用。"
+    "**決算短信のAI要約**・**機関投資家の大量保有動向**・**成長シグナルランキング**を提供します。"
+)
+
+edinet_t1, edinet_t2, edinet_t3 = st.tabs([
+    "📊 週次 成長シグナルランキング",
+    "📄 決算短信 AI要約",
+    "🏦 大量保有報告書 監視",
+])
+
+# ── Tab1: 週次 成長シグナルランキング ─────────────────────────────
+with edinet_t1:
+    st.markdown("#### 📊 週次 適時開示 成長シグナルランキング（Top5）")
+    st.caption("過去1週間の適時開示タイトルをAIが分析し、成長シグナルが最も強い企業Top5を表示します。")
+    col_td1, col_td2 = st.columns([2, 1])
+    with col_td1:
+        tdnet_days = st.slider("取得期間（営業日）", 3, 10, 5, key="tdnet_days_sl")
+    with col_td2:
+        run_tdnet = st.button("▶ ランキング分析を実行", type="primary", key="run_tdnet_rank")
+
+    if run_tdnet:
+        with st.spinner("TDnetから適時開示を取得中（1〜2分かかります）..."):
+            tdnet_list = fetch_tdnet_week(ticker_name_map, days=tdnet_days)
+
+        if not tdnet_list:
+            st.warning("⚠️ 適時開示データを取得できませんでした。TDnetのHTML構造が変わった可能性があります。")
+        else:
+            df_td = pd.DataFrame(tdnet_list)
+            col_m1, col_m2, col_m3 = st.columns(3)
+            col_m1.metric("取得件数", f"{len(df_td)}件")
+            col_m2.metric("開示企業数", f"{df_td['企業名'].nunique()}社")
+            col_m3.metric("取得期間", f"{tdnet_days}営業日")
+
+            # 企業別タイトル集約
+            grp = df_td.groupby("企業名")["タイトル"].apply(lambda x: " / ".join(x)).reset_index()
+            disclosure_text = "\n".join(
+                f"【{r['企業名']}】{r['タイトル']}" for _, r in grp.iterrows()
+            )
+
+            _prompt_tdnet = f"""
+以下は日本株225銘柄の過去{tdnet_days}営業日の適時開示タイトル一覧です。
+
+{disclosure_text[:4500]}
+
+成長シグナルが最も強い企業 上位5社を選んでください。
+選定基準：業績上方修正・増配・自社株買い・新規事業・M&A・好決算・黒字転換など
+
+**以下の形式で必ず出力してください：**
+🥇 No.1: [企業名] — [選定理由（80字以内）]
+🥈 No.2: [企業名] — [選定理由（80字以内）]
+🥉 No.3: [企業名] — [選定理由（80字以内）]
+4️⃣ No.4: [企業名] — [選定理由（80字以内）]
+5️⃣ No.5: [企業名] — [選定理由（80字以内）]
+
+📝 今週の総評（100字以内）：市場全体の傾向
+"""
+            with st.spinner("AIが成長シグナルを分析中..."):
+                try:
+                    ai_rank, ai_name_r = generate_ai_comment(_prompt_tdnet)
+                    st.markdown(f"### 🤖 AI成長シグナルランキング（{ai_name_r}）")
+                    st.success(ai_rank)
+                except Exception as _e_td:
+                    st.warning(f"AI分析エラー: {_e_td}")
+
+            st.divider()
+            with st.expander("📋 取得した適時開示一覧を見る"):
+                st.dataframe(
+                    df_td[["日付", "企業名", "業種", "タイトル"]].sort_values("日付", ascending=False),
+                    use_container_width=True, hide_index=True,
+                )
+
+# ── Tab2: 決算短信 AI要約 ─────────────────────────────────────────
+with edinet_t2:
+    st.markdown("#### 📄 決算短信 AI要約（EDINET × Gemini）")
+    st.caption("EDINETに提出された決算短信PDFをGeminiが要約。財務ハイライト・成長戦略・リスクを抽出します。")
+
+    col_ef1, col_ef2 = st.columns([2, 1])
+    with col_ef1:
+        edinet_fins_days = st.slider("取得対象期間（営業日）", 1, 14, 5, key="edinet_fins_days")
+    with col_ef2:
+        run_edinet_fins = st.button("▶ 決算短信を検索", type="primary", key="run_edinet_fins")
+
+    if run_edinet_fins:
+        with st.spinner("EDINETから決算短信を検索中..."):
+            all_docs_f = fetch_edinet_docs(days=edinet_fins_days)
+            fins_docs  = [d for d in all_docs_f if any(
+                kw in d["書類種別"] for kw in ["決算短信", "四半期短信", "業績予想修正"]
+            )]
+
+        if not fins_docs:
+            st.warning("該当期間に決算短信が見つかりませんでした")
+        else:
+            df_fins_e = pd.DataFrame(fins_docs)
+            our_codes = {t.replace(".T", "").zfill(4) for t in ticker_name_map}
+            df_fins_matched = df_fins_e[df_fins_e["証券コード"].isin(our_codes)].reset_index(drop=True)
+
+            st.success(f"✅ {len(df_fins_matched)}件（対象225銘柄） / 全{len(df_fins_e)}件")
+            st.dataframe(
+                df_fins_matched[["日付", "企業名", "書類種別"]],
+                use_container_width=True, hide_index=True,
+            )
+
+            if not df_fins_matched.empty:
+                st.divider()
+                sel_fins = st.selectbox(
+                    "AI要約する決算短信を選択",
+                    df_fins_matched.index.tolist(),
+                    format_func=lambda i: f"{df_fins_matched.loc[i,'企業名']}  ({df_fins_matched.loc[i,'日付']}) {df_fins_matched.loc[i,'書類種別']}",
+                    key="edinet_sel_fins",
+                )
+                if st.button("📄 PDFを取得してAI要約（Gemini）", type="primary", key="run_fins_summary"):
+                    doc_id_f = df_fins_matched.loc[sel_fins, "docID"]
+                    cname_f  = df_fins_matched.loc[sel_fins, "企業名"]
+                    with st.spinner(f"{cname_f} の決算短信PDFを取得中（〜30秒）..."):
+                        pdf_text_f = fetch_edinet_pdf_text(doc_id_f)
+
+                    if not pdf_text_f or pdf_text_f.startswith("["):
+                        st.error(f"PDF取得失敗: {pdf_text_f}")
+                    else:
+                        _prompt_fins_pdf = f"""
+以下は {cname_f} の決算短信PDFの冒頭テキストです。
+
+{pdf_text_f[:3500]}
+
+以下の観点で **400字以内** で要約してください：
+1. 📈 業績ハイライト（売上・営業利益・純利益・前年比）
+2. 💡 成長ドライバー（好調な事業・地域・製品）
+3. ⚠️ リスク・課題
+4. 🔮 来期見通し・配当・株主還元方針
+※ 数値は具体的に（例：売上高 1,234億円 前年比+15%）
+"""
+                        with st.spinner("Geminiが決算短信を要約中..."):
+                            try:
+                                summary_f, ai_nm_f = generate_ai_comment(_prompt_fins_pdf)
+                                st.markdown(f"### 🤖 {cname_f} 決算短信 AI要約（{ai_nm_f}）")
+                                st.success(summary_f)
+                            except Exception as _e_fins:
+                                st.warning(f"AI要約エラー: {_e_fins}")
+
+# ── Tab3: 大量保有報告書 監視 ─────────────────────────────────────
+with edinet_t3:
+    st.markdown("#### 🏦 大量保有報告書 監視（機関投資家・アクティビスト動向）")
+    st.caption(
+        "株式5%以上の保有変動があると提出義務が生じる「大量保有報告書」を監視。"
+        "機関投資家・アクティビストの動向把握に活用できます。"
+    )
+
+    col_hd1, col_hd2 = st.columns([2, 1])
+    with col_hd1:
+        holding_days = st.slider("取得対象期間（営業日）", 1, 14, 7, key="holding_days_sl")
+    with col_hd2:
+        run_holding = st.button("▶ 大量保有報告書を検索", type="primary", key="run_holding_btn")
+
+    if run_holding:
+        with st.spinner("EDINETから大量保有報告書を検索中..."):
+            all_docs_h = fetch_edinet_docs(days=holding_days)
+            holding_docs = [d for d in all_docs_h if any(
+                kw in d["書類種別"] for kw in ["大量保有報告書", "変更報告書"]
+            )]
+
+        if not holding_docs:
+            st.warning("該当期間に大量保有報告書が見つかりませんでした")
+        else:
+            df_hold = pd.DataFrame(holding_docs)
+            col_hm1, col_hm2 = st.columns(2)
+            col_hm1.metric("大量保有報告書 件数", f"{len(df_hold)}件")
+            col_hm2.metric("変更報告書を含む", f"{sum('変更' in d['書類種別'] for d in holding_docs)}件")
+
+            tab_h1, tab_h2 = st.tabs(["📋 全件一覧", "🤖 AI動向分析"])
+
+            with tab_h1:
+                st.dataframe(
+                    df_hold[["日付", "企業名", "書類種別"]].sort_values("日付", ascending=False).reset_index(drop=True),
+                    use_container_width=True, hide_index=True,
+                )
+                csv_hold = df_hold.to_csv(index=False, encoding="utf-8-sig")
+                st.download_button(
+                    "⬇️ CSV ダウンロード", data=csv_hold,
+                    file_name=f"large_holdings_{datetime.today().strftime('%Y%m%d')}.csv",
+                    mime="text/csv", key="dl_hold",
+                )
+
+            with tab_h2:
+                hold_summary_text = "\n".join(
+                    f"{d['日付']} 【{d['企業名']}】 {d['書類種別']}"
+                    for d in holding_docs[:40]
+                )
+                _prompt_hold = f"""
+以下は直近{holding_days}営業日のEDINET大量保有報告書・変更報告書の一覧です。
+
+{hold_summary_text}
+
+機関投資家・アクティビストの動向として注目すべき点を250字以内で解説してください。
+特に以下に注目：
+- 大量取得（新規5%超え）→ 買い増しシグナル
+- 変更報告書で保有率が大幅増加 → アクティビスト候補
+- 大量売却（保有率低下） → 機関の撤退シグナル
+"""
+                with st.spinner("AIが機関投資家動向を分析中..."):
+                    try:
+                        hold_comment, hold_ai = generate_ai_comment(_prompt_hold)
+                        st.info(f"🤖 **AI機関投資家動向分析（{hold_ai}）**\n\n{hold_comment}")
+                    except Exception as _e_hold:
+                        st.warning(f"AI分析エラー: {_e_hold}")
+
+
+# ================================================================
 # J-Quants APIクライアント（V2対応）
 # ================================================================
 JQUANTS_API_BASE = "https://api.jquants.com/v1"
