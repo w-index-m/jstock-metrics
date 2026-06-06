@@ -1389,6 +1389,9 @@ start_date = end_date - relativedelta(years=3)  # デフォルト3年
 
 # ─── Tab1: パフォーマンス分析 ────────────────────────────────────
 
+st.markdown("""<div style="background:#1565c0;color:white;padding:12px 22px;border-radius:8px;margin:28px 0 4px 0;font-size:18px;font-weight:bold;">
+📊 A.&nbsp;コア分析 &nbsp;<span style="font-size:12px;font-weight:400;opacity:.88">シャープレシオ・アルファ・ベータ</span></div>""", unsafe_allow_html=True)
+
 # ─────────────────────────────────────────────────────────────────
 st.header("📊 パフォーマンス分析")
 st.divider()
@@ -1734,6 +1737,9 @@ else:
 
 
 # ─── Tab2: セクターローテーション ────────────────────────────────
+
+st.markdown("""<div style="background:#2e7d32;color:white;padding:12px 22px;border-radius:8px;margin:28px 0 4px 0;font-size:18px;font-weight:bold;">
+📈 B.&nbsp;テクニカル・需給分析 &nbsp;<span style="font-size:12px;font-weight:400;opacity:.88">価格パターン / 需給 / モメンタム / セクター / J-Quants / ニュース</span></div>""", unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────────
 st.header("🔄 セクターローテーション")
@@ -2680,6 +2686,9 @@ def _av_get(func: str, params: dict = {}) -> dict:
         return {}
 
 
+st.markdown("""<div style="background:#bf360c;color:white;padding:12px 22px;border-radius:8px;margin:28px 0 4px 0;font-size:18px;font-weight:bold;">
+🗞️ D.&nbsp;外部データ・API &nbsp;<span style="font-size:12px;font-weight:400;opacity:.88">Finnhub / Alpha Vantage</span></div>""", unsafe_allow_html=True)
+
 # ─────────────────────────────────────────────────────────────────
 st.header("📡 Finnhub リアルタイム情報")
 st.caption("Finnhub APIによるリアルタイム株価・決算・インサイダー・ニュース")
@@ -3096,6 +3105,9 @@ else:
             st.warning("データ取得失敗（無料枠: 1分5回・1日25回制限）")
 
 
+
+st.markdown("""<div style="background:#6a1b9a;color:white;padding:12px 22px;border-radius:8px;margin:28px 0 4px 0;font-size:18px;font-weight:bold;">
+💰 C.&nbsp;ファンダメンタルズ分析 &nbsp;<span style="font-size:12px;font-weight:400;opacity:.88">来期業績スクリーニング / サイズ・バリューファクター / 価値創造（ROE・ROIC）</span></div>""", unsafe_allow_html=True)
 
 # =================================================================
 # 🔮 来期想定利益からのおすすめ銘柄スクリーニング
