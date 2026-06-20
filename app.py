@@ -2366,52 +2366,77 @@ if run_news:
                 ai_result = ai_news_summary(filtered, selected_name, selected_ticker)
             st.info(ai_result)
 
-    # ── TDnet 適時開示（直近3営業日・選択銘柄のみ）─────────────────
+    # ── TDnet 適時開示（直近3営業日・選択銘柄・自動表示）───────────
     st.divider()
     _sel_code4 = selected_ticker.replace(".T", "").zfill(4)
 
-    col_td_h, col_td_days = st.columns([3, 1])
-    with col_td_h:
-        st.subheader("📋 TDnet 適時開示（選択銘柄）")
-    with col_td_days:
-        _tdnet_days_n = st.selectbox(
-            "取得期間（営業日）", [2, 3, 5, 7], index=1,
-            key="tdnet_news_days",
-            help="週末に見る場合は3以上で金曜の開示をカバーできます"
+    _tdcol_h, _tdcol_r = st.columns([3, 1])
+    with _tdcol_h:
+        st.subheader("📋 TDnet 適時開示（直近3営業日）")
+    with _tdcol_r:
+        _tdnet_days_n = st.radio(
+            "期間", [3, 5, 7], index=0,
+            horizontal=True, key="tdnet_news_days",
+            help="週末閲覧時は3日で金曜まで遡ります"
         )
 
-    with st.spinner(f"TDnetから {selected_name} の開示を取得中（直近{_tdnet_days_n}営業日）..."):
+    with st.spinner(f"TDnetから {selected_name} の開示を取得中..."):
         _tdnet_news_list = fetch_tdnet_week(
             ticker_name_map, days=_tdnet_days_n, code4_filter=_sel_code4
         )
 
     if not _tdnet_news_list:
         st.info(
-            f"直近{_tdnet_days_n}営業日に **{selected_name}** の適時開示は見つかりませんでした。"
-            "（土日・祝日は開示なし。期間を延ばすか月曜以降にご確認ください）"
+            f"直近{_tdnet_days_n}営業日に **{selected_name}** の適時開示はありません。"
+            "（土日・祝日は開示なし。期間を延ばすか平日にご確認ください）"
         )
     else:
-        _df_tn = pd.DataFrame(_tdnet_news_list)
-        st.success(f"✅ {selected_name}：直近{_tdnet_days_n}営業日で **{len(_df_tn)}件** の開示")
+        _df_tn = pd.DataFrame(_tdnet_news_list).sort_values("日付", ascending=False)
 
+        # ── AI タイトル要約（自動）
+        _titles_str = "\n".join(
+            f"・{r['日付']} {r.get('時刻','')}  {r['タイトル']}"
+            for _, r in _df_tn.iterrows()
+        )
+        _prompt_titles = f"""
+{selected_name}（証券コード {_sel_code4}）の直近{_tdnet_days_n}営業日の適時開示タイトル一覧:
+
+{_titles_str}
+
+以下の観点で**200字以内**でまとめてください:
+1. 📌 主な開示内容のまとめ
+2. 📈 業績・財務・経営への影響
+3. 🔮 投資家として注目すべき点
+"""
+        with st.spinner("AIが開示内容を分析中..."):
+            try:
+                _ai_titles_sum, _ai_titles_nm = generate_ai_comment(_prompt_titles)
+                st.info(f"🤖 **AI開示要約（{_ai_titles_nm}）**\n\n{_ai_titles_sum}")
+            except Exception:
+                pass
+
+        st.caption(f"✅ {selected_name}：{len(_df_tn)}件（直近{_tdnet_days_n}営業日）")
+
+        # ── 開示一覧（カード形式）
         for _i, _row in _df_tn.iterrows():
             _has_pdf = bool(_row.get("PDF_URL"))
-            _icon    = "📄" if _has_pdf else "📝"
-            with st.expander(
-                f"{_icon} {_row['日付']} {_row.get('時刻','')}  {_row['タイトル']}",
-                expanded=len(_df_tn) == 1
-            ):
-                col_info, col_btn = st.columns([3, 1])
-                with col_info:
-                    st.write(f"**{_row['タイトル']}**")
-                    if _has_pdf:
-                        st.caption(f"PDF: `{_row['PDF_URL']}`")
-                    else:
-                        st.caption("（このファイルは PDF URL が取得できませんでした）")
-                with col_btn:
-                    if _has_pdf and st.button(
-                        "🤖 PDF→AI要約", key=f"tn_sum_{_i}", type="primary"
-                    ):
+            _col_a, _col_b, _col_c = st.columns([1.2, 4, 1.2])
+            with _col_a:
+                st.markdown(
+                    f"<div style='font-size:12px;color:#666;padding-top:6px'>"
+                    f"📅 {_row['日付']}<br>"
+                    f"{'🕐 ' + _row.get('時刻','') if _row.get('時刻') else ''}</div>",
+                    unsafe_allow_html=True,
+                )
+            with _col_b:
+                st.markdown(
+                    f"<div style='padding:6px 0;font-size:14px;font-weight:600'>"
+                    f"{'📄' if _has_pdf else '📝'} {_row['タイトル']}</div>",
+                    unsafe_allow_html=True,
+                )
+            with _col_c:
+                if _has_pdf:
+                    if st.button("🤖 PDF要約", key=f"tn_sum_{_i}", use_container_width=True):
                         with st.spinner("PDF取得・AI要約中（〜30秒）..."):
                             _pdf_txt = fetch_tdnet_pdf_text(_row["PDF_URL"])
                         if _pdf_txt.startswith("["):
@@ -2422,13 +2447,14 @@ if run_news:
 
 {_pdf_txt[:4000]}
 
-**300字以内**で以下の観点から要約してください：
+**300字以内**で以下の観点から要約:
 1. 📌 開示の概要（何を発表したか）
 2. 📈 業績・財務への影響（数値があれば具体的に）
 3. 🔮 投資家へのポイント・今後の注目点
 """
                             _sum, _ai_nm = generate_ai_comment(_prompt_tn)
                             st.success(f"**AI要約（{_ai_nm}）**\n\n{_sum}")
+            st.divider()
 
 
 # ─── Tab7: 市場全体ニュース ──────────────────────────────────────
