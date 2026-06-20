@@ -1445,15 +1445,9 @@ import concurrent.futures as _cf_boot
 _boot_tuple = tuple(ticker_name_map.items())
 _boot_s     = start_date.strftime("%Y-%m-%d")
 _boot_e     = end_date.strftime("%Y-%m-%d")
-with st.spinner("📊 基本データを並列取得中（初回のみ）..."):
-    with _cf_boot.ThreadPoolExecutor(max_workers=2) as _boot_ex:
-        _boot_f1 = _boot_ex.submit(
-            compute_sharpe_all, _boot_tuple, _boot_s, _boot_e, risk_free_rate
-        )
-        _boot_f2 = _boot_ex.submit(
-            fetch_all_ticker_info_bulk, _boot_tuple
-        )
-        _cf_boot.wait([_boot_f1, _boot_f2])
+# compute_sharpe_all をここでキャッシュウォーム（fetch_all_ticker_info_bulk は後段で定義後に別途実行）
+with st.spinner("📊 シャープレシオデータを取得中（初回のみ）..."):
+    compute_sharpe_all(_boot_tuple, _boot_s, _boot_e, risk_free_rate)
 
 
 # ─── Tab1: パフォーマンス分析 ────────────────────────────────────
@@ -2371,6 +2365,70 @@ if run_news:
             with st.spinner("AI分析中..."):
                 ai_result = ai_news_summary(filtered, selected_name, selected_ticker)
             st.info(ai_result)
+
+    # ── TDnet 適時開示（直近3営業日・選択銘柄のみ）─────────────────
+    st.divider()
+    _sel_code4 = selected_ticker.replace(".T", "").zfill(4)
+
+    col_td_h, col_td_days = st.columns([3, 1])
+    with col_td_h:
+        st.subheader("📋 TDnet 適時開示（選択銘柄）")
+    with col_td_days:
+        _tdnet_days_n = st.selectbox(
+            "取得期間（営業日）", [2, 3, 5, 7], index=1,
+            key="tdnet_news_days",
+            help="週末に見る場合は3以上で金曜の開示をカバーできます"
+        )
+
+    with st.spinner(f"TDnetから {selected_name} の開示を取得中（直近{_tdnet_days_n}営業日）..."):
+        _tdnet_news_list = fetch_tdnet_week(
+            ticker_name_map, days=_tdnet_days_n, code4_filter=_sel_code4
+        )
+
+    if not _tdnet_news_list:
+        st.info(
+            f"直近{_tdnet_days_n}営業日に **{selected_name}** の適時開示は見つかりませんでした。"
+            "（土日・祝日は開示なし。期間を延ばすか月曜以降にご確認ください）"
+        )
+    else:
+        _df_tn = pd.DataFrame(_tdnet_news_list)
+        st.success(f"✅ {selected_name}：直近{_tdnet_days_n}営業日で **{len(_df_tn)}件** の開示")
+
+        for _i, _row in _df_tn.iterrows():
+            _has_pdf = bool(_row.get("PDF_URL"))
+            _icon    = "📄" if _has_pdf else "📝"
+            with st.expander(
+                f"{_icon} {_row['日付']} {_row.get('時刻','')}  {_row['タイトル']}",
+                expanded=len(_df_tn) == 1
+            ):
+                col_info, col_btn = st.columns([3, 1])
+                with col_info:
+                    st.write(f"**{_row['タイトル']}**")
+                    if _has_pdf:
+                        st.caption(f"PDF: `{_row['PDF_URL']}`")
+                    else:
+                        st.caption("（このファイルは PDF URL が取得できませんでした）")
+                with col_btn:
+                    if _has_pdf and st.button(
+                        "🤖 PDF→AI要約", key=f"tn_sum_{_i}", type="primary"
+                    ):
+                        with st.spinner("PDF取得・AI要約中（〜30秒）..."):
+                            _pdf_txt = fetch_tdnet_pdf_text(_row["PDF_URL"])
+                        if _pdf_txt.startswith("["):
+                            st.error(f"取得失敗: {_pdf_txt}")
+                        else:
+                            _prompt_tn = f"""
+以下は {selected_name}（{_sel_code4}）の適時開示「{_row['タイトル']}」のPDFテキストです。
+
+{_pdf_txt[:4000]}
+
+**300字以内**で以下の観点から要約してください：
+1. 📌 開示の概要（何を発表したか）
+2. 📈 業績・財務への影響（数値があれば具体的に）
+3. 🔮 投資家へのポイント・今後の注目点
+"""
+                            _sum, _ai_nm = generate_ai_comment(_prompt_tn)
+                            st.success(f"**AI要約（{_ai_nm}）**\n\n{_sum}")
 
 
 # ─── Tab7: 市場全体ニュース ──────────────────────────────────────
