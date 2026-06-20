@@ -2296,6 +2296,99 @@ else:
     )
 
 
+# ── TDnet / PDF ヘルパー（銘柄別ニュースセクションより前で定義）──────
+EDINET_API_BASE = "https://disclosure.edinet-api.go.jp/api/v2"
+TDNET_BASE      = "https://www.release.tdnet.info/inbs"
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_tdnet_week(code_map: dict, days: int = 7, code4_filter: str = None) -> list:
+    import re as _re
+    from bs4 import BeautifulSoup as _BS
+    from datetime import timedelta as _td
+    code4_map = {}
+    for ticker, (name, sector) in code_map.items():
+        c4 = ticker.replace(".T", "").zfill(4)
+        code4_map[c4] = (name, sector)
+    results = []
+    today = datetime.today()
+    checked, d = 0, 0
+    while checked < days and d < 20:
+        target = today - _td(days=d); d += 1
+        if target.weekday() >= 5:
+            continue
+        checked += 1
+        date_str = target.strftime("%Y%m%d")
+        for page in range(1, 10):
+            url = f"{TDNET_BASE}/I_list_{page:03d}_{date_str}.html"
+            try:
+                r = requests.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
+                if r.status_code != 200:
+                    break
+                r.encoding = r.apparent_encoding or "utf-8"
+                soup = _BS(r.text, "html.parser")
+                rows = soup.find_all("tr")
+                found_any = False
+                for row in rows:
+                    cells = row.find_all("td")
+                    if len(cells) < 4:
+                        continue
+                    texts = [c.get_text(strip=True) for c in cells]
+                    code = next((t for t in texts if _re.fullmatch(r'\d{4}', t)), None)
+                    if not code or code not in code4_map:
+                        continue
+                    if code4_filter and code != code4_filter:
+                        continue
+                    found_any = True
+                    pdf_url = None
+                    title = ""
+                    for a in row.find_all("a", href=True):
+                        h = a["href"]
+                        m = _re.search(r'(\d{14,18})\.pdf', h)
+                        if m:
+                            pdf_url = f"https://www.release.tdnet.info/inbs/{m.group(1)}.pdf"
+                        elif not title and not h.endswith(".pdf"):
+                            t = a.get_text(strip=True)
+                            if t and len(t) > 2:
+                                title = t
+                    if not title:
+                        ci = texts.index(code)
+                        title = texts[ci + 2] if ci + 2 < len(texts) else texts[-1]
+                    name, sector = code4_map[code]
+                    time_str = next(
+                        (t for t in texts if _re.fullmatch(r'\d{1,2}:\d{2}', t)), ""
+                    )
+                    results.append({
+                        "日付": target.strftime("%Y-%m-%d"),
+                        "時刻": time_str,
+                        "コード": code,
+                        "企業名": name,
+                        "業種": sector,
+                        "タイトル": title,
+                        "PDF_URL": pdf_url,
+                    })
+                if not found_any and page > 1:
+                    break
+            except Exception:
+                break
+    return results
+
+@st.cache_data(ttl=7200, show_spinner=False)
+def fetch_tdnet_pdf_text(pdf_url: str) -> str:
+    if not pdf_url:
+        return "[PDF URLが見つかりませんでした]"
+    try:
+        import pdfplumber, io
+        r = requests.get(pdf_url, timeout=35, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200:
+            return f"[HTTP {r.status_code}: PDF取得失敗]"
+        if len(r.content) < 500:
+            return "[レスポンスが短すぎます]"
+        with pdfplumber.open(io.BytesIO(r.content)) as pdf:
+            text = "\n".join(p.extract_text() or "" for p in pdf.pages[:5])
+        return text if text.strip() else "[テキスト抽出失敗（画像PDFの可能性）]"
+    except Exception as e:
+        return f"[取得エラー: {e}]"
+
 # ─── Tab6: 銘柄別ニュース ─────────────────────────────────────────
 
 # ─────────────────────────────────────────────────────────────────
@@ -2519,103 +2612,7 @@ if True:  # 自動実行
 # ================================================================
 # 📋 適時開示・EDINET AI分析 ヘルパー関数
 # ================================================================
-
-EDINET_API_BASE = "https://disclosure.edinet-api.go.jp/api/v2"
-TDNET_BASE      = "https://www.release.tdnet.info/inbs"
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def fetch_tdnet_week(code_map: dict, days: int = 7, code4_filter: str = None) -> list:
-    """TDnetから過去N営業日の適時開示を取得（PDF URLも含む）"""
-    import re as _re
-    from bs4 import BeautifulSoup as _BS
-    from datetime import timedelta as _td
-    code4_map = {}
-    for ticker, (name, sector) in code_map.items():
-        c4 = ticker.replace(".T", "").zfill(4)
-        code4_map[c4] = (name, sector)
-    results = []
-    today = datetime.today()
-    checked, d = 0, 0
-    while checked < days and d < 20:
-        target = today - _td(days=d); d += 1
-        if target.weekday() >= 5:
-            continue
-        checked += 1
-        date_str = target.strftime("%Y%m%d")
-        for page in range(1, 10):
-            url = f"{TDNET_BASE}/I_list_{page:03d}_{date_str}.html"
-            try:
-                r = requests.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
-                if r.status_code != 200:
-                    break
-                r.encoding = r.apparent_encoding or "utf-8"
-                soup = _BS(r.text, "html.parser")
-                rows = soup.find_all("tr")
-                found_any = False
-                for row in rows:
-                    cells = row.find_all("td")
-                    if len(cells) < 4:
-                        continue
-                    texts = [c.get_text(strip=True) for c in cells]
-                    code = next((t for t in texts if _re.fullmatch(r'\d{4}', t)), None)
-                    if not code or code not in code4_map:
-                        continue
-                    if code4_filter and code != code4_filter:
-                        continue
-                    found_any = True
-                    # PDF URL を行内の <a href="...pdf"> から取得
-                    pdf_url = None
-                    title = ""
-                    for a in row.find_all("a", href=True):
-                        h = a["href"]
-                        m = _re.search(r'(\d{14,18})\.pdf', h)
-                        if m:
-                            pdf_url = f"https://www.release.tdnet.info/inbs/{m.group(1)}.pdf"
-                        elif not title and not h.endswith(".pdf"):
-                            t = a.get_text(strip=True)
-                            if t and len(t) > 2:
-                                title = t
-                    if not title:
-                        ci = texts.index(code)
-                        title = texts[ci + 2] if ci + 2 < len(texts) else texts[-1]
-                    name, sector = code4_map[code]
-                    time_str = next(
-                        (t for t in texts if _re.fullmatch(r'\d{1,2}:\d{2}', t)), ""
-                    )
-                    results.append({
-                        "日付": target.strftime("%Y-%m-%d"),
-                        "時刻": time_str,
-                        "コード": code,
-                        "企業名": name,
-                        "業種": sector,
-                        "タイトル": title,
-                        "PDF_URL": pdf_url,
-                    })
-                if not found_any and page > 1:
-                    break
-            except Exception:
-                break
-    return results
-
-
-@st.cache_data(ttl=7200, show_spinner=False)
-def fetch_tdnet_pdf_text(pdf_url: str) -> str:
-    """TDnet PDFを取得しpdfplumberでテキスト抽出（先頭5ページ）"""
-    if not pdf_url:
-        return "[PDF URLが見つかりませんでした]"
-    try:
-        import pdfplumber, io
-        r = requests.get(pdf_url, timeout=35, headers={"User-Agent": "Mozilla/5.0"})
-        if r.status_code != 200:
-            return f"[HTTP {r.status_code}: PDF取得失敗]"
-        if len(r.content) < 500:
-            return "[レスポンスが短すぎます]"
-        with pdfplumber.open(io.BytesIO(r.content)) as pdf:
-            text = "\n".join(p.extract_text() or "" for p in pdf.pages[:5])
-        return text if text.strip() else "[テキスト抽出失敗（画像PDFの可能性）]"
-    except Exception as e:
-        return f"[取得エラー: {e}]"
-
+# fetch_tdnet_week / fetch_tdnet_pdf_text は銘柄別ニュースセクション直前で定義済み
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_edinet_docs(days: int = 7, doc_type_filter: str = "") -> list:
