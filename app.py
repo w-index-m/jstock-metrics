@@ -415,26 +415,63 @@ def ai_news_summary(news_items: list[dict], company_name: str, ticker: str) -> s
 # 🔄 セクターローテーション分析モジュール
 # ================================================================
 
+def _batch_close(tickers: list, start_dt, end_dt) -> pd.DataFrame:
+    """全銘柄を yf.download 1回のバッチ取得（Close列のみ返す）"""
+    try:
+        raw = yf.download(
+            tickers,
+            start=start_dt.strftime("%Y-%m-%d"),
+            end=end_dt.strftime("%Y-%m-%d"),
+            progress=False, auto_adjust=True, threads=True,
+        )
+        if raw.empty:
+            return pd.DataFrame()
+        return raw["Close"] if isinstance(raw.columns, pd.MultiIndex) else raw
+    except Exception:
+        return pd.DataFrame()
+
+
+def _batch_ohlcv(tickers: list, start_dt, end_dt) -> dict:
+    """Close / High / Low / Volume を1回のバッチ取得でまとめて返す"""
+    try:
+        raw = yf.download(
+            tickers,
+            start=start_dt.strftime("%Y-%m-%d"),
+            end=end_dt.strftime("%Y-%m-%d"),
+            progress=False, auto_adjust=True, threads=True,
+        )
+        if raw.empty:
+            return {}
+        if isinstance(raw.columns, pd.MultiIndex):
+            lvl0 = raw.columns.get_level_values(0).unique()
+            return {
+                "Close":  raw["Close"]  if "Close"  in lvl0 else pd.DataFrame(),
+                "Volume": raw["Volume"] if "Volume" in lvl0 else pd.DataFrame(),
+                "High":   raw["High"]   if "High"   in lvl0 else pd.DataFrame(),
+                "Low":    raw["Low"]    if "Low"    in lvl0 else pd.DataFrame(),
+            }
+        return {"Close": raw, "Volume": pd.DataFrame(), "High": pd.DataFrame(), "Low": pd.DataFrame()}
+    except Exception:
+        return {}
+
+
 @st.cache_data(ttl=1800)
 def get_sector_performance(ticker_name_map: dict, period_days: int = 20) -> pd.DataFrame:
     from datetime import timedelta
-    end_date   = datetime.today()
-    start_date = end_date - timedelta(days=period_days + 10)
-    sector_returns = {}
+    end_dt   = datetime.today()
+    start_dt = end_dt - timedelta(days=period_days + 10)
+    close_all = _batch_close(list(ticker_name_map.keys()), start_dt, end_dt)
+    if close_all.empty:
+        return pd.DataFrame()
+    sector_returns: dict = {}
     for ticker, (name, sector) in ticker_name_map.items():
-        try:
-            df = _yfdownload(ticker, start=start_date, end=end_date, progress=False)
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.droplevel(1)
-            if df.empty or len(df) < 2:
-                continue
-            close = df["Close"].dropna()
-            ret = (close.iloc[-1] - close.iloc[0]) / close.iloc[0] * 100
-            if sector not in sector_returns:
-                sector_returns[sector] = []
-            sector_returns[sector].append(float(ret))
-        except Exception:
+        if ticker not in close_all.columns:
             continue
+        close = close_all[ticker].dropna()
+        if len(close) < 2:
+            continue
+        ret = (close.iloc[-1] - close.iloc[0]) / close.iloc[0] * 100
+        sector_returns.setdefault(sector, []).append(float(ret))
     rows = []
     for sector, rets in sector_returns.items():
         rows.append({
@@ -454,23 +491,19 @@ def get_sector_performance(ticker_name_map: dict, period_days: int = 20) -> pd.D
 @st.cache_data(ttl=1800)
 def get_sector_timeseries(ticker_name_map: dict, days: int = 60) -> pd.DataFrame:
     from datetime import timedelta
-    end_date   = datetime.today()
-    start_date = end_date - timedelta(days=days + 5)
-    sector_price_data = {}
+    end_dt   = datetime.today()
+    start_dt = end_dt - timedelta(days=days + 5)
+    close_all = _batch_close(list(ticker_name_map.keys()), start_dt, end_dt)
+    if close_all.empty:
+        return pd.DataFrame()
+    sector_price_data: dict = {}
     for ticker, (name, sector) in ticker_name_map.items():
-        try:
-            df = _yfdownload(ticker, start=start_date, end=end_date, progress=False)
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.droplevel(1)
-            if df.empty or len(df) < 5:
-                continue
-            close = df["Close"].dropna()
-            norm  = close / close.iloc[0] * 100
-            if sector not in sector_price_data:
-                sector_price_data[sector] = []
-            sector_price_data[sector].append(norm)
-        except Exception:
+        if ticker not in close_all.columns:
             continue
+        close = close_all[ticker].dropna()
+        if len(close) < 5:
+            continue
+        sector_price_data.setdefault(sector, []).append(close / close.iloc[0] * 100)
     sector_avg = {}
     for sector, series_list in sector_price_data.items():
         combined = pd.concat(series_list, axis=1)
@@ -587,23 +620,28 @@ def plot_sector_heatmap(df_multi: pd.DataFrame) -> plt.Figure:
 def get_volume_surge(ticker_name_map: dict, surge_ratio: float = 2.0,
                      short_days: int = 5, base_days: int = 20) -> pd.DataFrame:
     from datetime import timedelta
-    end_date   = datetime.today()
-    start_date = end_date - timedelta(days=base_days + 10)
+    end_dt   = datetime.today()
+    start_dt = end_dt - timedelta(days=base_days + 10)
+    cols = _batch_ohlcv(list(ticker_name_map.keys()), start_dt, end_dt)
+    close_all  = cols.get("Close",  pd.DataFrame())
+    volume_all = cols.get("Volume", pd.DataFrame())
+    if close_all.empty:
+        return pd.DataFrame()
     results = []
     for ticker, (name, sector) in ticker_name_map.items():
         try:
-            df = _yfdownload(ticker, start=start_date, end=end_date, progress=False)
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.droplevel(1)
-            if df.empty or len(df) < base_days:
+            if ticker not in close_all.columns:
                 continue
-            vol = df["Volume"].dropna()
-            recent_avg = vol.iloc[-short_days:].mean()
-            base_avg   = vol.iloc[-base_days:-short_days].mean()
+            close = close_all[ticker].dropna()
+            vol   = volume_all[ticker].dropna() if not volume_all.empty and ticker in volume_all.columns else pd.Series()
+            if len(close) < base_days or len(vol) < base_days:
+                continue
+            recent_avg = float(vol.iloc[-short_days:].mean())
+            base_avg   = float(vol.iloc[-base_days:-short_days].mean())
             if base_avg == 0:
                 continue
-            ratio = recent_avg / base_avg
-            price_chg = (df["Close"].iloc[-1] - df["Close"].iloc[-short_days]) / df["Close"].iloc[-short_days] * 100
+            ratio     = recent_avg / base_avg
+            price_chg = (close.iloc[-1] - close.iloc[-short_days]) / close.iloc[-short_days] * 100
             if ratio >= surge_ratio:
                 results.append({
                     "企業名": name, "業種": sector, "ティッカー": ticker,
@@ -611,7 +649,7 @@ def get_volume_surge(ticker_name_map: dict, surge_ratio: float = 2.0,
                     "直近5日平均出来高": int(recent_avg),
                     "基準平均出来高": int(base_avg),
                     "株価変化率(5日%)": round(float(price_chg), 2),
-                    "最新株価": round(float(df["Close"].iloc[-1]), 1),
+                    "最新株価": round(float(close.iloc[-1]), 1),
                 })
         except Exception:
             continue
@@ -624,25 +662,31 @@ def get_volume_surge(ticker_name_map: dict, surge_ratio: float = 2.0,
 @st.cache_data(ttl=1800)
 def get_vwap_deviation(ticker_name_map: dict, days: int = 20) -> pd.DataFrame:
     from datetime import timedelta
-    end_date   = datetime.today()
-    start_date = end_date - timedelta(days=days + 5)
+    end_dt   = datetime.today()
+    start_dt = end_dt - timedelta(days=days + 5)
+    cols = _batch_ohlcv(list(ticker_name_map.keys()), start_dt, end_dt)
+    close_all  = cols.get("Close",  pd.DataFrame())
+    volume_all = cols.get("Volume", pd.DataFrame())
+    if close_all.empty:
+        return pd.DataFrame()
     results = []
     for ticker, (name, sector) in ticker_name_map.items():
         try:
-            df = _yfdownload(ticker, start=start_date, end=end_date, progress=False)
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.droplevel(1)
-            if df.empty or len(df) < 5:
+            if ticker not in close_all.columns:
                 continue
-            df = df.dropna(subset=["Close", "Volume"])
-            vwap = (df["Close"] * df["Volume"]).sum() / df["Volume"].sum()
-            current_price = float(df["Close"].iloc[-1])
-            deviation = (current_price - float(vwap)) / float(vwap) * 100
+            close = close_all[ticker].dropna()
+            vol   = volume_all[ticker].dropna() if not volume_all.empty and ticker in volume_all.columns else pd.Series()
+            if len(close) < 5 or len(vol) < 5:
+                continue
+            idx   = close.index.intersection(vol.index)
+            c, v  = close.loc[idx], vol.loc[idx]
+            vwap  = (c * v).sum() / v.sum()
+            cur   = float(c.iloc[-1])
             results.append({
                 "企業名": name, "業種": sector, "ティッカー": ticker,
-                "現在値": round(current_price, 1),
+                "現在値": round(cur, 1),
                 "VWAP": round(float(vwap), 1),
-                "VWAP乖離率(%)": round(deviation, 2),
+                "VWAP乖離率(%)": round((cur - float(vwap)) / float(vwap) * 100, 2),
             })
         except Exception:
             continue
@@ -655,16 +699,20 @@ def get_vwap_deviation(ticker_name_map: dict, days: int = 20) -> pd.DataFrame:
 @st.cache_data(ttl=1800)
 def get_price_volume_scatter(ticker_name_map: dict, days: int = 20) -> pd.DataFrame:
     from datetime import timedelta
-    end_date   = datetime.today()
-    start_date = end_date - timedelta(days=days + 10)
+    end_dt   = datetime.today()
+    start_dt = end_dt - timedelta(days=days + 10)
+    cols = _batch_ohlcv(list(ticker_name_map.keys()), start_dt, end_dt)
+    close_all  = cols.get("Close",  pd.DataFrame())
+    volume_all = cols.get("Volume", pd.DataFrame())
+    if close_all.empty:
+        return pd.DataFrame()
     results = []
     for ticker, (name, sector) in ticker_name_map.items():
         try:
-            df = _yfdownload(ticker, start=start_date, end=end_date, progress=False)
-            if df.empty or len(df) < 5:
+            if ticker not in close_all.columns:
                 continue
-            close  = _to_series(df["Close"]).dropna()
-            volume = _to_series(df["Volume"]).dropna()
+            close  = close_all[ticker].dropna()
+            volume = volume_all[ticker].dropna() if not volume_all.empty and ticker in volume_all.columns else pd.Series()
             if len(close) < 5 or len(volume) < 10:
                 continue
             price_chg = (close.iloc[-1] - close.iloc[0]) / close.iloc[0] * 100
@@ -691,10 +739,14 @@ def plot_pv_scatter(df: pd.DataFrame) -> None:
 
         df = df.copy()
         # 原点からの距離で外れ値上位25銘柄にフロートラベルを付与
+        # さらに注目銘柄は距離に関わらず必ずラベル表示
+        _PINNED_LABELS = {"フジクラ", "JX金属", "太陽誘電"}
         df["_dist"] = np.sqrt(df["株価騰落率(%)"]**2 + df["出来高変化率(%)"]**2)
         top_idx = df.nlargest(min(25, len(df)), "_dist").index
         df["_label"] = ""
         df.loc[top_idx, "_label"] = df.loc[top_idx, "企業名"]
+        pinned_idx = df[df["企業名"].isin(_PINNED_LABELS)].index
+        df.loc[pinned_idx, "_label"] = df.loc[pinned_idx, "企業名"]
 
         x_max = df["出来高変化率(%)"].max()
         x_min = df["出来高変化率(%)"].min()
@@ -816,32 +868,34 @@ def plot_pv_scatter(df: pd.DataFrame) -> None:
 @st.cache_data(ttl=1800)
 def get_52week_highlow(ticker_name_map: dict) -> pd.DataFrame:
     from datetime import timedelta
-    end_date   = datetime.today()
-    start_date = end_date - timedelta(days=365)
+    end_dt   = datetime.today()
+    start_dt = end_dt - timedelta(days=365)
+    cols = _batch_ohlcv(list(ticker_name_map.keys()), start_dt, end_dt)
+    close_all = cols.get("Close", pd.DataFrame())
+    high_all  = cols.get("High",  pd.DataFrame())
+    low_all   = cols.get("Low",   pd.DataFrame())
+    if close_all.empty:
+        return pd.DataFrame()
     results = []
     for ticker, (name, sector) in ticker_name_map.items():
         try:
-            df = _yfdownload(ticker, start=start_date, end=end_date, progress=False)
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.droplevel(1)
-            if df.empty or len(df) < 50:
+            if ticker not in close_all.columns:
                 continue
-            high_52w = float(df["High"].max())
-            low_52w  = float(df["Low"].min())
-            current  = float(df["Close"].iloc[-1])
-            from_high = (current - high_52w) / high_52w * 100
-            from_low  = (current - low_52w)  / low_52w  * 100
-            is_new_high = float(df["High"].iloc[-1]) >= high_52w * 0.995
-            is_new_low  = float(df["Low"].iloc[-1])  <= low_52w  * 1.005
+            close = close_all[ticker].dropna()
+            if len(close) < 50:
+                continue
+            high_52w = float(high_all[ticker].dropna().max()) if not high_all.empty and ticker in high_all.columns else float(close.max())
+            low_52w  = float(low_all[ticker].dropna().min())  if not low_all.empty  and ticker in low_all.columns  else float(close.min())
+            current  = float(close.iloc[-1])
             results.append({
                 "企業名": name, "業種": sector,
                 "現在値": round(current, 1),
                 "52週高値": round(high_52w, 1),
                 "52週安値": round(low_52w, 1),
-                "高値からの乖離(%)": round(from_high, 2),
-                "安値からの乖離(%)": round(from_low, 2),
-                "新高値": "新高値" if is_new_high else "",
-                "新安値": "新安値" if is_new_low else "",
+                "高値からの乖離(%)": round((current - high_52w) / high_52w * 100, 2),
+                "安値からの乖離(%)": round((current - low_52w)  / low_52w  * 100, 2),
+                "新高値": "新高値" if current >= high_52w * 0.995 else "",
+                "新安値": "新安値" if current <= low_52w  * 1.005 else "",
             })
         except Exception:
             continue
@@ -851,27 +905,29 @@ def get_52week_highlow(ticker_name_map: dict) -> pd.DataFrame:
 @st.cache_data(ttl=1800)
 def get_ma_deviation(ticker_name_map: dict) -> pd.DataFrame:
     from datetime import timedelta
-    end_date   = datetime.today()
-    start_date = end_date - timedelta(days=250)
+    end_dt   = datetime.today()
+    start_dt = end_dt - timedelta(days=250)
+    close_all = _batch_close(list(ticker_name_map.keys()), start_dt, end_dt)
+    if close_all.empty:
+        return pd.DataFrame()
     results = []
     for ticker, (name, sector) in ticker_name_map.items():
         try:
-            df = _yfdownload(ticker, start=start_date, end=end_date, progress=False)
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.droplevel(1)
-            if df.empty or len(df) < 200:
+            if ticker not in close_all.columns:
                 continue
-            close   = df["Close"].dropna()
-            current = float(close.iloc[-1])
-            ma25    = float(close.rolling(25).mean().iloc[-1])
-            ma75    = float(close.rolling(75).mean().iloc[-1])
-            ma200   = float(close.rolling(200).mean().iloc[-1])
+            close = close_all[ticker].dropna()
+            if len(close) < 200:
+                continue
+            cur  = float(close.iloc[-1])
+            ma25 = float(close.rolling(25).mean().iloc[-1])
+            ma75 = float(close.rolling(75).mean().iloc[-1])
+            ma200= float(close.rolling(200).mean().iloc[-1])
             results.append({
                 "企業名": name, "業種": sector,
-                "現在値": round(current, 1),
-                "25日MA乖離(%)": round((current - ma25) / ma25 * 100, 2),
-                "75日MA乖離(%)": round((current - ma75) / ma75 * 100, 2),
-                "200日MA乖離(%)": round((current - ma200) / ma200 * 100, 2),
+                "現在値": round(cur, 1),
+                "25日MA乖離(%)":  round((cur - ma25)  / ma25  * 100, 2),
+                "75日MA乖離(%)":  round((cur - ma75)  / ma75  * 100, 2),
+                "200日MA乖離(%)": round((cur - ma200) / ma200 * 100, 2),
             })
         except Exception:
             continue
@@ -884,38 +940,30 @@ def get_ma_deviation(ticker_name_map: dict) -> pd.DataFrame:
 @st.cache_data(ttl=1800)
 def get_cross_signals(ticker_name_map: dict, lookback_days: int = 10) -> pd.DataFrame:
     from datetime import timedelta
-    end_date   = datetime.today()
-    start_date = end_date - timedelta(days=120)
+    end_dt   = datetime.today()
+    start_dt = end_dt - timedelta(days=120)
+    close_all = _batch_close(list(ticker_name_map.keys()), start_dt, end_dt)
+    if close_all.empty:
+        return pd.DataFrame()
     results = []
     for ticker, (name, sector) in ticker_name_map.items():
         try:
-            df = _yfdownload(ticker, start=start_date, end=end_date, progress=False)
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.droplevel(1)
-            if df.empty or len(df) < 75:
+            if ticker not in close_all.columns:
                 continue
-            close = df["Close"].dropna()
-            ma25  = close.rolling(25).mean()
-            ma75  = close.rolling(75).mean()
-            diff  = ma25 - ma75
+            close = close_all[ticker].dropna()
+            if len(close) < 75:
+                continue
+            diff = close.rolling(25).mean() - close.rolling(75).mean()
             for i in range(max(1, len(diff) - lookback_days), len(diff)):
                 if pd.isna(diff.iloc[i]) or pd.isna(diff.iloc[i-1]):
                     continue
                 if diff.iloc[i-1] < 0 and diff.iloc[i] >= 0:
-                    results.append({
-                        "企業名": name, "業種": sector,
-                        "シグナル": "ゴールデンクロス",
-                        "発生日": str(diff.index[i])[:10],
-                        "現在値": round(float(close.iloc[-1]), 1),
-                    })
+                    results.append({"企業名": name, "業種": sector, "シグナル": "ゴールデンクロス",
+                                    "発生日": str(diff.index[i])[:10], "現在値": round(float(close.iloc[-1]), 1)})
                     break
                 elif diff.iloc[i-1] > 0 and diff.iloc[i] <= 0:
-                    results.append({
-                        "企業名": name, "業種": sector,
-                        "シグナル": "デッドクロス",
-                        "発生日": str(diff.index[i])[:10],
-                        "現在値": round(float(close.iloc[-1]), 1),
-                    })
+                    results.append({"企業名": name, "業種": sector, "シグナル": "デッドクロス",
+                                    "発生日": str(diff.index[i])[:10], "現在値": round(float(close.iloc[-1]), 1)})
                     break
         except Exception:
             continue
@@ -929,72 +977,68 @@ def get_cross_signals(ticker_name_map: dict, lookback_days: int = 10) -> pd.Data
 @st.cache_data(ttl=1800)
 def get_dow_of_week_pattern(ticker_name_map: dict, days: int = 180) -> pd.DataFrame:
     from datetime import timedelta
-    end_date   = datetime.today()
-    start_date = end_date - timedelta(days=days)
-    dow_map    = {0: "月", 1: "火", 2: "水", 3: "木", 4: "金"}
+    end_dt   = datetime.today()
+    start_dt = end_dt - timedelta(days=days)
+    close_all = _batch_close(list(ticker_name_map.keys()), start_dt, end_dt)
+    if close_all.empty:
+        return pd.DataFrame()
+    dow_map = {0: "月", 1: "火", 2: "水", 3: "木", 4: "金"}
     sector_dow: dict = {}
     for ticker, (name, sector) in ticker_name_map.items():
+        if ticker not in close_all.columns:
+            continue
         try:
-            df = _yfdownload(ticker, start=start_date, end=end_date, progress=False)
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.droplevel(1)
-            if df.empty or len(df) < 20:
+            close = close_all[ticker].dropna()
+            if len(close) < 20:
                 continue
-            ret = df["Close"].pct_change().dropna() * 100
+            ret = close.pct_change().dropna() * 100
             ret.index = pd.to_datetime(ret.index)
             for dow_num, dow_label in dow_map.items():
                 avg = float(ret[ret.index.dayofweek == dow_num].mean())
-                key = (sector, dow_label)
-                if key not in sector_dow:
-                    sector_dow[key] = []
-                sector_dow[key].append(avg)
+                sector_dow.setdefault((sector, dow_label), []).append(avg)
         except Exception:
             continue
-    rows = []
-    for (sector, dow), vals in sector_dow.items():
-        rows.append({"業種": sector, "曜日": dow, "平均リターン(%)": round(np.mean(vals), 4)})
+    rows = [{"業種": s, "曜日": d, "平均リターン(%)": round(np.mean(vals), 4)}
+            for (s, d), vals in sector_dow.items()]
     df_long = pd.DataFrame(rows)
     if df_long.empty:
         return df_long
     df_pivot = df_long.pivot(index="業種", columns="曜日", values="平均リターン(%)")
-    dow_order = ["月", "火", "水", "木", "金"]
-    df_pivot  = df_pivot.reindex(columns=[d for d in dow_order if d in df_pivot.columns])
-    return df_pivot
+    return df_pivot.reindex(columns=[d for d in ["月","火","水","木","金"] if d in df_pivot.columns])
 
 
 @st.cache_data(ttl=1800)
 def get_correlation_divergence(ticker_name_map: dict, days: int = 60,
                                 corr_window: int = 20) -> pd.DataFrame:
     from datetime import timedelta
-    end_date   = datetime.today()
-    start_date = end_date - timedelta(days=days + 10)
-    benchmark = _yfdownload("^N225", start=start_date, end=end_date, progress=False)
-    if isinstance(benchmark.columns, pd.MultiIndex):
-        benchmark.columns = benchmark.columns.droplevel(1)
-    market_ret = benchmark["Close"].pct_change().dropna()
+    end_dt   = datetime.today()
+    start_dt = end_dt - timedelta(days=days + 10)
+    tickers  = list(ticker_name_map.keys()) + ["^N225"]
+    close_all = _batch_close(tickers, start_dt, end_dt)
+    if close_all.empty or "^N225" not in close_all.columns:
+        return pd.DataFrame()
+    market_ret = close_all["^N225"].pct_change().dropna()
     results = []
     for ticker, (name, sector) in ticker_name_map.items():
         try:
-            df = _yfdownload(ticker, start=start_date, end=end_date, progress=False)
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.droplevel(1)
-            if df.empty or len(df) < corr_window + 5:
+            if ticker not in close_all.columns:
                 continue
-            ret = df["Close"].pct_change().dropna()
+            close = close_all[ticker].dropna()
+            if len(close) < corr_window + 5:
+                continue
+            ret    = close.pct_change().dropna()
             common = ret.index.intersection(market_ret.index)
             if len(common) < corr_window + 5:
                 continue
-            r = ret.loc[common]
-            m = market_ret.loc[common]
+            r, m        = ret.loc[common], market_ret.loc[common]
             corr_long   = float(r.corr(m))
             corr_recent = float(r.iloc[-corr_window:].corr(m.iloc[-corr_window:]))
-            divergence  = corr_long - corr_recent
-            price_chg   = (df["Close"].iloc[-1] - df["Close"].iloc[-5]) / df["Close"].iloc[-5] * 100
+            price_chg   = (close.iloc[-1] - close.iloc[-5]) / close.iloc[-5] * 100
             results.append({
                 "企業名": name, "業種": sector,
                 "長期相関": round(corr_long, 3),
                 "直近相関": round(corr_recent, 3),
-                "相関乖離度": round(divergence, 3),
+                "相関乖離度": round(corr_long - corr_recent, 3),
                 "直近5日株価変化(%)": round(float(price_chg), 2),
             })
         except Exception:
@@ -1008,25 +1052,31 @@ def get_correlation_divergence(ticker_name_map: dict, days: int = 60,
 @st.cache_data(ttl=1800)
 def get_momentum_score(ticker_name_map: dict) -> pd.DataFrame:
     from datetime import timedelta
-    end_date   = datetime.today()
-    start_date = end_date - timedelta(days=30)
+    end_dt   = datetime.today()
+    start_dt = end_dt - timedelta(days=30)
+    cols = _batch_ohlcv(list(ticker_name_map.keys()), start_dt, end_dt)
+    close_all  = cols.get("Close",  pd.DataFrame())
+    volume_all = cols.get("Volume", pd.DataFrame())
+    if close_all.empty:
+        return pd.DataFrame()
     results = []
     for ticker, (name, sector) in ticker_name_map.items():
         try:
-            df = _yfdownload(ticker, start=start_date, end=end_date, progress=False)
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.droplevel(1)
-            if df.empty or len(df) < 10:
+            if ticker not in close_all.columns:
                 continue
-            price_chg = (df["Close"].iloc[-1] - df["Close"].iloc[0]) / df["Close"].iloc[0] * 100
-            vol_chg   = (df["Volume"].iloc[-5:].mean() - df["Volume"].mean()) / (df["Volume"].mean() + 1) * 100
-            score = float(price_chg) * np.log1p(max(float(vol_chg), 0) / 100 + 1)
+            close = close_all[ticker].dropna()
+            if len(close) < 10:
+                continue
+            vol = volume_all[ticker].dropna() if not volume_all.empty and ticker in volume_all.columns else pd.Series()
+            price_chg = (close.iloc[-1] - close.iloc[0]) / close.iloc[0] * 100
+            vol_chg   = (vol.iloc[-5:].mean() - vol.mean()) / (vol.mean() + 1) * 100 if len(vol) >= 5 else 0.0
+            score     = float(price_chg) * np.log1p(max(float(vol_chg), 0) / 100 + 1)
             results.append({
                 "企業名": name, "業種": sector,
                 "モメンタムスコア": round(score, 3),
                 "株価騰落率(%)": round(float(price_chg), 2),
                 "出来高変化率(%)": round(float(vol_chg), 2),
-                "現在値": round(float(df["Close"].iloc[-1]), 1),
+                "現在値": round(float(close.iloc[-1]), 1),
             })
         except Exception:
             continue
@@ -1385,6 +1435,25 @@ def compute_sharpe_all(
 # ================================================================
 end_date   = datetime.today()
 start_date = end_date - relativedelta(years=3)  # デフォルト3年
+
+# ================================================================
+# 起動時 並列プリフェッチ（キャッシュウォームアップ）
+# compute_sharpe_all と fetch_all_ticker_info_bulk を同時実行し
+# 後続セクションがキャッシュ済みデータを即座に取得できるようにする
+# ================================================================
+import concurrent.futures as _cf_boot
+_boot_tuple = tuple(ticker_name_map.items())
+_boot_s     = start_date.strftime("%Y-%m-%d")
+_boot_e     = end_date.strftime("%Y-%m-%d")
+with st.spinner("📊 基本データを並列取得中（初回のみ）..."):
+    with _cf_boot.ThreadPoolExecutor(max_workers=2) as _boot_ex:
+        _boot_f1 = _boot_ex.submit(
+            compute_sharpe_all, _boot_tuple, _boot_s, _boot_e, risk_free_rate
+        )
+        _boot_f2 = _boot_ex.submit(
+            fetch_all_ticker_info_bulk, _boot_tuple
+        )
+        _cf_boot.wait([_boot_f1, _boot_f2])
 
 
 # ─── Tab1: パフォーマンス分析 ────────────────────────────────────
@@ -1899,10 +1968,18 @@ with col_v3:
 st.divider()
 
 if run_volume:
-    st.subheader(f"📊 出来高急増銘柄（過去5日平均が20日平均の{surge_ratio}倍以上）")
-    with st.spinner("出来高データ取得中..."):
-        df_surge = get_volume_surge(ticker_name_map, surge_ratio=surge_ratio)
+    # ── 需給3データを並列取得 ──────────────────────────────────────
+    import concurrent.futures as _cf_vol
+    with st.spinner("📊 出来高・VWAP・PriceVolume データを並列取得中..."):
+        with _cf_vol.ThreadPoolExecutor(max_workers=3) as _ex_vol:
+            _f_surge = _ex_vol.submit(get_volume_surge, ticker_name_map, surge_ratio)
+            _f_vwap  = _ex_vol.submit(get_vwap_deviation, ticker_name_map)
+            _f_pv    = _ex_vol.submit(get_price_volume_scatter, ticker_name_map, pv_days)
+            df_surge = _f_surge.result()
+            df_vwap  = _f_vwap.result()
+            df_pv    = _f_pv.result()
 
+    st.subheader(f"📊 出来高急増銘柄（過去5日平均が20日平均の{surge_ratio}倍以上）")
     if df_surge.empty:
         st.info(f"現在、出来高が{surge_ratio}倍以上の銘柄は検出されませんでした。")
     else:
@@ -1937,9 +2014,6 @@ if run_volume:
     st.divider()
 
     st.subheader("📏 VWAP乖離率ランキング（割高・割安スクリーニング）")
-    with st.spinner("VWAPデータ計算中..."):
-        df_vwap = get_vwap_deviation(ticker_name_map)
-
     if not df_vwap.empty:
         col_up, col_down = st.columns(2)
         with col_up:
@@ -1956,9 +2030,6 @@ if run_volume:
     st.divider()
 
     st.subheader(f"🗺️ Price x Volume マップ（直近{pv_days}日）")
-    with st.spinner("散布図データ取得中..."):
-        df_pv = get_price_volume_scatter(ticker_name_map, days=pv_days)
-
     if df_pv.empty:
         st.info("散布図データを取得できませんでした。しばらく待って再読み込みしてください。")
     else:
@@ -2002,10 +2073,18 @@ with col_p2:
 st.divider()
 
 if run_price:
-    st.subheader("🏔️ 52週高値・安値ダッシュボード")
-    with st.spinner("52週データ取得中..."):
-        df_52 = get_52week_highlow(ticker_name_map)
+    # ── 価格パターン3データを並列取得 ──────────────────────────────
+    import concurrent.futures as _cf_pp
+    with st.spinner("📈 52週・移動平均・クロスシグナルを並列取得中..."):
+        with _cf_pp.ThreadPoolExecutor(max_workers=3) as _ex_pp:
+            _f_52  = _ex_pp.submit(get_52week_highlow, ticker_name_map)
+            _f_ma  = _ex_pp.submit(get_ma_deviation, ticker_name_map)
+            _f_crs = _ex_pp.submit(get_cross_signals, ticker_name_map, cross_lookback)
+            df_52    = _f_52.result()
+            df_ma    = _f_ma.result()
+            df_cross = _f_crs.result()
 
+    st.subheader("🏔️ 52週高値・安値ダッシュボード")
     if not df_52.empty:
         new_highs = df_52[df_52["新高値"] != ""]
         new_lows  = df_52[df_52["新安値"] != ""]
@@ -2035,9 +2114,6 @@ if run_price:
     st.divider()
 
     st.subheader("📐 移動平均線乖離率ランキング")
-    with st.spinner("移動平均データ計算中..."):
-        df_ma = get_ma_deviation(ticker_name_map)
-
     if not df_ma.empty:
         col_ma1, col_ma2 = st.columns(2)
         with col_ma1:
@@ -2058,8 +2134,6 @@ if run_price:
     st.divider()
 
     st.subheader(f"🔔 ゴールデンクロス / デッドクロス（直近{cross_lookback}日以内）")
-    with st.spinner("クロスシグナル検出中..."):
-        df_cross = get_cross_signals(ticker_name_map, lookback_days=cross_lookback)
 
     if df_cross.empty:
         st.info(f"直近{cross_lookback}日以内にクロスシグナルは検出されませんでした。")
