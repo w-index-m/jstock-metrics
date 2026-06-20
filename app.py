@@ -4190,7 +4190,7 @@ with sz_t2:
         if any(len(d) > 0 for d in box_sz):
             fig_bx, ax_bx = plt.subplots(figsize=(9, 5))
             bp = ax_bx.boxplot([d for d in box_sz if len(d) > 0],
-                               labels=[l for l, d in zip(box_sz_lbl, box_sz) if len(d) > 0],
+                               tick_labels=[l for l, d in zip(box_sz_lbl, box_sz) if len(d) > 0],
                                patch_artist=True,
                                medianprops=dict(color="black", linewidth=2))
             for patch, color in zip(bp["boxes"], ["#1565c0", "#42a5f5", "#90caf9"]):
@@ -4428,7 +4428,7 @@ with vl_t2:
             fig_vbx, ax_vbx = plt.subplots(figsize=(9, 5))
             bpv = ax_vbx.boxplot(
                 [d for d in box_vl if len(d) > 0],
-                labels=[l for l, d in zip(box_vl_lbl, box_vl) if len(d) > 0],
+                tick_labels=[l for l, d in zip(box_vl_lbl, box_vl) if len(d) > 0],
                 patch_artist=True,
                 medianprops=dict(color="black", linewidth=2),
             )
