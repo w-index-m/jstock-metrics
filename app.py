@@ -506,7 +506,7 @@ def plot_sector_bar(df_sector: pd.DataFrame, title: str) -> plt.Figure:
 def plot_sector_timeseries(df_ts: pd.DataFrame, top_sectors: list, bottom_sectors: list) -> plt.Figure:
     fig, axes = plt.subplots(1, 2, figsize=(20, 7))
     ax = axes[0]
-    cmap = plt.cm.get_cmap("Greens", len(top_sectors) + 2)
+    cmap = plt.colormaps["Greens"].resampled(len(top_sectors) + 2)
     for i, sec in enumerate(top_sectors):
         if sec in df_ts.columns:
             series = df_ts[sec].dropna()
@@ -521,7 +521,7 @@ def plot_sector_timeseries(df_ts: pd.DataFrame, top_sectors: list, bottom_sector
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
     ax = axes[1]
-    cmap2 = plt.cm.get_cmap("Reds", len(bottom_sectors) + 2)
+    cmap2 = plt.colormaps["Reds"].resampled(len(bottom_sectors) + 2)
     for i, sec in enumerate(bottom_sectors):
         if sec in df_ts.columns:
             series = df_ts[sec].dropna()
@@ -784,7 +784,7 @@ def plot_pv_scatter(df: pd.DataFrame) -> None:
 
     # matplotlib fallback（plotly未インストール時のみ到達）
         sectors = df["業種"].unique()
-        cmap = plt.cm.get_cmap("tab20", len(sectors))
+        cmap = plt.colormaps["tab20"].resampled(len(sectors))
         sector_color = {sec: cmap(i) for i, sec in enumerate(sectors)}
         fig2, ax = plt.subplots(figsize=(14, 8))
         for sec in sectors:
@@ -1575,7 +1575,7 @@ else:
         )
 
         sectors_ab = df_ab["業種"].unique()
-        cmap_ab = plt.cm.get_cmap("tab20", len(sectors_ab))
+        cmap_ab = plt.colormaps["tab20"].resampled(len(sectors_ab))
         sec_color_ab = {s: cmap_ab(i) for i, s in enumerate(sectors_ab)}
 
         fig_ab, ax_ab = plt.subplots(figsize=(14, 9))
@@ -2366,8 +2366,9 @@ EDINET_API_BASE = "https://disclosure.edinet-api.go.jp/api/v2"
 TDNET_BASE      = "https://www.release.tdnet.info/inbs"
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def fetch_tdnet_week(code_map: dict, days: int = 7) -> list:
-    """TDnetから過去N営業日の適時開示を取得（対象225銘柄のみ）"""
+def fetch_tdnet_week(code_map: dict, days: int = 7, code4_filter: str = None) -> list:
+    """TDnetから過去N営業日の適時開示を取得（PDF URLも含む）"""
+    import re as _re
     from bs4 import BeautifulSoup as _BS
     from datetime import timedelta as _td
     code4_map = {}
@@ -2383,7 +2384,7 @@ def fetch_tdnet_week(code_map: dict, days: int = 7) -> list:
             continue
         checked += 1
         date_str = target.strftime("%Y%m%d")
-        for page in range(1, 8):
+        for page in range(1, 10):
             url = f"{TDNET_BASE}/I_list_{page:03d}_{date_str}.html"
             try:
                 r = requests.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
@@ -2398,26 +2399,64 @@ def fetch_tdnet_week(code_map: dict, days: int = 7) -> list:
                     if len(cells) < 4:
                         continue
                     texts = [c.get_text(strip=True) for c in cells]
-                    code = next((t for t in texts[:3] if t.isdigit() and len(t) == 4), None)
+                    code = next((t for t in texts if _re.fullmatch(r'\d{4}', t)), None)
                     if not code or code not in code4_map:
                         continue
+                    if code4_filter and code != code4_filter:
+                        continue
                     found_any = True
-                    # タイトルはコードより後の列
-                    ci = texts.index(code)
-                    title = texts[ci + 2] if ci + 2 < len(texts) else texts[-1]
+                    # PDF URL を行内の <a href="...pdf"> から取得
+                    pdf_url = None
+                    title = ""
+                    for a in row.find_all("a", href=True):
+                        h = a["href"]
+                        m = _re.search(r'(\d{14,18})\.pdf', h)
+                        if m:
+                            pdf_url = f"https://www.release.tdnet.info/inbs/{m.group(1)}.pdf"
+                        elif not title and not h.endswith(".pdf"):
+                            t = a.get_text(strip=True)
+                            if t and len(t) > 2:
+                                title = t
+                    if not title:
+                        ci = texts.index(code)
+                        title = texts[ci + 2] if ci + 2 < len(texts) else texts[-1]
                     name, sector = code4_map[code]
+                    time_str = next(
+                        (t for t in texts if _re.fullmatch(r'\d{1,2}:\d{2}', t)), ""
+                    )
                     results.append({
                         "日付": target.strftime("%Y-%m-%d"),
+                        "時刻": time_str,
                         "コード": code,
                         "企業名": name,
                         "業種": sector,
                         "タイトル": title,
+                        "PDF_URL": pdf_url,
                     })
                 if not found_any and page > 1:
                     break
             except Exception:
                 break
     return results
+
+
+@st.cache_data(ttl=7200, show_spinner=False)
+def fetch_tdnet_pdf_text(pdf_url: str) -> str:
+    """TDnet PDFを取得しpdfplumberでテキスト抽出（先頭5ページ）"""
+    if not pdf_url:
+        return "[PDF URLが見つかりませんでした]"
+    try:
+        import pdfplumber, io
+        r = requests.get(pdf_url, timeout=35, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200:
+            return f"[HTTP {r.status_code}: PDF取得失敗]"
+        if len(r.content) < 500:
+            return "[レスポンスが短すぎます]"
+        with pdfplumber.open(io.BytesIO(r.content)) as pdf:
+            text = "\n".join(p.extract_text() or "" for p in pdf.pages[:5])
+        return text if text.strip() else "[テキスト抽出失敗（画像PDFの可能性）]"
+    except Exception as e:
+        return f"[取得エラー: {e}]"
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -2493,7 +2532,7 @@ st.caption(
 
 edinet_t1, edinet_t2, edinet_t3 = st.tabs([
     "📊 週次 成長シグナルランキング",
-    "📄 決算短信 AI要約",
+    "📄 適時開示 PDF → AI要約",
     "🏦 大量保有報告書 監視",
 ])
 
@@ -2558,73 +2597,114 @@ with edinet_t1:
                     use_container_width=True, hide_index=True,
                 )
 
-# ── Tab2: 決算短信 AI要約 ─────────────────────────────────────────
+# ── Tab2: TDnet 適時開示 → PDF → AI要約 ───────────────────────────
 with edinet_t2:
-    st.markdown("#### 📄 決算短信 AI要約（EDINET × Gemini）")
-    st.caption("EDINETに提出された決算短信PDFをGeminiが要約。財務ハイライト・成長戦略・リスクを抽出します。")
+    st.markdown("#### 📄 適時開示 PDF → Gemini/Groq AI要約（TDnet）")
+    st.caption(
+        "TDnetから選択銘柄の適時開示を取得し、PDFをそのままGemini/Groqへ渡して自動要約します。"
+        "PDFを手動で開く必要はありません。"
+    )
 
-    col_ef1, col_ef2 = st.columns([2, 1])
-    with col_ef1:
-        edinet_fins_days = st.slider("取得対象期間（営業日）", 1, 14, 5, key="edinet_fins_days")
-    with col_ef2:
-        run_edinet_fins = st.button("▶ 決算短信を検索", type="primary", key="run_edinet_fins")
+    # 銘柄選択
+    _company_opts = {
+        f"{v[0]}  ({k.replace('.T','')})" : k.replace(".T", "").zfill(4)
+        for k, v in ticker_name_map.items()
+    }
+    col_td2a, col_td2b = st.columns([3, 1])
+    with col_td2a:
+        sel_company_td = st.selectbox(
+            "銘柄を選択", list(_company_opts.keys()), key="tdnet_company_sel"
+        )
+    with col_td2b:
+        sel_days_td2 = st.slider("取得期間（営業日）", 1, 14, 7, key="tdnet_days_company")
 
-    if run_edinet_fins:
-        with st.spinner("EDINETから決算短信を検索中..."):
-            all_docs_f = fetch_edinet_docs(days=edinet_fins_days)
-            fins_docs  = [d for d in all_docs_f if any(
-                kw in d["書類種別"] for kw in ["決算短信", "四半期短信", "業績予想修正"]
-            )]
+    sel_code4_td = _company_opts[sel_company_td]
+    sel_cname_td = sel_company_td.split("(")[0].strip()
 
-        if not fins_docs:
-            st.warning("該当期間に決算短信が見つかりませんでした")
-        else:
-            df_fins_e = pd.DataFrame(fins_docs)
-            our_codes = {t.replace(".T", "").zfill(4) for t in ticker_name_map}
-            df_fins_matched = df_fins_e[df_fins_e["証券コード"].isin(our_codes)].reset_index(drop=True)
+    run_fetch_td = st.button(
+        f"▶ {sel_cname_td} の適時開示を取得", type="primary", key="btn_fetch_tdnet2"
+    )
 
-            st.success(f"✅ {len(df_fins_matched)}件（対象225銘柄） / 全{len(df_fins_e)}件")
+    if run_fetch_td:
+        with st.spinner(f"TDnetから {sel_cname_td} の開示を検索中..."):
+            _disc_list = fetch_tdnet_week(
+                ticker_name_map, days=sel_days_td2, code4_filter=sel_code4_td
+            )
+        st.session_state["_td2_disclosures"] = _disc_list
+        st.session_state["_td2_cname"] = sel_cname_td
+
+    _disc_list = st.session_state.get("_td2_disclosures", [])
+    _td2_cname = st.session_state.get("_td2_cname", "")
+
+    if _disc_list:
+        df_disc = pd.DataFrame(_disc_list)
+        st.success(f"✅ {_td2_cname}: {len(df_disc)} 件の適時開示")
+
+        # セレクトボックスで開示を選択
+        disc_opts = [
+            f"{r['日付']} {r['時刻']}  {r['タイトル']}"
+            for _, r in df_disc.iterrows()
+        ]
+        sel_disc_idx = st.selectbox(
+            "AI要約する開示書類を選択", range(len(disc_opts)),
+            format_func=lambda i: disc_opts[i], key="td2_sel_disc"
+        )
+        sel_disc_row = df_disc.iloc[sel_disc_idx]
+
+        col_pdf1, col_pdf2 = st.columns([3, 1])
+        with col_pdf1:
+            st.caption(f"📎 PDF: `{sel_disc_row.get('PDF_URL') or '（URLなし）'}`")
+        with col_pdf2:
+            has_pdf = bool(sel_disc_row.get("PDF_URL"))
+            run_summarize = st.button(
+                "🤖 PDF取得 → AI要約", type="primary",
+                key="run_td2_summary", disabled=not has_pdf
+            )
+        if not has_pdf:
+            st.info("この開示にはPDF URLが取得できませんでした（HTML形式の開示の可能性）")
+
+        if run_summarize and has_pdf:
+            pdf_url_td = sel_disc_row["PDF_URL"]
+            title_td   = sel_disc_row["タイトル"]
+            with st.spinner(f"PDF を取得中…（〜30秒）"):
+                pdf_text_td = fetch_tdnet_pdf_text(pdf_url_td)
+
+            if pdf_text_td.startswith("["):
+                st.error(f"PDF取得失敗: {pdf_text_td}")
+                st.markdown(f"[TDnet で直接開く]({pdf_url_td})")
+            else:
+                _prompt_td2_pdf = f"""
+以下は {_td2_cname}（{sel_disc_row['コード']}）の適時開示「{title_td}」のPDFテキストです。
+
+{pdf_text_td[:4000]}
+
+**400字以内**で以下の観点から要約してください：
+1. 📌 開示の概要（何を発表したか）
+2. 📈 業績・財務への影響（売上・利益・前年比など具体的数値）
+3. 💡 ポジティブな点・成長シグナル
+4. ⚠️ リスク・懸念点
+5. 🔮 今後の見通し・投資家への示唆
+"""
+                with st.spinner("Gemini/Groqが要約中..."):
+                    try:
+                        summary_td, ai_nm_td = generate_ai_comment(_prompt_td2_pdf)
+                        st.markdown(
+                            f"### 🤖 {_td2_cname}「{title_td}」AI要約（{ai_nm_td}）"
+                        )
+                        st.success(summary_td)
+                        with st.expander("📄 抽出テキスト（先頭2000字）を確認"):
+                            st.text(pdf_text_td[:2000])
+                    except Exception as _e_td2:
+                        st.warning(f"AI要約エラー: {_e_td2}")
+
+        st.divider()
+        with st.expander("📋 全開示一覧"):
             st.dataframe(
-                df_fins_matched[["日付", "企業名", "書類種別"]],
+                df_disc[["日付", "時刻", "タイトル", "PDF_URL"]].reset_index(drop=True),
                 use_container_width=True, hide_index=True,
             )
-
-            if not df_fins_matched.empty:
-                st.divider()
-                sel_fins = st.selectbox(
-                    "AI要約する決算短信を選択",
-                    df_fins_matched.index.tolist(),
-                    format_func=lambda i: f"{df_fins_matched.loc[i,'企業名']}  ({df_fins_matched.loc[i,'日付']}) {df_fins_matched.loc[i,'書類種別']}",
-                    key="edinet_sel_fins",
-                )
-                if st.button("📄 PDFを取得してAI要約（Gemini）", type="primary", key="run_fins_summary"):
-                    doc_id_f = df_fins_matched.loc[sel_fins, "docID"]
-                    cname_f  = df_fins_matched.loc[sel_fins, "企業名"]
-                    with st.spinner(f"{cname_f} の決算短信PDFを取得中（〜30秒）..."):
-                        pdf_text_f = fetch_edinet_pdf_text(doc_id_f)
-
-                    if not pdf_text_f or pdf_text_f.startswith("["):
-                        st.error(f"PDF取得失敗: {pdf_text_f}")
-                    else:
-                        _prompt_fins_pdf = f"""
-以下は {cname_f} の決算短信PDFの冒頭テキストです。
-
-{pdf_text_f[:3500]}
-
-以下の観点で **400字以内** で要約してください：
-1. 📈 業績ハイライト（売上・営業利益・純利益・前年比）
-2. 💡 成長ドライバー（好調な事業・地域・製品）
-3. ⚠️ リスク・課題
-4. 🔮 来期見通し・配当・株主還元方針
-※ 数値は具体的に（例：売上高 1,234億円 前年比+15%）
-"""
-                        with st.spinner("Geminiが決算短信を要約中..."):
-                            try:
-                                summary_f, ai_nm_f = generate_ai_comment(_prompt_fins_pdf)
-                                st.markdown(f"### 🤖 {cname_f} 決算短信 AI要約（{ai_nm_f}）")
-                                st.success(summary_f)
-                            except Exception as _e_fins:
-                                st.warning(f"AI要約エラー: {_e_fins}")
+    elif run_fetch_td:
+        st.warning(f"⚠️ {sel_cname_td} の適時開示が見つかりませんでした（対象期間: {sel_days_td2}営業日）")
 
 # ── Tab3: 大量保有報告書 監視 ─────────────────────────────────────
 with edinet_t3:
@@ -3799,7 +3879,7 @@ else:
             if not df_plot.empty:
                 fig_sc2, ax_sc2 = plt.subplots(figsize=(14, 8))
                 sectors_p = df_plot["業種"].unique()
-                cmap_p = plt.cm.get_cmap("tab20", len(sectors_p))
+                cmap_p = plt.colormaps["tab20"].resampled(len(sectors_p))
                 sec_c_p = {s: cmap_p(i) for i, s in enumerate(sectors_p)}
 
                 for sec in sectors_p:
