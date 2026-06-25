@@ -2472,7 +2472,7 @@ if run_news:
         st.subheader("📋 TDnet 適時開示")
     with _tdcol_r:
         _tdnet_days_n = st.radio(
-            "期間", [3, 7, 14, 30, 60], index=0,
+            "期間", [3, 7, 14, 30, 60], index=4,
             horizontal=True, key="tdnet_news_days",
             help="30日以上は取得に時間がかかります（約1〜3分）"
         )
@@ -2701,7 +2701,7 @@ with edinet_t1:
     st.caption("過去1週間の適時開示タイトルをAIが分析し、成長シグナルが最も強い企業Top5を表示します。")
     col_td1, col_td2 = st.columns([2, 1])
     with col_td1:
-        tdnet_days = st.slider("取得期間（営業日）", 3, 60, 5, key="tdnet_days_sl",
+        tdnet_days = st.slider("取得期間（営業日）", 3, 60, 60, key="tdnet_days_sl",
                                help="30日以上は取得に1〜3分かかります")
     with col_td2:
         run_tdnet = st.button("▶ ランキング分析を実行", type="primary", key="run_tdnet_rank")
@@ -2776,7 +2776,7 @@ with edinet_t2:
             "銘柄を選択", list(_company_opts.keys()), key="tdnet_company_sel"
         )
     with col_td2b:
-        sel_days_td2 = st.slider("取得期間（営業日）", 1, 60, 7, key="tdnet_days_company",
+        sel_days_td2 = st.slider("取得期間（営業日）", 1, 60, 60, key="tdnet_days_company",
                                   help="30日以上は取得に時間がかかります")
 
     sel_code4_td = _company_opts[sel_company_td]
