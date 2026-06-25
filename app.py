@@ -363,6 +363,95 @@ def fetch_reuters_jp_rss(max_items: int = 8) -> list[dict]:
         return []
 
 
+MEMORY_KEYWORDS_JA = [
+    "半導体", "メモリ", "DRAM", "NAND", "HBM", "LPDDR", "フラッシュメモリ",
+    "シリコンウエハ", "ウエハ", "キオクシア", "マイクロン", "サムスン", "ハイニックス",
+    "Western Digital", "AIチップ", "GPU", "積層", "露光装置", "エッチング",
+    "TSMCニコン", "チップ", "製造装置", "フォトレジスト", "CMP",
+]
+MEMORY_KEYWORDS_EN = [
+    "memory", "DRAM", "NAND", "HBM", "semiconductor", "Micron", "Samsung",
+    "Hynix", "Kioxia", "flash memory", "wafer", "chip", "AI chip", "GPU memory",
+    "3D NAND", "stacked memory", "TSMC", "fab", "chipmaker",
+]
+
+MEMORY_TICKERS = {
+    '8035.T': ('東京エレクトロン', '半導体製造装置'),
+    '6857.T': ('アドバンテスト',   'メモリテスト装置'),
+    '6920.T': ('レーザーテック',   '半導体検査'),
+    '4063.T': ('信越化学',         'シリコンウエハ・材料'),
+    '3436.T': ('SUMCO',            'シリコンウエハ'),
+    '6723.T': ('ルネサス',         'MCU・半導体'),
+    '6526.T': ('ソシオネクスト',   'SoC設計'),
+    '6146.T': ('ディスコ',         '半導体切断装置'),
+    '6758.T': ('ソニーＧ',         'CMOSセンサー'),
+    '6762.T': ('ＴＤＫ',           '電子部品'),
+    '6504.T': ('富士電機',         'パワー半導体'),
+    '6702.T': ('富士通',           '半導体・IT'),
+}
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_memory_news_domestic(max_items: int = 15) -> list[dict]:
+    """国内RSSからメモリ・半導体関連ニュースをキーワードフィルタで取得"""
+    import xml.etree.ElementTree as _ET
+    feeds = [
+        ("https://www.nikkei.com/rss/market.xml",            "日経新聞"),
+        ("https://feeds.reuters.com/reuters/JPBusinessNews",  "Reuters JP"),
+        ("https://feeds.reuters.com/reuters/JPTechnologyNews","Reuters JP Tech"),
+    ]
+    results = []
+    for url, source in feeds:
+        try:
+            r = requests.get(url, headers=_NEWS_HEADERS, timeout=10)
+            if r.status_code != 200:
+                continue
+            root = _ET.fromstring(r.content)
+            for item in root.findall(".//item"):
+                title   = (item.findtext("title", "") or "").strip()
+                link    = (item.findtext("link",  "") or "").strip()
+                pubdate = (item.findtext("pubDate", "") or "").strip()
+                desc    = (item.findtext("description", "") or "").strip()
+                text    = title + " " + desc
+                if any(kw in text for kw in MEMORY_KEYWORDS_JA):
+                    results.append({
+                        "source": source, "title": title,
+                        "link": link, "date": pubdate,
+                    })
+        except Exception:
+            continue
+    return results[:max_items]
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_memory_news_overseas(max_items: int = 15) -> list[dict]:
+    """Reuters Technology RSS（英語）からメモリ業界ニュースを取得"""
+    import xml.etree.ElementTree as _ET
+    feeds = [
+        ("https://feeds.reuters.com/reuters/technologyNews", "Reuters Technology"),
+        ("https://feeds.reuters.com/reuters/businessNews",   "Reuters Business"),
+    ]
+    results = []
+    for url, source in feeds:
+        try:
+            r = requests.get(url, headers=_NEWS_HEADERS, timeout=10)
+            if r.status_code != 200:
+                continue
+            root = _ET.fromstring(r.content)
+            for item in root.findall(".//item"):
+                title   = (item.findtext("title", "") or "").strip()
+                link    = (item.findtext("link",  "") or "").strip()
+                pubdate = (item.findtext("pubDate", "") or "").strip()
+                desc    = (item.findtext("description", "") or "").strip()
+                text    = (title + " " + desc).lower()
+                if any(kw.lower() in text for kw in MEMORY_KEYWORDS_EN):
+                    results.append({
+                        "source": source, "title": title,
+                        "link": link, "date": pubdate,
+                    })
+        except Exception:
+            continue
+    return results[:max_items]
+
+
 def fetch_all_news(ticker_code: str, max_per_source: int = 5) -> list[dict]:
     import concurrent.futures
     code = ticker_code.replace(".T", "")
@@ -5321,6 +5410,124 @@ else:
             ax_sec.grid(True, axis="y", alpha=0.3)
             plt.tight_layout()
             st.pyplot(fig_sec, clear_figure=True)
+
+
+# ================================================================
+# 💾 メモリ業界分析
+# ================================================================
+st.header("💾 メモリ業界分析")
+st.divider()
+st.caption(
+    "半導体メモリ関連銘柄の適時開示・国内外ニュースをAIが時間軸別に分析。"
+    "対象: 東京エレクトロン, アドバンテスト, レーザーテック, 信越化学, SUMCO 他"
+)
+
+_mem_t1, _mem_t2, _mem_t3 = st.tabs(["⏱️ 24時間の影響", "📅 1週間の影響", "📊 3ヶ月の影響"])
+
+def _render_memory_tab(horizon_label: str, tdnet_days: int):
+    """メモリ業界分析タブの共通描画"""
+    col_tdnet, col_news = st.columns(2)
+
+    # ── 適時開示（メモリ関連銘柄）
+    with col_tdnet:
+        st.markdown("##### 📋 関連銘柄の適時開示")
+        mem_code_map = {t: (n, s) for t, (n, s) in MEMORY_TICKERS.items()}
+        with st.spinner(f"TDnetを取得中（{tdnet_days}営業日）..."):
+            _mem_tdnet = fetch_tdnet_week(mem_code_map, days=tdnet_days)
+        if _mem_tdnet:
+            _df_mem_td = (
+                pd.DataFrame(_mem_tdnet)
+                .sort_values("日付", ascending=False)
+                [["日付", "企業名", "タイトル"]]
+            )
+            st.dataframe(_df_mem_td, use_container_width=True, hide_index=True,
+                         height=min(300, 36 * len(_df_mem_td) + 40))
+        else:
+            st.info(f"直近{tdnet_days}営業日に対象銘柄の適時開示はありません")
+
+    # ── 国内ニュース
+    with col_news:
+        st.markdown("##### 🗞️ 国内ニュース（半導体・メモリ関連）")
+        _dom_news = fetch_memory_news_domestic(15)
+        if _dom_news:
+            for n in _dom_news[:8]:
+                st.markdown(
+                    f"**[{n['title']}]({n['link']})**  \n"
+                    f"<small>{n['source']} | {n.get('date','')[:16]}</small>",
+                    unsafe_allow_html=True
+                )
+                st.divider()
+        else:
+            st.info("国内ニュースは取得できませんでした")
+
+    # ── 海外ニュース
+    st.markdown("##### 🌐 海外ニュース（英語）")
+    _ovs_news = fetch_memory_news_overseas(15)
+    if _ovs_news:
+        _ovs_cols = st.columns(2)
+        for i, n in enumerate(_ovs_news[:6]):
+            with _ovs_cols[i % 2]:
+                st.markdown(
+                    f"**[{n['title']}]({n['link']})**  \n"
+                    f"<small>{n['source']} | {n.get('date','')[:16]}</small>",
+                    unsafe_allow_html=True
+                )
+                st.divider()
+    else:
+        st.info("海外ニュースは取得できませんでした")
+
+    # ── AI総合分析
+    st.markdown(f"##### 🤖 AI分析：{horizon_label}の影響まとめ")
+    if st.button(f"▶ AI分析を実行（{horizon_label}）", key=f"mem_ai_{tdnet_days}"):
+        _tdnet_titles = "\n".join(
+            f"- [{r['日付']}] {r['企業名']}: {r['タイトル']}"
+            for r in (_mem_tdnet or [])[:30]
+        ) or "（適時開示なし）"
+        _dom_titles = "\n".join(
+            f"- {n['title']}" for n in (_dom_news or [])[:10]
+        ) or "（国内ニュースなし）"
+        _ovs_titles = "\n".join(
+            f"- {n['title']}" for n in (_ovs_news or [])[:10]
+        ) or "（海外ニュースなし）"
+
+        _mem_prompt = f"""
+あなたは半導体・メモリ業界の専門アナリストです。
+以下の情報をもとに、**{horizon_label}の日本のメモリ・半導体関連株への影響**を分析してください。
+
+## 対象銘柄の適時開示（直近{tdnet_days}営業日）
+{_tdnet_titles}
+
+## 国内ニュース（半導体・メモリ関連）
+{_dom_titles}
+
+## 海外ニュース（英語）
+{_ovs_titles}
+
+## 分析指示
+1. **{horizon_label}の主要材料**を箇条書きで3〜5点
+2. **ポジティブ材料** と **ネガティブ材料** をそれぞれ整理
+3. **注目銘柄と注目理由**（東エレク, アドテスト, レーザーテク, 信越化, SUMCO など）
+4. **{horizon_label}の総合見通し**（強気/中立/弱気）と根拠
+
+簡潔・具体的に。投資推奨は含まないこと。
+"""
+        with st.spinner("AI分析中..."):
+            _mem_ai_text, _mem_ai_model = generate_ai_comment(_mem_prompt)
+        st.markdown(_mem_ai_text)
+        st.caption(f"by {_mem_ai_model}")
+
+
+with _mem_t1:
+    st.markdown("**直近1営業日**の適時開示・ニュースから当日〜翌日の短期影響を分析")
+    _render_memory_tab("24時間", tdnet_days=1)
+
+with _mem_t2:
+    st.markdown("**直近5営業日（1週間）**の適時開示・ニュースから今週の影響を分析")
+    _render_memory_tab("1週間", tdnet_days=5)
+
+with _mem_t3:
+    st.markdown("**直近60営業日（約3ヶ月）**の適時開示から中期トレンドを分析（初回取得に2〜3分かかります）")
+    _render_memory_tab("3ヶ月", tdnet_days=60)
 
 
 st.divider()
