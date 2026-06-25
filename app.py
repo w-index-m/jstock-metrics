@@ -2302,7 +2302,7 @@ TDNET_BASE      = "https://www.release.tdnet.info/inbs"
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_tdnet_week(code_map: dict, days: int = 7, code4_filter: str = None) -> list:
-    import re as _re
+    import re as _re, time as _time
     from bs4 import BeautifulSoup as _BS
     from datetime import timedelta as _td
     code4_map = {}
@@ -2312,7 +2312,8 @@ def fetch_tdnet_week(code_map: dict, days: int = 7, code4_filter: str = None) ->
     results = []
     today = datetime.today()
     checked, d = 0, 0
-    while checked < days and d < 20:
+    # days * 2 + 10 でカレンダー日を十分確保（週末・祝日対応）
+    while checked < days and d < days * 2 + 10:
         target = today - _td(days=d); d += 1
         if target.weekday() >= 5:
             continue
@@ -2321,7 +2322,7 @@ def fetch_tdnet_week(code_map: dict, days: int = 7, code4_filter: str = None) ->
         for page in range(1, 10):
             url = f"{TDNET_BASE}/I_list_{page:03d}_{date_str}.html"
             try:
-                r = requests.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
+                r = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
                 if r.status_code != 200:
                     break
                 r.encoding = r.apparent_encoding or "utf-8"
@@ -2368,6 +2369,9 @@ def fetch_tdnet_week(code_map: dict, days: int = 7, code4_filter: str = None) ->
                     })
                 if not found_any and page > 1:
                     break
+                # 長期取得時のレート制限回避
+                if days > 14:
+                    _time.sleep(0.15)
             except Exception:
                 break
     return results
@@ -2465,12 +2469,12 @@ if run_news:
 
     _tdcol_h, _tdcol_r = st.columns([3, 1])
     with _tdcol_h:
-        st.subheader("📋 TDnet 適時開示（直近3営業日）")
+        st.subheader("📋 TDnet 適時開示")
     with _tdcol_r:
         _tdnet_days_n = st.radio(
-            "期間", [3, 5, 7], index=0,
+            "期間", [3, 7, 14, 30, 60], index=0,
             horizontal=True, key="tdnet_news_days",
-            help="週末閲覧時は3日で金曜まで遡ります"
+            help="30日以上は取得に時間がかかります（約1〜3分）"
         )
 
     with st.spinner(f"TDnetから {selected_name} の開示を取得中..."):
@@ -2697,7 +2701,8 @@ with edinet_t1:
     st.caption("過去1週間の適時開示タイトルをAIが分析し、成長シグナルが最も強い企業Top5を表示します。")
     col_td1, col_td2 = st.columns([2, 1])
     with col_td1:
-        tdnet_days = st.slider("取得期間（営業日）", 3, 10, 5, key="tdnet_days_sl")
+        tdnet_days = st.slider("取得期間（営業日）", 3, 60, 5, key="tdnet_days_sl",
+                               help="30日以上は取得に1〜3分かかります")
     with col_td2:
         run_tdnet = st.button("▶ ランキング分析を実行", type="primary", key="run_tdnet_rank")
 
@@ -2771,7 +2776,8 @@ with edinet_t2:
             "銘柄を選択", list(_company_opts.keys()), key="tdnet_company_sel"
         )
     with col_td2b:
-        sel_days_td2 = st.slider("取得期間（営業日）", 1, 14, 7, key="tdnet_days_company")
+        sel_days_td2 = st.slider("取得期間（営業日）", 1, 60, 7, key="tdnet_days_company",
+                                  help="30日以上は取得に時間がかかります")
 
     sel_code4_td = _company_opts[sel_company_td]
     sel_cname_td = sel_company_td.split("(")[0].strip()
