@@ -2300,7 +2300,7 @@ else:
 EDINET_API_BASE = "https://disclosure.edinet-api.go.jp/api/v2"
 TDNET_BASE      = "https://www.release.tdnet.info/inbs"
 
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(ttl=86400, show_spinner=False)
 def fetch_tdnet_week(code_map: dict, days: int = 7, code4_filter: str = None) -> list:
     import re as _re, time as _time
     from bs4 import BeautifulSoup as _BS
@@ -2618,13 +2618,13 @@ if True:  # 自動実行
 # ================================================================
 # fetch_tdnet_week / fetch_tdnet_pdf_text は銘柄別ニュースセクション直前で定義済み
 
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(ttl=86400, show_spinner=False)
 def fetch_edinet_docs(days: int = 7, doc_type_filter: str = "") -> list:
     """EDINET APIから過去N営業日の書類一覧を取得"""
     from datetime import timedelta as _td
     results = []
     today = datetime.today()
-    for d in range(days + 5):
+    for d in range(days * 2 + 10):
         target = today - _td(days=d)
         if target.weekday() >= 5:
             continue
@@ -2877,7 +2877,7 @@ with edinet_t3:
 
     col_hd1, col_hd2 = st.columns([2, 1])
     with col_hd1:
-        holding_days = st.slider("取得対象期間（営業日）", 1, 14, 7, key="holding_days_sl")
+        holding_days = st.slider("取得対象期間（営業日）", 1, 60, 30, key="holding_days_sl")
     with col_hd2:
         run_holding = st.button("▶ 大量保有報告書を検索", type="primary", key="run_holding_btn")
 
