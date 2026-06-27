@@ -391,6 +391,32 @@ MEMORY_TICKERS = {
     '6702.T': ('富士通',           '半導体・IT'),
 }
 
+# テーマ別銘柄グループ（テーマ市場サマリー用）
+THEME_GROUPS = {
+    "半導体（主要）":   ["8035.T","6857.T","6920.T","6723.T","6526.T"],
+    "DRAM・メモリ":    ["285A.T","8035.T","6857.T","3436.T"],
+    "フラッシュメモリ": ["285A.T","6857.T"],
+    "半導体製造装置":   ["8035.T","6920.T","6146.T"],
+    "半導体露光装置":   ["8035.T","6920.T"],
+    "パワー半導体":     ["6504.T","6723.T"],
+    "ウエハ":          ["3436.T","4063.T"],
+    "電子材料":        ["4063.T","4183.T","4188.T"],
+    "AI・データセンター":["6702.T","6701.T","8035.T","6857.T"],
+    "EV・電池":        ["6674.T","6752.T","6594.T"],
+    "ロボット・FA":    ["6506.T","6861.T","6954.T"],
+    "自動車・トヨタ系": ["7203.T","7267.T","6902.T","7269.T"],
+    "防衛・宇宙":      ["7011.T","7013.T"],
+    "インバウンド":    ["9602.T","9603.T"],
+    "銀行":            ["8306.T","8316.T","8411.T","8354.T"],
+    "不動産":          ["8802.T","8801.T"],
+    "医療機器":        ["4543.T"],
+    "商社":            ["8001.T","8002.T","8058.T"],
+    "通信":            ["9432.T","9433.T","9984.T"],
+    "エネルギー":      ["1605.T","5020.T"],
+    "外食・食品":      ["2801.T","2802.T","2802.T"],
+    "化学":            ["4063.T","4188.T","4005.T"],
+}
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_memory_news_domestic(max_items: int = 15) -> list[dict]:
     """国内RSSからメモリ・半導体関連ニュースをキーワードフィルタで取得"""
@@ -5412,6 +5438,438 @@ else:
             ax_sec.grid(True, axis="y", alpha=0.3)
             plt.tight_layout()
             st.pyplot(fig_sec, clear_figure=True)
+
+
+# ================================================================
+# 🎯 テーマ市場サマリー
+# ================================================================
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def calc_theme_performance() -> pd.DataFrame:
+    """テーマ別週次・月次リターンと出来高比率を計算"""
+    import warnings
+    rows = []
+    all_tickers = list({t for tlist in THEME_GROUPS.values() for t in tlist})
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            df_all = _yfdownload(all_tickers, period="2mo")
+        if df_all.empty:
+            return pd.DataFrame()
+        close_df = df_all["Close"] if "Close" in df_all.columns else pd.DataFrame()
+        vol_df   = df_all["Volume"] if "Volume" in df_all.columns else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+    for theme, tickers in THEME_GROUPS.items():
+        try:
+            valid = [t for t in tickers if t in close_df.columns]
+            if not valid:
+                continue
+            c = close_df[valid].dropna(how="all")
+            v = vol_df[valid].dropna(how="all") if not vol_df.empty else pd.DataFrame()
+            if len(c) < 5:
+                continue
+            w_ret = float((c.iloc[-1] / c.iloc[-6].replace(0, float("nan")) - 1).mean() * 100) if len(c) >= 6 else 0.0
+            m_ret = float((c.iloc[-1] / c.iloc[-22].replace(0, float("nan")) - 1).mean() * 100) if len(c) >= 22 else w_ret
+            if not v.empty and len(v) >= 10:
+                vol_ratio = float(v.tail(5).mean().mean() / (v.iloc[-25:-5].mean().mean() + 1e-8))
+            else:
+                vol_ratio = 1.0
+            rows.append({"テーマ": theme, "週次(%)": round(w_ret, 1),
+                         "月次(%)": round(m_ret, 1), "出来高比": round(vol_ratio, 1)})
+        except Exception:
+            continue
+
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    df["週次ランク"] = df["週次(%)"].rank(ascending=False).astype(int)
+    df["月次ランク"] = df["月次(%)"].rank(ascending=False).astype(int)
+    df["ランク変化"] = df["月次ランク"] - df["週次ランク"]
+    return df.sort_values("週次(%)", ascending=False).reset_index(drop=True)
+
+
+def _draw_speedometer(value: int) -> "plt.Figure":
+    """半円スピードメーター（テーマ温度計）"""
+    import numpy as np
+    fig, ax = plt.subplots(figsize=(3.5, 2.2))
+    ax.set_xlim(-1.3, 1.3); ax.set_ylim(-0.3, 1.2)
+    colors = ["#c62828","#ef6c00","#f9a825","#1565c0","#2e7d32"]
+    for i, col in enumerate(colors):
+        t1 = np.radians(180 - i * 36)
+        t2 = np.radians(180 - (i + 1) * 36)
+        th = np.linspace(t2, t1, 60)
+        ro, ri = 1.0, 0.6
+        xo, yo = ro * np.cos(th), ro * np.sin(th)
+        xi, yi = ri * np.cos(th[::-1]), ri * np.sin(th[::-1])
+        ax.fill(np.concatenate([xo, xi]), np.concatenate([yo, yi]), color=col, alpha=0.85)
+    ang = np.radians(180 - value * 1.8)
+    ax.plot([0, 0.72 * np.cos(ang)], [0, 0.72 * np.sin(ang)],
+            color="black", linewidth=2.5, zorder=5, solid_capstyle="round")
+    ax.add_patch(plt.Circle((0, 0), 0.07, color="black", zorder=6))
+    label = "強気" if value >= 70 else ("弱気" if value < 40 else "中立")
+    ax.text(0, 0.28, str(value), ha="center", va="center", fontsize=20, fontweight="bold")
+    ax.text(0, 0.08, "/100", ha="center", va="center", fontsize=9, color="gray")
+    ax.text(0, -0.12, label, ha="center", va="center", fontsize=10, color="gray")
+    ax.axis("off")
+    plt.tight_layout(pad=0.1)
+    return fig
+
+
+st.header("🎯 テーマ市場サマリー")
+st.divider()
+
+with st.spinner("テーマパフォーマンスを計算中..."):
+    _df_theme = calc_theme_performance()
+
+if _df_theme.empty:
+    st.warning("テーマデータを取得できませんでした（yfinanceのレート制限の可能性があります）")
+else:
+    # ── ① サマリー指標 3カラム ─────────────────────────────────────
+    _n_up   = int((_df_theme["週次(%)"] > 0).sum())
+    _n_all  = len(_df_theme)
+    _up_pct = round(_n_up / _n_all * 100, 1) if _n_all else 0
+    _temp   = min(100, max(0, int(_up_pct * 1.5 - 25 + _df_theme["週次(%)"].mean() * 3)))
+    _avg_vol= round(_df_theme["出来高比"].mean(), 2)
+    _vol_chg= round((_avg_vol - 1.0) * 100, 1)
+
+    _sm1, _sm2, _sm3 = st.columns(3)
+    with _sm1:
+        st.markdown("**テーマ温度**")
+        _fig_gauge = _draw_speedometer(_temp)
+        st.pyplot(_fig_gauge, clear_figure=True)
+    with _sm2:
+        st.markdown("**値上がりテーマ比率**")
+        import plotly.graph_objects as _go_th
+        _fig_donut = _go_th.Figure(_go_th.Pie(
+            values=[_up_pct, 100 - _up_pct],
+            labels=["上昇", "下落"],
+            hole=0.6,
+            marker_colors=["#2e7d32", "#ffcdd2"],
+            textinfo="none",
+        ))
+        _fig_donut.update_layout(
+            showlegend=True, height=220, margin=dict(t=10, b=10, l=10, r=10),
+            annotations=[dict(text=f"{_up_pct}%<br>上昇", x=0.5, y=0.5,
+                              font_size=16, showarrow=False)]
+        )
+        st.plotly_chart(_fig_donut, use_container_width=True)
+    with _sm3:
+        st.markdown("**売買代金前日比（平均）**")
+        _vol_color = "#2e7d32" if _vol_chg >= 0 else "#c62828"
+        st.markdown(
+            f"<div style='font-size:2.2rem;font-weight:bold;color:{_vol_color};margin-top:28px'>"
+            f"{_vol_chg:+.1f}%</div>",
+            unsafe_allow_html=True
+        )
+        _bar_pct = min(100, max(0, 50 + _vol_chg * 2))
+        st.progress(int(_bar_pct))
+        _vol_label = "買いは活発" if _vol_chg > 5 else ("売りが優勢" if _vol_chg < -5 else "概ね平常")
+        st.caption(_vol_label)
+
+    st.divider()
+
+    # ── ② 出来高急増テーマ ──────────────────────────────────────────
+    st.markdown("##### ② 出来高急増テーマ")
+    _df_vol_surge = _df_theme.nlargest(4, "出来高比")[["テーマ","出来高比","週次(%)"]]
+    _surge_cols = st.columns(4)
+    for i, (_, row) in enumerate(_df_vol_surge.iterrows()):
+        with _surge_cols[i]:
+            ret_color = "#2e7d32" if row["週次(%)"] >= 0 else "#c62828"
+            st.markdown(
+                f"**{row['テーマ']}**  \n"
+                f"<span style='font-size:1.3rem;font-weight:bold'>{row['出来高比']:.1f}x</span>  \n"
+                f"<span style='color:{ret_color}'>当日リターン {row['週次(%)']:+.1f}%</span>",
+                unsafe_allow_html=True
+            )
+
+    st.divider()
+
+    # ── ③ 主な変動（急浮上 / 常勝 / 失速）─────────────────────────
+    st.markdown("##### ③ 主な変動")
+    _col_rise, _col_steady, _col_fall = st.columns(3)
+
+    # 急浮上: 週次ランクが月次より大幅改善
+    _df_rise = _df_theme[_df_theme["ランク変化"] > 0].nsmallest(9, "週次ランク")[
+        ["テーマ","月次ランク","週次ランク","週次(%)"]].reset_index(drop=True)
+    with _col_rise:
+        st.markdown("**急浮上** <small>週近で動き出したテーマ</small>", unsafe_allow_html=True)
+        for _, r in _df_rise.iterrows():
+            chg = int(r["月次ランク"] - r["週次ランク"])
+            st.markdown(
+                f"<div style='display:flex;justify-content:space-between;padding:2px 0'>"
+                f"<span>{r['テーマ']}</span>"
+                f"<span style='color:#2e7d32;font-size:.85rem'>▲{chg} 位</span>"
+                f"<span style='font-size:.85rem'>{int(r['週次ランク'])}位</span></div>",
+                unsafe_allow_html=True
+            )
+
+    # 常勝: 週次・月次ともに上位半分
+    _median_rank = _n_all / 2
+    _df_steady = _df_theme[
+        (_df_theme["週次ランク"] <= _median_rank) & (_df_theme["月次ランク"] <= _median_rank)
+    ].nsmallest(6, "週次ランク")[["テーマ","月次ランク","週次ランク"]].reset_index(drop=True)
+    with _col_steady:
+        st.markdown("**常勝** <small>上位を維持しているテーマ</small>", unsafe_allow_html=True)
+        for _, r in _df_steady.iterrows():
+            st.markdown(
+                f"<div style='display:flex;justify-content:space-between;padding:2px 0'>"
+                f"<span>{r['テーマ']}</span>"
+                f"<span style='color:#1565c0;font-size:.85rem'>● {int(r['月次ランク'])}位</span>"
+                f"<span style='font-size:.85rem'>{int(r['週次ランク'])}位</span></div>",
+                unsafe_allow_html=True
+            )
+
+    # 失速: 月次より週次ランクが大幅悪化
+    _df_fall = _df_theme[_df_theme["ランク変化"] < 0].nlargest(12, "週次ランク")[
+        ["テーマ","月次ランク","週次ランク","週次(%)"]].reset_index(drop=True)
+    with _col_fall:
+        st.markdown("**失速** <small>順位を落としたテーマ</small>", unsafe_allow_html=True)
+        for _, r in _df_fall.iterrows():
+            drop = int(r["週次ランク"] - r["月次ランク"])
+            ret_color = "#c62828" if r["週次(%)"] < 0 else "#555"
+            st.markdown(
+                f"<div style='display:flex;justify-content:space-between;padding:2px 0'>"
+                f"<span style='color:{ret_color}'>{r['テーマ']}</span>"
+                f"<span style='color:#c62828;font-size:.85rem'>▼{drop} 位</span>"
+                f"<span style='font-size:.85rem'>{int(r['週次ランク'])}位</span></div>",
+                unsafe_allow_html=True
+            )
+
+
+# ================================================================
+# 📊 需給分析
+# ================================================================
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def calc_demand_supply(ticker: str) -> dict:
+    """yfinance + J-Quants（あれば）で需給スコアを計算"""
+    try:
+        df = _yfdownload(ticker, period="1y")
+        if df.empty:
+            return {"error": "データなし"}
+        close  = df["Close"].dropna()
+        volume = df["Volume"].dropna()
+        if len(close) < 10:
+            return {"error": "データ不足"}
+
+        current = float(close.iloc[-1])
+        high52  = float(close.tail(252).max())
+        vol5    = float(volume.tail(5).mean())
+        vol20   = float(volume.tail(20).mean())
+        vol_ratio = vol5 / (vol20 + 1e-8)
+
+        # 基礎スコア (0–100)
+        pos_score  = max(0, min(30, (current / high52) * 30))
+        vol_score  = max(0, min(20, (vol_ratio - 0.5) * 20))
+        mom5       = float((close.iloc[-1] / close.iloc[-6] - 1) * 100) if len(close) >= 6 else 0
+        mom_score  = max(0, min(20, (mom5 + 5) * 2))
+        ma25_score = 15 if current > float(close.tail(25).mean()) else 0
+        ma75       = float(close.tail(75).mean()) if len(close) >= 75 else float(close.tail(25).mean())
+        ma75_score = 15 if current > ma75 else 0
+        base_score = int(pos_score + vol_score + mom_score + ma25_score + ma75_score)
+
+        # J-Quants 信用データ（Standard プラン）
+        code4 = ticker.replace(".T", "").zfill(4)
+        credit_ratio, credit_score, balance_score = None, 0, 0
+        df_mg = pd.DataFrame()
+        jq_key = st.secrets.get("JQUANTS_API_KEY", "")
+        if jq_key:
+            end_d  = datetime.today().strftime("%Y%m%d")
+            start_d = (datetime.today() - __import__("dateutil.relativedelta", fromlist=["relativedelta"]).relativedelta(months=3)).strftime("%Y%m%d")
+            df_mg = jq_fetch_margin(code4, start_d, end_d)
+            if not df_mg.empty:
+                buy_col  = next((c for c in df_mg.columns if "longmargin"  in c.lower()), None)
+                sell_col = next((c for c in df_mg.columns if "shortmargin" in c.lower()), None)
+                if buy_col and sell_col:
+                    buy_ser  = df_mg[buy_col].astype(float)
+                    sell_ser = df_mg[sell_col].astype(float)
+                    credit_ratio = float(buy_ser.iloc[-1] / (sell_ser.iloc[-1] + 1e-8))
+                    # 信用倍率スコア
+                    if credit_ratio < 1.0:    credit_score = 5
+                    elif credit_ratio < 2.0:  credit_score = 0
+                    elif credit_ratio < 3.0:  credit_score = -2
+                    elif credit_ratio < 5.0:  credit_score = -8
+                    elif credit_ratio < 10.0: credit_score = -15
+                    else:                     credit_score = -25
+                    # 残高トレンドスコア
+                    if len(buy_ser) >= 3:
+                        trend = (buy_ser.iloc[-1] - buy_ser.iloc[-3]) / (buy_ser.iloc[-3] + 1e-8)
+                        if trend < -0.05:   balance_score = 10
+                        elif trend < 0.05:  balance_score = 0
+                        elif trend < 0.15:  balance_score = -8
+                        else:               balance_score = -15
+
+        total = max(-30, min(100, base_score + credit_score + balance_score))
+        grade = "A" if total >= 80 else ("B" if total >= 60 else ("C" if total >= 40 else ("D" if total >= 20 else "E")))
+        if total >= 70:   status, detail = "需給は強い圏内です", "買い需要が売り圧力を上回っています"
+        elif total >= 50: status, detail = "需給は中立圏です",   "売買内訳と信用残の変化を継続確認してください"
+        else:             status, detail = "需給は弱い圏内です", "売り圧力が高まっています。注意が必要です"
+
+        return {
+            "base": base_score, "credit_sc": credit_score,
+            "balance_sc": balance_score, "total": total, "grade": grade,
+            "status": status, "detail": detail,
+            "credit_ratio": credit_ratio, "vol_ratio": vol_ratio, "mom5": mom5,
+            "current": current, "high52": high52,
+            "vol_today": int(volume.iloc[-1]), "vol20avg": int(vol20),
+            "df": df, "df_mg": df_mg,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+st.header("📊 需給分析")
+st.divider()
+st.caption("信用取引残高・売買動向・テクニカルから需給バランスをスコアリング（信用データはJ-Quants Standardプラン以上）")
+
+_sq_all_tickers = {
+    f"{n}（{t}）": t
+    for t, (n, _) in {**ticker_name_map, **MEMORY_TICKERS}.items()
+}
+_sq_c1, _sq_c2, _sq_c3 = st.columns([3, 1, 1])
+with _sq_c1:
+    _sq_sel = st.selectbox("銘柄を選択", list(_sq_all_tickers.keys()), key="sq_sel_ticker")
+    _sq_ticker = _sq_all_tickers[_sq_sel]
+with _sq_c2:
+    st.markdown(""); st.markdown("")
+    _sq_run = st.button("▶ 需給分析を実行", type="primary", key="sq_run")
+
+if _sq_run:
+    with st.spinner(f"{_sq_sel} の需給データを取得・計算中..."):
+        _sq = calc_demand_supply(_sq_ticker)
+
+    if "error" in _sq:
+        st.error(f"取得失敗: {_sq['error']}")
+    else:
+        # ── スコアカード ────────────────────────────────────────────
+        _grade_colors = {"A":"#1b5e20","B":"#1565c0","C":"#f57f17","D":"#bf360c","E":"#6a1b9a"}
+        _gc = _grade_colors.get(_sq["grade"], "#555")
+        _sc1, _sc2 = st.columns([1, 3])
+        with _sc1:
+            st.markdown(
+                f"<div style='border:2px solid #ddd;border-radius:10px;padding:20px;text-align:center'>"
+                f"<div style='font-size:.8rem;color:gray'>需給ランク</div>"
+                f"<div style='font-size:4rem;font-weight:bold;color:{_gc}'>{_sq['grade']}</div>"
+                f"<div style='font-size:1.4rem;font-weight:bold'>{_sq['total']}<span style='font-size:.9rem;color:gray'>/100</span></div>"
+                f"</div>", unsafe_allow_html=True
+            )
+        with _sc2:
+            st.markdown(f"**需給ステータス**: {_sq['status']}")
+            st.caption(_sq["detail"])
+            # カラーグラデーションバー
+            _bar_pos = max(0, min(100, _sq["total"]))
+            st.markdown(
+                f"<div style='height:14px;border-radius:7px;background:linear-gradient(to right,#c62828,#ef6c00,#f9a825,#1565c0,#2e7d32);margin:8px 0'>"
+                f"<div style='height:14px;width:{_bar_pos}%;border-right:3px solid black;border-radius:7px 0 0 7px'></div></div>",
+                unsafe_allow_html=True
+            )
+            # スコア内訳
+            _bd = _sq
+            st.markdown(
+                f"スコア内訳: 基礎 **{_bd['base']}** "
+                f"{'%+d' % _bd['credit_sc']} (信用倍率) "
+                f"{'%+d' % _bd['balance_sc']} (残高トレンド) "
+                f"= **{_bd['total']}**"
+            )
+            _sc_cols = st.columns(4)
+            _sc_cols[0].metric("基礎スコア", f"{_bd['base']}")
+            _sc_cols[1].metric("信用倍率スコア", f"{_bd['credit_sc']:+d}")
+            _sc_cols[2].metric("残高トレンドスコア", f"{_bd['balance_sc']:+d}")
+            cr_val = f"{_sq['credit_ratio']:.2f}倍" if _sq["credit_ratio"] else "—"
+            _sc_cols[3].metric("信用倍率", cr_val)
+
+        st.divider()
+
+        # ── 主要メトリクス ─────────────────────────────────────────
+        _m1, _m2, _m3, _m4 = st.columns(4)
+        _m1.metric("現在株価", f"¥{_sq['current']:,.0f}")
+        _m2.metric("5日騰落率", f"{_sq['mom5']:+.1f}%")
+        _m3.metric("出来高比（5日/20日）", f"{_sq['vol_ratio']:.2f}x")
+        _m4.metric("52週高値比", f"{_sq['current']/_sq['high52']*100:.1f}%")
+
+        st.divider()
+
+        _ch1, _ch2 = st.columns(2)
+
+        # ── ① 当日の売買動向（出来高バー）──────────────────────────
+        with _ch1:
+            st.markdown("**① 当日の売買動向**")
+            _df_ch = _sq["df"]
+            _close = _df_ch["Close"].dropna()
+            _vol   = _df_ch["Volume"].dropna()
+            _recent = _df_ch.tail(10)
+            _dates  = [d.strftime("%m/%d") for d in _recent.index]
+            _vols   = _recent["Volume"].tolist()
+            _avg_v  = float(_vol.tail(20).mean())
+            _colors_v = ["#2e7d32" if float(_recent["Close"].iloc[i]) >= float(_recent["Close"].iloc[i-1] if i>0 else _recent["Close"].iloc[i])
+                         else "#c62828" for i in range(len(_recent))]
+            _fig_v, _ax_v = plt.subplots(figsize=(6, 3))
+            _bars_v = _ax_v.bar(_dates, [v/1e4 for v in _vols], color=_colors_v, alpha=0.8)
+            _ax_v.axhline(_avg_v/1e4, color="orange", linestyle="--", linewidth=1.2, label="20日平均")
+            _ax_v.set_ylabel("万株"); _ax_v.set_title("出来高（直近10営業日）", fontsize=10)
+            _ax_v.legend(fontsize=8); _ax_v.grid(True, axis="y", alpha=0.3)
+            plt.xticks(rotation=45, fontsize=8); plt.tight_layout()
+            st.pyplot(_fig_v, clear_figure=True)
+            _today_vol = _sq["vol_today"]; _avg20 = _sq["vol20avg"]
+            _diff = _today_vol - _avg20
+            _sign = "買い超" if _diff >= 0 else "売り超"
+            st.caption(f"差し引き {_sign} {abs(_diff)/1e4:+.1f}万株  |  5日平均 {vol5/1e4:+.1f}万株")
+
+        # ── ② 株価推移（25日・75日MA）────────────────────────────
+        with _ch2:
+            st.markdown("**② 株価推移（MA付き）**")
+            _close_plot = _close.tail(90)
+            _fig_c, _ax_c = plt.subplots(figsize=(6, 3))
+            _ax_c.plot(_close_plot.index, _close_plot.values, color="#1565c0", linewidth=1.5, label="株価")
+            if len(_close) >= 25:
+                _ma25_s = _close.rolling(25).mean().tail(90)
+                _ax_c.plot(_close_plot.index, _ma25_s.values[-len(_close_plot):],
+                           color="orange", linewidth=1, linestyle="--", label="MA25")
+            if len(_close) >= 75:
+                _ma75_s = _close.rolling(75).mean().tail(90)
+                _ax_c.plot(_close_plot.index, _ma75_s.values[-len(_close_plot):],
+                           color="#c62828", linewidth=1, linestyle="--", label="MA75")
+            _ax_c.set_title("株価チャート（90日）", fontsize=10)
+            _ax_c.legend(fontsize=8); _ax_c.grid(True, alpha=0.25)
+            plt.xticks(rotation=45, fontsize=7); plt.tight_layout()
+            st.pyplot(_fig_c, clear_figure=True)
+
+        # ── ③ 信用残推移（J-Quants あれば）──────────────────────
+        st.markdown("**③ 信用残推移**")
+        _df_mg = _sq.get("df_mg", pd.DataFrame())
+        if not _df_mg.empty:
+            _buy_col  = next((c for c in _df_mg.columns if "longmargin"  in c.lower()), None)
+            _sell_col = next((c for c in _df_mg.columns if "shortmargin" in c.lower()), None)
+            if _buy_col and _sell_col and "Date" in _df_mg.columns:
+                _fig_mg, _ax_mg = plt.subplots(figsize=(10, 3.5))
+                _ax2_mg = _ax_mg.twinx()
+                _x_mg = range(len(_df_mg))
+                _w = 0.35
+                _buy_v  = _df_mg[_buy_col].astype(float)
+                _sell_v = _df_mg[_sell_col].astype(float)
+                _ax_mg.bar([x - _w/2 for x in _x_mg], _buy_v/1000, width=_w,
+                           color="#2e7d32", alpha=0.7, label="信用買残(千株)")
+                _ax_mg.bar([x + _w/2 for x in _x_mg], _sell_v/1000, width=_w,
+                           color="#ffcdd2", alpha=0.7, label="信用売残(千株)")
+                _ratio_mg = _buy_v / (_sell_v + 1e-8)
+                _ax2_mg.plot(_x_mg, _ratio_mg, color="black", linewidth=1.8,
+                             marker="o", markersize=3, label="信用倍率")
+                _xlabels = [d.strftime("%m/%d") if hasattr(d, "strftime") else str(d)
+                            for d in _df_mg["Date"]]
+                _ax_mg.set_xticks(list(_x_mg)); _ax_mg.set_xticklabels(_xlabels, rotation=45, fontsize=7)
+                _ax_mg.set_ylabel("千株"); _ax2_mg.set_ylabel("信用倍率")
+                _ax_mg.set_title("信用残推移", fontsize=10)
+                lines1, labs1 = _ax_mg.get_legend_handles_labels()
+                lines2, labs2 = _ax2_mg.get_legend_handles_labels()
+                _ax_mg.legend(lines1 + lines2, labs1 + labs2, fontsize=8, loc="upper left")
+                _ax_mg.grid(True, axis="y", alpha=0.2); plt.tight_layout()
+                st.pyplot(_fig_mg, clear_figure=True)
+            else:
+                st.dataframe(_df_mg.tail(10), use_container_width=True)
+        else:
+            st.info("信用残データはJ-Quants Standardプラン以上で取得できます。基礎スコアのみ表示しています。")
 
 
 # ================================================================
