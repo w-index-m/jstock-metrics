@@ -3052,6 +3052,202 @@ with edinet_t3:
 
 
 # ================================================================
+# 🔍 LLM as a Judge — 適時開示スコアリング
+# ================================================================
+st.header("🔍 AI開示評価（LLM as a Judge）")
+st.divider()
+st.caption(
+    "TDnet適時開示をAIが5軸でスコアリング → 重要度ランキング表示。"
+    "評価軸: 重要度・市場インパクト・ポジネガ・緊急性・関連テーマ"
+)
+
+def _judge_disclosures(disclosures: list[dict]) -> list[dict]:
+    """開示リストをAIで一括スコアリング（JSON構造化出力）"""
+    import json as _json
+    if not disclosures:
+        return []
+
+    items_text = "\n".join(
+        f"{i+1}. [{r['日付']}] {r['企業名']}（{r['コード']}）: {r['タイトル']}"
+        for i, r in enumerate(disclosures)
+    )
+    prompt = f"""あなたは日本株の機関投資家向けアナリストです。
+以下の適時開示リストを評価し、**必ずJSON配列のみ**を返してください（説明文・マークダウン不要）。
+
+## 評価対象
+{items_text}
+
+## 評価基準（各項目の定義）
+- importance (1–5): 市場全体への重要度。5=決算・業績修正・M&A、1=軽微なお知らせ
+- impact ("高"/"中"/"低"): 株価への短期インパクト
+- sentiment ("ポジティブ"/"ネガティブ"/"中立"): 投資家心理への影響
+- urgency ("高"/"中"/"低"): 即日対応が必要か
+- themes (配列, 最大3個): 関連テーマ例: ["半導体","AI","M&A","業績上方修正","株主還元","リストラ"]
+- reason (30字以内): スコア根拠
+
+## 出力形式（JSONのみ・他の文字は一切不要）
+[
+  {{"id":1,"importance":4,"impact":"高","sentiment":"ポジティブ","urgency":"中","themes":["AI"],"reason":"大型受注でEPS押し上げ"}},
+  ...
+]"""
+
+    raw, model_name = generate_ai_comment(prompt)
+
+    # JSON抽出（コードブロック・余分なテキストを除去）
+    import re as _re
+    m = _re.search(r'\[[\s\S]*\]', raw)
+    if not m:
+        return []
+    try:
+        scores = _json.loads(m.group())
+    except Exception:
+        return []
+
+    result = []
+    score_map = {s["id"]: s for s in scores if "id" in s}
+    for i, row in enumerate(disclosures):
+        sc = score_map.get(i + 1, {})
+        result.append({
+            **row,
+            "重要度":     sc.get("importance", 0),
+            "インパクト": sc.get("impact", "—"),
+            "ポジネガ":   sc.get("sentiment", "—"),
+            "緊急性":     sc.get("urgency", "—"),
+            "テーマ":     "・".join(sc.get("themes", [])),
+            "根拠":       sc.get("reason", ""),
+            "_model":     model_name,
+        })
+    return result
+
+
+# ── コントロール ─────────────────────────────────────────────────
+_jdg_c1, _jdg_c2, _jdg_c3 = st.columns([2, 1, 1])
+with _jdg_c1:
+    _jdg_sector_opts = ["全銘柄（Nikkei225）"] + sorted({
+        s for _, (_, s) in ticker_name_map.items()
+    })
+    _jdg_sector = st.selectbox("絞り込み業種", _jdg_sector_opts, key="jdg_sector")
+with _jdg_c2:
+    _jdg_days = st.radio("取得期間", [1, 3, 5], index=1,
+                         horizontal=True, key="jdg_days", format_func=lambda x: f"{x}営業日")
+with _jdg_c3:
+    st.markdown(""); st.markdown("")
+    _jdg_run = st.button("▶ AI評価を実行", type="primary", key="jdg_run")
+
+# ── フィルタ UI ──────────────────────────────────────────────────
+_jdg_f1, _jdg_f2, _jdg_f3 = st.columns(3)
+with _jdg_f1:
+    _jdg_min_imp = st.slider("重要度フィルタ（以上）", 1, 5, 1, key="jdg_min_imp")
+with _jdg_f2:
+    _jdg_impact_f = st.multiselect("インパクト", ["高", "中", "低"],
+                                    default=["高", "中"], key="jdg_impact_f")
+with _jdg_f3:
+    _jdg_sent_f = st.multiselect("ポジネガ", ["ポジティブ", "中立", "ネガティブ"],
+                                  default=["ポジティブ", "中立", "ネガティブ"], key="jdg_sent_f")
+
+if _jdg_run:
+    # 対象 code_map 構築
+    if _jdg_sector == "全銘柄（Nikkei225）":
+        _jdg_map = ticker_name_map
+    else:
+        _jdg_map = {t: (n, s) for t, (n, s) in ticker_name_map.items() if s == _jdg_sector}
+
+    with st.spinner(f"TDnetから {_jdg_days} 営業日分の開示を取得中..."):
+        _jdg_raw = fetch_tdnet_week(_jdg_map, days=_jdg_days)
+
+    if not _jdg_raw:
+        st.warning("取得できた適時開示がありませんでした。期間を延ばすか平日にお試しください。")
+    else:
+        st.info(f"📋 {len(_jdg_raw)} 件の開示を取得。AIがスコアリング中...")
+        # 最大30件（API負荷制限）
+        _jdg_batch = _jdg_raw[:30]
+        with st.spinner("AIが評価中（Gemini → Groqフォールバック）..."):
+            _jdg_scored = _judge_disclosures(_jdg_batch)
+
+        if not _jdg_scored:
+            st.error("AI評価の解析に失敗しました。もう一度お試しください。")
+        else:
+            _model_used = _jdg_scored[0].get("_model", "?")
+            st.success(f"✅ {len(_jdg_scored)} 件を評価完了（by {_model_used}）")
+
+            # フィルタ適用
+            _jdg_df = pd.DataFrame(_jdg_scored)
+            _jdg_df = _jdg_df[
+                (_jdg_df["重要度"] >= _jdg_min_imp) &
+                (_jdg_df["インパクト"].isin(_jdg_impact_f + ["—"])) &
+                (_jdg_df["ポジネガ"].isin(_jdg_sent_f + ["—"]))
+            ].sort_values("重要度", ascending=False).reset_index(drop=True)
+
+            # ── サマリーメトリクス
+            _jm1, _jm2, _jm3, _jm4 = st.columns(4)
+            _jm1.metric("評価件数", f"{len(_jdg_df)} 件")
+            _jm2.metric("高インパクト", f"{(_jdg_df['インパクト']=='高').sum()} 件")
+            _jm3.metric("ポジティブ", f"{(_jdg_df['ポジネガ']=='ポジティブ').sum()} 件")
+            _jm4.metric("平均重要度", f"{_jdg_df['重要度'].mean():.1f} / 5")
+
+            st.divider()
+
+            # ── 重要度スコア分布（横棒グラフ）
+            _jdg_dist = _jdg_df["重要度"].value_counts().sort_index(ascending=False)
+            _fig_dist, _ax_dist = plt.subplots(figsize=(7, 2.2))
+            _colors_dist = {5:"#c62828",4:"#ef6c00",3:"#f9a825",2:"#1565c0",1:"#aaa"}
+            _ax_dist.barh(
+                [f"★{v}" for v in _jdg_dist.index],
+                _jdg_dist.values,
+                color=[_colors_dist.get(v,"#aaa") for v in _jdg_dist.index],
+                alpha=0.85
+            )
+            for i, v in enumerate(_jdg_dist.values):
+                _ax_dist.text(v + 0.1, i, str(v), va="center", fontsize=9)
+            _ax_dist.set_title("重要度スコア分布", fontsize=10)
+            _ax_dist.set_xlabel("件数"); _ax_dist.grid(True, axis="x", alpha=0.3)
+            plt.tight_layout()
+            st.pyplot(_fig_dist, clear_figure=True)
+
+            # ── ランキングテーブル
+            st.markdown("#### 📊 開示ランキング（重要度順）")
+
+            _SENT_COLOR = {"ポジティブ":"#1b5e20","ネガティブ":"#b71c1c","中立":"#555"}
+            _IMP_COLOR  = {"高":"#c62828","中":"#ef6c00","低":"#1565c0"}
+
+            for _, row in _jdg_df.iterrows():
+                _imp_stars = "★" * int(row["重要度"]) + "☆" * (5 - int(row["重要度"]))
+                _sc = _SENT_COLOR.get(row["ポジネガ"], "#555")
+                _ic = _IMP_COLOR.get(row["インパクト"], "#555")
+                with st.container():
+                    st.markdown(
+                        f"<div style='border-left:4px solid {_ic};padding:8px 12px;margin:4px 0;"
+                        f"border-radius:0 6px 6px 0;background:#fafafa'>"
+                        f"<div style='display:flex;justify-content:space-between;align-items:center'>"
+                        f"<span style='font-size:.85rem;color:gray'>{row['日付']} | {row['企業名']}（{row['コード']}）</span>"
+                        f"<span style='font-size:.95rem'>{_imp_stars}</span></div>"
+                        f"<div style='font-weight:bold;margin:2px 0'>{row['タイトル']}</div>"
+                        f"<div style='display:flex;gap:8px;font-size:.82rem;margin-top:4px'>"
+                        f"<span style='color:{_ic}'>インパクト:{row['インパクト']}</span>"
+                        f"<span style='color:{_sc}'>{row['ポジネガ']}</span>"
+                        f"<span>緊急性:{row['緊急性']}</span>"
+                        f"<span style='color:#555'>🏷 {row['テーマ']}</span>"
+                        f"</div>"
+                        f"<div style='font-size:.8rem;color:#666;margin-top:2px'>💬 {row['根拠']}</div>"
+                        f"</div>",
+                        unsafe_allow_html=True
+                    )
+
+            st.divider()
+
+            # ── CSVダウンロード
+            _dl_cols = ["日付","企業名","コード","タイトル","重要度","インパクト","ポジネガ","緊急性","テーマ","根拠"]
+            _dl_df = _jdg_df[[c for c in _dl_cols if c in _jdg_df.columns]]
+            st.download_button(
+                "📥 評価結果をCSVダウンロード",
+                _dl_df.to_csv(index=False, encoding="utf-8-sig"),
+                file_name=f"tdnet_judge_{datetime.today().strftime('%Y%m%d')}.csv",
+                mime="text/csv",
+                key="jdg_download"
+            )
+
+
+# ================================================================
 # J-Quants APIクライアント（V2対応）
 # ================================================================
 JQUANTS_API_BASE = "https://api.jquants.com/v1"
