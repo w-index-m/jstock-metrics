@@ -131,7 +131,7 @@ genai.configure(api_key=GEMINI_API_KEY)
 gemini_model = genai.GenerativeModel(GEMINI_MODEL)
 groq_client  = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
-def generate_ai_comment(prompt: str) -> tuple[str, str]:
+def generate_ai_comment(prompt: str, max_tokens: int = 400) -> tuple[str, str]:
     """Gemini → Groq フォールバック（安定版）"""
     # ---- Gemini ----
     try:
@@ -151,7 +151,7 @@ def generate_ai_comment(prompt: str) -> tuple[str, str]:
         chat = groq_client.chat.completions.create(
             model=GROQ_MODEL,
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=400,
+            max_tokens=max_tokens,
         )
         return chat.choices[0].message.content, "Groq"
     except Exception as e:
@@ -3091,7 +3091,7 @@ def _judge_disclosures(disclosures: list[dict]) -> list[dict]:
   ...
 ]"""
 
-    raw, model_name = generate_ai_comment(prompt)
+    raw, model_name = generate_ai_comment(prompt, max_tokens=1500)
 
     # JSON抽出（コードブロック・余分なテキストを除去）
     import re as _re
